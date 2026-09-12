@@ -61,6 +61,8 @@ var stremioToMPVProps = {
     'subtitlesSize': 'sub-scale',
     'subtitlesOffset': 'sub-pos',
     'subtitlesDelay': 'sub-delay',
+    // Milliseconds on the web side (like subtitlesDelay), seconds in mpv.
+    'audioDelay': 'audio-delay',
     'subtitlesTextColor': 'sub-color',
     'subtitlesBackgroundColor': 'sub-back-color',
     'subtitlesOutlineColor': 'sub-border-color',
@@ -140,6 +142,7 @@ function ShellVideo(options) {
     ipc.send('mpv-observe-prop', 'sub-scale');
     ipc.send('mpv-observe-prop', 'sub-pos');
     ipc.send('mpv-observe-prop', 'sub-delay');
+    ipc.send('mpv-observe-prop', 'audio-delay');
     ipc.send('mpv-observe-prop', 'speed');
 
     ipc.send('mpv-observe-prop', 'mpv-version');
@@ -229,7 +232,8 @@ function ShellVideo(options) {
                 props[args.name] = 100 - args.data;
                 break;
             }
-            case 'sub-delay': {
+            case 'sub-delay':
+            case 'audio-delay': {
                 props[args.name] = Math.round(args.data*1000);
                 break;
             }
@@ -503,8 +507,15 @@ function ShellVideo(options) {
                 ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue * SUBS_SCALE_FACTOR]);
                 break;
             }
-            case 'subtitlesDelay': {
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue]);
+            case 'subtitlesDelay':
+            case 'audioDelay': {
+                // The web keeps delays in MILLISECONDS (the observe handler above
+                // converts mpv's seconds the same way); mpv wants seconds. Sending
+                // the raw value here would have set a 250ms nudge to 250 SECONDS,
+                // which is why embedded-track delay was never wired before.
+                if (propValue !== null && isFinite(propValue)) {
+                    ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue / 1000]);
+                }
                 break;
             }
             case 'subtitlesOffset': {

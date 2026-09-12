@@ -29,6 +29,10 @@ const PROPERTIES: Record<string, Property> = {
         label: 'SUBTITLES_DELAY',
         format: (value) => `${((value as number) / 1000).toFixed(2)}s`,
     },
+    'audioDelay': {
+        label: 'AUDIO_DELAY',
+        format: (value) => `${((value as number) / 1000).toFixed(2)}s`,
+    },
     'videoScale': {
         label: 'VIDEO_SCALE',
         format: (value) => t(VIDEO_SCALE_KEYS[String(value)] || String(value)),

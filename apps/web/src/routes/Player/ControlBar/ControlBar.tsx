@@ -279,24 +279,27 @@ const ControlBar = forwardRef<HTMLDivElement, Props>(function ControlBar({
                     'max-sm:absolute max-sm:bottom-[4.5rem] max-sm:right-0 max-sm:m-2 max-sm:max-w-[calc(100dvw-1rem)] max-sm:gap-[0.15rem] max-sm:overflow-x-auto max-sm:rounded-card max-sm:border max-sm:border-line max-sm:bg-glass-panel max-sm:p-2 max-sm:shadow-elevated max-sm:backdrop-blur-(--glass-blur)',
                     buttonsMenuOpen ? 'max-sm:flex' : 'max-sm:hidden',
                 )}>
-                    <IconButton className={cn(CB_BUTTON, !stream && 'opacity-40')} tabIndex={-1} onMouseDown={onStatisticsButtonMouseDown} onClick={onToggleStatisticsMenu}>
+                    {/* Every icon-only control carries its name (title doubles as
+                        the accessible name): these were unnamed to assistive tech,
+                        which also made them unreachable for automation. */}
+                    <IconButton className={cn(CB_BUTTON, !stream && 'opacity-40')} title={t('SETTINGS_SHORTCUT_MENU_STATISTICS')} tabIndex={-1} onMouseDown={onStatisticsButtonMouseDown} onClick={onToggleStatisticsMenu}>
                         <Activity className={CB_ICON} />
                     </IconButton>
-                    <IconButton className={cn(CB_BUTTON, playbackSpeed === null && 'opacity-40')} tabIndex={-1} onMouseDown={onSpeedButtonMouseDown} onClick={onToggleSpeedMenu}>
+                    <IconButton className={cn(CB_BUTTON, playbackSpeed === null && 'opacity-40')} title={t('SETTINGS_SHORTCUT_MENU_PLAYBACK_SPEED')} tabIndex={-1} onMouseDown={onSpeedButtonMouseDown} onClick={onToggleSpeedMenu}>
                         <Gauge className={CB_ICON} />
                     </IconButton>
-                    <IconButton className={cn(CB_BUTTON, !chromecastServiceActive && 'opacity-40')} tabIndex={-1} onClick={onChromecastButtonClick}>
+                    <IconButton className={cn(CB_BUTTON, !chromecastServiceActive && 'opacity-40')} title={t('CAST')} tabIndex={-1} onClick={onChromecastButtonClick}>
                         <Cast className={CB_ICON} />
                     </IconButton>
-                    <IconButton className={cn(CB_BUTTON, (!Array.isArray(subtitlesTracks) || subtitlesTracks.length === 0) && 'opacity-40')} tabIndex={-1} onMouseDown={onSubtitlesButtonMouseDown} onClick={onToggleSubtitlesMenu}>
+                    <IconButton className={cn(CB_BUTTON, (!Array.isArray(subtitlesTracks) || subtitlesTracks.length === 0) && 'opacity-40')} title={t('SETTINGS_SHORTCUT_MENU_SUBTITLES')} tabIndex={-1} onMouseDown={onSubtitlesButtonMouseDown} onClick={onToggleSubtitlesMenu}>
                         <Captions className={CB_ICON} />
                     </IconButton>
-                    <IconButton className={cn(CB_BUTTON, (!Array.isArray(audioTracks) || audioTracks.length === 0) && 'opacity-40')} tabIndex={-1} onMouseDown={onAudioButtonMouseDown} onClick={onToggleAudioMenu}>
+                    <IconButton className={cn(CB_BUTTON, (!Array.isArray(audioTracks) || audioTracks.length === 0) && 'opacity-40')} title={t('SETTINGS_SHORTCUT_MENU_AUDIO')} tabIndex={-1} onMouseDown={onAudioButtonMouseDown} onClick={onToggleAudioMenu}>
                         <AudioLines className={CB_ICON} />
                     </IconButton>
                     {
                         (metaItem?.content?.videos?.length ?? 0) > 0 ?
-                            <IconButton className={CB_BUTTON} tabIndex={-1} onMouseDown={onVideosButtonMouseDown} onClick={onToggleSideDrawer}>
+                            <IconButton className={CB_BUTTON} title={t('SETTINGS_SHORTCUT_MENU_INFO')} tabIndex={-1} onMouseDown={onVideosButtonMouseDown} onClick={onToggleSideDrawer}>
                                 <ListVideo className={CB_ICON} />
                             </IconButton>
                             :
@@ -313,7 +316,7 @@ const ControlBar = forwardRef<HTMLDivElement, Props>(function ControlBar({
                             :
                             null
                     }
-                    <IconButton className={cn(CB_BUTTON, !stream && 'opacity-40')} tabIndex={-1} onMouseDown={onOptionsButtonMouseDown} onClick={onToggleOptionsMenu}>
+                    <IconButton className={cn(CB_BUTTON, !stream && 'opacity-40')} title={t('MORE')} tabIndex={-1} onMouseDown={onOptionsButtonMouseDown} onClick={onToggleOptionsMenu}>
                         <MoreHorizontal className={CB_ICON} />
                     </IconButton>
                 </div>

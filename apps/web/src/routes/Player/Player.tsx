@@ -447,6 +447,12 @@ const Player = () => {
         });
     }, [streamStateChanged]);
 
+    // Session-scoped on purpose: an a/v offset is a property of one file's
+    // mux, so it is not written into the library's stream state.
+    const onAudioDelayChanged = React.useCallback((delay: number) => {
+        video.setAudioDelay(delay);
+    }, []);
+
     const onDismissNextVideoPopup = React.useCallback(() => {
         closeNextVideoPopup();
         nextVideoPopupDismissed.current = true;
@@ -1337,7 +1343,9 @@ const Player = () => {
                             className={MENU_LAYER}
                             audioTracks={video.state.audioTracks}
                             selectedAudioTrackId={video.state.selectedAudioTrackId}
+                            audioDelay={video.state.audioDelay}
                             onAudioTrackSelected={onAudioTrackSelected}
+                            onAudioDelayChanged={onAudioDelayChanged}
                         />
                     </Presence>
                     <Presence when={speedMenuOpen}>

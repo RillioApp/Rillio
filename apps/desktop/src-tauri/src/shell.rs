@@ -320,6 +320,8 @@ const MPV_SETPROP_ALLOWLIST: &[&str] = &[
     "sub-color",
     "sub-back-color",
     "sub-border-color",
+    // a/v sync (audio menu: shifts the audio track against the video)
+    "audio-delay",
 ];
 
 /// What [`shell_init`] returns to the web client's `useShell`.
@@ -1610,7 +1612,7 @@ mod tests {
             "pause", "speed", "time-pos", "volume", "mute", "aid", "sid", "hwdec", "vo", "osc",
             "input-default-bindings", "input-vo-keyboard", "keepaspect", "panscan",
             "sub-ass-override", "sub-scale", "sub-pos", "sub-delay", "sub-color", "sub-back-color",
-            "sub-border-color",
+            "sub-border-color", "audio-delay",
         ] {
             check_mpv_setprop(name).unwrap_or_else(|e| panic!("{name} should be allowed: {e}"));
         }

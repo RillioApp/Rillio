@@ -37,6 +37,9 @@ const useVideo = () => {
         hdrInfo: null,
         audioTracks: [],
         selectedAudioTrackId: null,
+        // A/V sync offsets in ms (mpv seconds converted at the ShellVideo edge).
+        audioDelay: null,
+        subtitlesDelay: null,
         subtitlesTracks: [],
         selectedSubtitlesTrackId: null,
         chapters: [],
@@ -143,8 +146,17 @@ const useVideo = () => {
         setProp('selectedExtraSubtitlesTrackId', id);
     };
 
+    // One delay for whichever subtitle track is active: addon tracks are drawn
+    // by the web (extraSubtitlesDelay), embedded tracks by mpv (subtitlesDelay
+    // -> sub-delay). Setting both keeps the menu's single control honest across
+    // the two renderers, same as size/offset/colors below.
     const setSubtitlesDelay = (delay: number) => {
         setProp('extraSubtitlesDelay', delay);
+        setProp('subtitlesDelay', delay);
+    };
+
+    const setAudioDelay = (delay: number) => {
+        setProp('audioDelay', delay);
     };
 
     const setSubtitlesSize = (size: number) => {
@@ -253,6 +265,7 @@ const useVideo = () => {
         setTime,
         setPlaybackSpeed,
         setAudioTrack,
+        setAudioDelay,
         setSubtitlesTrack,
         setSubtitlesDelay,
         setSubtitlesSize,

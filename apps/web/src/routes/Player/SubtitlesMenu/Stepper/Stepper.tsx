@@ -98,6 +98,7 @@ const Stepper = ({ className, label, value, unit, step, min, max, disabled, onCh
                 <IconButton
                     disabled={decreaseDisabled}
                     className={STEP_BUTTON}
+                    aria-label={`${t(label)} -${step}`}
                     onMouseDown={onDecrementMouseDown}
                     onMouseUp={onDecrementMouseUp}
                     onMouseLeave={cancel}
@@ -110,6 +111,7 @@ const Stepper = ({ className, label, value, unit, step, min, max, disabled, onCh
                 <IconButton
                     disabled={increaseDisabled}
                     className={STEP_BUTTON}
+                    aria-label={`${t(label)} +${step}`}
                     onMouseDown={onIncrementMouseDown}
                     onMouseUp={onIncrementMouseUp}
                     onMouseLeave={cancel}

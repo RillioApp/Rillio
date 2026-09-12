@@ -19,6 +19,7 @@ import ShaderBlurRect from '../ShaderBlurRect';
 import SnapshotBackdrop from '../SnapshotBackdrop';
 import Stepper from './Stepper';
 import SubtitleVariant from './SubtitleVariant';
+import DelayFineControl from '../DelayFineControl';
 
 const ORIGIN_PRIORITIES = ['LOCAL', 'EMBEDDED', 'EXCLUSIVE'];
 
@@ -121,15 +122,26 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
             }
         }
     }, [props.onSubtitlesTrackSelected, props.onExtraSubtitlesTrackSelected]);
-    const onSubtitlesDelayChanged = useCallback((value: number) => {
-        if (typeof props.selectedExtraSubtitlesTrackId === 'string') {
-            if (props.extraSubtitlesDelay !== null && !isNaN(props.extraSubtitlesDelay)) {
-                if (typeof props.onExtraSubtitlesDelayChanged === 'function') {
-                    props.onExtraSubtitlesDelayChanged(value * 1000);
-                }
-            }
+    // The delay in effect for whichever subtitle track is active: embedded
+    // tracks are timed by mpv (subtitlesDelay), addon tracks by the web
+    // renderer (extraSubtitlesDelay). Before this the control only knew about
+    // addon tracks, so embedded subtitles could not be nudged at all.
+    const activeSubtitlesDelay: number | null = useMemo(() => {
+        if (typeof props.selectedSubtitlesTrackId === 'string') {
+            return typeof props.subtitlesDelay === 'number' ? props.subtitlesDelay : null;
         }
-    }, [props.selectedExtraSubtitlesTrackId, props.extraSubtitlesDelay, props.onExtraSubtitlesDelayChanged]);
+        if (typeof props.selectedExtraSubtitlesTrackId === 'string') {
+            return typeof props.extraSubtitlesDelay === 'number' ? props.extraSubtitlesDelay : null;
+        }
+        return null;
+    }, [props.selectedSubtitlesTrackId, props.selectedExtraSubtitlesTrackId, props.subtitlesDelay, props.extraSubtitlesDelay]);
+    const onSubtitlesDelayChanged = useCallback((value: number) => {
+        // Seconds from the controls, ms to the video (one setter drives both
+        // renderers, see useVideo.setSubtitlesDelay).
+        if (activeSubtitlesDelay !== null && typeof props.onExtraSubtitlesDelayChanged === 'function') {
+            props.onExtraSubtitlesDelayChanged(Math.round(value * 1000));
+        }
+    }, [activeSubtitlesDelay, props.onExtraSubtitlesDelayChanged]);
     const onSubtitlesSizeChanged = useCallback((value: number) => {
         if (typeof props.selectedSubtitlesTrackId === 'string') {
             if (props.subtitlesSize !== null && !isNaN(props.subtitlesSize)) {
@@ -225,12 +237,18 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
                 <div className={HEADER}>{t('PLAYER_SUBTITLES_SETTINGS')}</div>
                 <div className={'overflow-y-scroll'}>
                     <Stepper
-                        className={'px-6 pb-4'}
+                        className={'px-6 pb-3'}
                         label={'DELAY'}
-                        value={props.extraSubtitlesDelay / 1000}
+                        value={activeSubtitlesDelay !== null ? activeSubtitlesDelay / 1000 : null}
                         unit={'s'}
                         step={0.25}
-                        disabled={props.extraSubtitlesDelay === null}
+                        disabled={activeSubtitlesDelay === null}
+                        onChange={onSubtitlesDelayChanged}
+                    />
+                    <DelayFineControl
+                        className={'px-6 pb-4'}
+                        value={activeSubtitlesDelay !== null ? activeSubtitlesDelay / 1000 : null}
+                        disabled={activeSubtitlesDelay === null}
                         onChange={onSubtitlesDelayChanged}
                     />
                     <Stepper
