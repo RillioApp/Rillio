@@ -4,7 +4,7 @@
 
 [package]
 name = "rillio-desktop"
-version = "0.1.42"
+version = "0.1.43"
 edition = "2021"
 description = "Rillio desktop shell (Tauri) embedding the Rust streaming server"
 license = "gpl-2.0"

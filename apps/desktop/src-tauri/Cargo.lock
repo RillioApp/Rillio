@@ -4028,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "rillio-desktop"
-version = "0.1.42"
+version = "0.1.43"
 dependencies = [
  "base64 0.22.1",
  "image",
