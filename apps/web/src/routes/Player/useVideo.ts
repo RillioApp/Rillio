@@ -108,6 +108,20 @@ const useVideo = () => {
         });
     };
 
+    // The live "Generated" track: the whole VTT transcribed so far (the shell's
+    // whisper worker sends batches; useSubtitles accumulates and re-renders).
+    const setGeneratedSubtitles = (text: string, lang: string | null, label: string) => {
+        dispatch({
+            type: 'command',
+            commandName: 'setGeneratedSubtitles',
+            commandArgs: {
+                text,
+                lang: lang ?? undefined,
+                label,
+            },
+        });
+    };
+
     const setProp = (name: string, value: any) => {
         dispatch({ type: 'setProp', propName: name, propValue: value });
     };
@@ -259,6 +273,7 @@ const useVideo = () => {
         unload,
         addExtraSubtitlesTracks,
         addLocalSubtitles,
+        setGeneratedSubtitles,
         setPaused,
         setVolume,
         setMuted,

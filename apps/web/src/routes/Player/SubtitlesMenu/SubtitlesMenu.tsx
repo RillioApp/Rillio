@@ -11,7 +11,7 @@
 
 import React, { forwardRef, memo, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AudioLines, Loader2 } from 'lucide-react';
+import { AudioLines, Loader2, Sparkles } from 'lucide-react';
 import { languages } from 'rillio/common';
 import { SUBTITLES_SIZES, DEFAULT_SUBTITLES_LANGUAGE, LOCAL_SUBTITLES_LANGUAGE } from 'rillio/common/CONSTANTS';
 import { Button } from 'rillio/components/ui';
@@ -23,6 +23,8 @@ import SubtitleVariant from './SubtitleVariant';
 import FineStepper from '../FineStepper';
 
 const ORIGIN_PRIORITIES = ['LOCAL', 'EMBEDDED', 'EXCLUSIVE'];
+// The generated track's id doubles as its "language" in this menu.
+const GENERATED_LANGUAGE_ID = 'GENERATED';
 
 const normalizeTracksLang = (tracks: any[]) => tracks.map((track) => ({
     ...track,
@@ -51,9 +53,15 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
         return normalizeTracksLang(Array.isArray(props.extraSubtitlesTracks) ? props.extraSubtitlesTracks : []);
     }, [props.extraSubtitlesTracks]);
 
+    // The generated (whisper) track is its own entry in the Languages column
+    // (the "Generate with AI" row), never grouped under the language it
+    // detected: otherwise both that language and the row light up at once.
     const allSubtitles = useMemo(() => {
-        return subtitlesTracks.concat(extraSubtitlesTracks);
+        return subtitlesTracks.concat(extraSubtitlesTracks).filter((track) => !track.generated);
     }, [subtitlesTracks, extraSubtitlesTracks]);
+    const generatedTracks = useMemo(() => {
+        return extraSubtitlesTracks.filter((track) => track.generated);
+    }, [extraSubtitlesTracks]);
 
     const subtitlesLanguages = useMemo(() => {
         const userLanguage = languages.toCode(props.subtitlesLanguage) ?? DEFAULT_SUBTITLES_LANGUAGE;
@@ -64,6 +72,9 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
     }, [allSubtitles, props.subtitlesLanguage, props.interfaceLanguage]);
 
     const selectedSubtitlesLanguage = useMemo(() => {
+        if (props.selectedExtraSubtitlesTrackId === GENERATED_LANGUAGE_ID) {
+            return GENERATED_LANGUAGE_ID;
+        }
         return typeof props.selectedSubtitlesTrackId === 'string' ?
             subtitlesTracks
                 .reduce((selectedSubtitlesLanguage, { id, lang }) => {
@@ -85,9 +96,12 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
                 null;
     }, [subtitlesTracks, extraSubtitlesTracks, props.selectedSubtitlesTrackId, props.selectedExtraSubtitlesTrackId]);
     const subtitlesTracksForLanguage = useMemo(() => {
+        if (selectedSubtitlesLanguage === GENERATED_LANGUAGE_ID) {
+            return generatedTracks;
+        }
         const tracks = allSubtitles.filter(({ lang }) => lang === selectedSubtitlesLanguage);
         return sortByValues(tracks, ORIGIN_PRIORITIES);
-    }, [allSubtitles, selectedSubtitlesLanguage]);
+    }, [allSubtitles, generatedTracks, selectedSubtitlesLanguage]);
     const onMouseDown = useCallback((event: React.MouseEvent) => {
         (event.nativeEvent as any).subtitlesMenuClosePrevented = true;
     }, []);
@@ -210,6 +224,43 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
                             {selectedSubtitlesLanguage === lang ? <div className={'ml-4 size-2 flex-none rounded-full bg-primary'} /> : null}
                         </Button>
                     ))}
+                    {
+                        // Generated (whisper) subtitles: shell-only. A language
+                        // row of its own: picking it starts the worker (or selects
+                        // the track it already made) and it shows the phase;
+                        // picking any other language stops the worker.
+                        props.subtitlesGenerate?.supported ?
+                            <Button
+                                variant={'ghost'}
+                                title={t('SUBTITLES_GENERATE_HINT')}
+                                onClick={props.onSubtitlesGenerateSelect}
+                                className={cn(
+                                    'mb-2 flex h-14 w-full flex-row items-center rounded-card px-6 hover:bg-surface-hover',
+                                    selectedSubtitlesLanguage === GENERATED_LANGUAGE_ID && 'bg-accent-soft',
+                                )}
+                            >
+                                {
+                                    ['downloading', 'loading', 'running'].includes(props.subtitlesGenerate.state) ?
+                                        <Loader2 className={'mr-3 size-4 flex-none animate-spin text-fg'} />
+                                        :
+                                        <Sparkles className={'mr-3 size-4 flex-none text-fg'} />
+                                }
+                                <div className={'flex-1 truncate text-left text-[1.1rem] text-fg'}>
+                                    {
+                                        // Just "AI": the spinner says it is working, and the
+                                        // one slow phase (the one-time model download) shows
+                                        // its percentage. Any language: whisper detects it.
+                                        props.subtitlesGenerate.state === 'downloading' ?
+                                            `${t('SUBTITLES_AI')} ${Math.round((props.subtitlesGenerate.progress ?? 0) * 100)}%`
+                                            :
+                                            t('SUBTITLES_AI')
+                                    }
+                                </div>
+                                {selectedSubtitlesLanguage === GENERATED_LANGUAGE_ID ? <div className={'ml-4 size-2 flex-none rounded-full bg-primary'} /> : null}
+                            </Button>
+                            :
+                            null
+                    }
                 </div>
             </div>
             <div className={'flex w-64 flex-none flex-col self-stretch'}>

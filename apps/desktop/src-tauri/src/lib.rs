@@ -7,6 +7,26 @@
 mod autosync;
 pub mod mpv;
 pub mod platform;
+#[cfg(not(target_os = "android"))]
+mod transcribe;
+/// Generated subtitles are desktop-only (whisper.cpp is not built for the
+/// Android port, which has no CPU budget for it either); the commands exist so
+/// the invoke surface is identical and the web layer gets a clean refusal.
+#[cfg(target_os = "android")]
+mod transcribe {
+    #[derive(Default)]
+    pub struct TranscribeState;
+
+    #[tauri::command]
+    pub async fn subtitles_generate_start(_url: String) -> Result<(), String> {
+        Err("generated subtitles are not available on this device".into())
+    }
+
+    #[tauri::command]
+    pub async fn subtitles_generate_stop() -> Result<(), String> {
+        Ok(())
+    }
+}
 mod shell;
 pub mod stream_cb;
 mod surface;
@@ -417,6 +437,7 @@ pub fn run() {
         .manage(UpdateInFlight::default())
         .manage(shell::ShellState::default())
         .manage(thumbs::ThumbsState::default())
+        .manage(transcribe::TranscribeState::default())
         .manage(DeepLinkState::default())
         // Filled in once the server binds (see start_streaming_server). Managed
         // up front so `streaming_server_url` can answer "not yet" instead of
@@ -515,7 +536,9 @@ pub fn run() {
             thumbs::player_thumb,
             thumbs::player_thumb_stop,
             thumbs::player_scene_cuts,
-            autosync::subtitles_autosync
+            autosync::subtitles_autosync,
+            transcribe::subtitles_generate_start,
+            transcribe::subtitles_generate_stop
         ])
         .build(ctx)
         .expect("error while building the Rillio desktop shell")

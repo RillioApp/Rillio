@@ -33,6 +33,14 @@ stale, present but not applying means the WebView2 cache.
 `libmpv-2.dll` is not present next to the debug binary, so playback is disabled
 under `cargo run` (harmless for UI work; the release bundle ships the dll).
 
+The shell links whisper.cpp (generated subtitles, `src/transcribe.rs`) through
+`whisper-rs`, which compiles it with cmake and runs bindgen at build time, so a
+Windows build needs cmake plus a libclang: set `LIBCLANG_PATH` to a directory
+holding `libclang.dll` (CI uses the runner's `C:\Program Files\LLVM\bin`; a
+dev box can use the PyPI `libclang` wheel's `site-packages\clang\native`). The
+crate's bundled bindings are Linux-only, so `WHISPER_DONT_GENERATE_BINDINGS`
+does not work on MSVC.
+
 **Debug builds use their own profile** (`com.rillio.desktop.dev` - fresh/empty
 data, own dirs under `%LOCALAPPDATA%`), so a dev shell can never contend with
 the installed app's WebView2 profile (root cause of the 2026-08 dead-storage

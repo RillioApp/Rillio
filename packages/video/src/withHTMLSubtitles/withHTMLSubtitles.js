@@ -621,6 +621,56 @@ function withHTMLSubtitles(Video) {
 
                     return true;
                 }
+                case 'setGeneratedSubtitles': {
+                    // The live "Generated" track (shell-side whisper): the whole
+                    // VTT so far, replaced on every batch. Upserted as a buffer
+                    // track so selecting it works like a local file; when it IS
+                    // the selected track the cues swap in place, no reload.
+                    if (commandArgs && typeof commandArgs.text === 'string') {
+                        var generated = tracks.find(function(track) { return track.generated; });
+                        var buffer = new TextEncoder().encode(commandArgs.text).buffer;
+                        if (!generated) {
+                            generated = {
+                                id: 'GENERATED',
+                                url: null,
+                                buffer: buffer,
+                                lang: typeof commandArgs.lang === 'string' ? commandArgs.lang : 'auto',
+                                label: typeof commandArgs.label === 'string' ? commandArgs.label : 'Generated',
+                                origin: 'GENERATED',
+                                generated: true,
+                                embedded: false,
+                            };
+                            tracks.push(generated);
+                            onPropChanged('extraSubtitlesTracks');
+                        } else {
+                            generated.buffer = buffer;
+                            if (typeof commandArgs.lang === 'string' && generated.lang !== commandArgs.lang) {
+                                generated.lang = commandArgs.lang;
+                                onPropChanged('extraSubtitlesTracks');
+                            }
+                        }
+                        if (selectedTrackId === generated.id) {
+                            subtitlesConverter.convert(commandArgs.text)
+                                .then(function(text) {
+                                    return subtitlesParser.parse(text);
+                                })
+                                .then(function(result) {
+                                    if (selectedTrackId !== generated.id) {
+                                        return;
+                                    }
+                                    cuesByTime = result;
+                                    forceRender = true;
+                                    startRenderLoop();
+                                })
+                                .catch(function(error) {
+                                    // eslint-disable-next-line no-console
+                                    console.error('Generated subtitles parse failed', error);
+                                });
+                        }
+                    }
+
+                    return true;
+                }
                 case 'load': {
                     command('unload');
                     if (commandArgs.stream && Array.isArray(commandArgs.stream.subtitles)) {
@@ -729,7 +779,7 @@ function withHTMLSubtitles(Video) {
         external: Video.manifest.external,
         props: Video.manifest.props.concat(['extraSubtitlesTracks', 'selectedExtraSubtitlesTrackId', 'extraSubtitlesDelay', 'extraSubtitlesSize', 'extraSubtitlesOffset', 'extraSubtitlesTextColor', 'extraSubtitlesBackgroundColor', 'extraSubtitlesOutlineColor', 'extraSubtitlesOpacity'])
             .filter(function(value, index, array) { return array.indexOf(value) === index; }),
-        commands: Video.manifest.commands.concat(['load', 'unload', 'destroy', 'addExtraSubtitlesTracks', 'addLocalSubtitles'])
+        commands: Video.manifest.commands.concat(['load', 'unload', 'destroy', 'addExtraSubtitlesTracks', 'addLocalSubtitles', 'setGeneratedSubtitles'])
             .filter(function(value, index, array) { return array.indexOf(value) === index; }),
         events: Video.manifest.events.concat(['propValue', 'propChanged', 'error', 'extraSubtitlesTrackLoaded', 'extraSubtitlesTrackAdded'])
             .filter(function(value, index, array) { return array.indexOf(value) === index; })

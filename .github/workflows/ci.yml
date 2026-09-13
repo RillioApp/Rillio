@@ -90,6 +90,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # whisper-rs-sys runs bindgen at build time (its bundled bindings are
+          # Linux-only); the runner's preinstalled LLVM provides libclang.
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
         with:
           projectPath: apps/desktop/src-tauri
 

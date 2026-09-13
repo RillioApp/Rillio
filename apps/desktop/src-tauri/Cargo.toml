@@ -73,6 +73,23 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 # navigates. Schemes + installer registration are configured in tauri.conf.json;
 # we forward each opened URL to the web client (see lib::queue_or_emit_deep_link).
 tauri-plugin-deep-link = "2"
+# Generated subtitles (src/transcribe.rs): whisper.cpp through whisper-rs,
+# built from source by cmake at compile time (CPU inference; the model file is
+# downloaded on first use, never bundled). Desktop-only: the Android port has
+# no cmake toolchain wired up and no CPU budget for it anyway.
+whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+# Fetches the whisper model from Hugging Face on first use, streaming to disk
+# with progress. rustls so no system TLS surprises; same 0.12 line the updater
+# already pulls in.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Streams the download body chunk by chunk (reqwest's `bytes_stream`).
+futures-util = "0.3"
+
+# whisper.cpp is compiled by cmake at the Rust profile's opt-level; unoptimised
+# inference is ~10x slower, which would make a dev shell's "Generate" useless
+# and its timings meaningless. Always build it optimised.
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3
 
 [target.'cfg(windows)'.dependencies]
 # Win32 HWND for mpv `wid` embedding + child-window z-order (S3/S4). Already in

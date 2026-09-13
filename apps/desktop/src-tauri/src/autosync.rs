@@ -37,8 +37,9 @@ use webrtc_vad::{SampleRate, Vad, VadMode};
 
 use crate::mpv::{self, Mpv, MpvEvent};
 
-/// Decode target. 16 kHz is what the VAD wants; mono s16 keeps the WAV tiny.
-const SAMPLE_RATE: u32 = 16_000;
+/// Decode target. 16 kHz is what the VAD (and whisper) want; mono s16 keeps
+/// the WAV tiny. Shared with transcribe.rs.
+pub(crate) const SAMPLE_RATE: u32 = 16_000;
 /// Correlation grid. 10 ms is finer than anyone can perceive and keeps the
 /// search at a few thousand bins.
 const BIN_MS: i64 = 10;
@@ -48,6 +49,11 @@ const VAD_FRAME_SAMPLES: usize = (SAMPLE_RATE as i64 * VAD_FRAME_MS / 1000) as u
 /// Audio window around the position: mostly behind (already downloaded).
 const WINDOW_BEFORE_S: f64 = 40.0;
 const WINDOW_AFTER_S: f64 = 20.0;
+/// The window is decoded in slices so a torrent that has only part of it
+/// still syncs on the part it has: the longest run of decodable slices
+/// around the position is used, provided it is at least `MIN_RUN_S` long.
+const SLICE_S: f64 = 10.0;
+const MIN_RUN_S: f64 = 20.0;
 /// Largest delay searched either way. Beyond this the subtitles are for a
 /// different cut and no single offset will fix them.
 const MAX_SHIFT_MS: i64 = 30_000;
@@ -146,38 +152,90 @@ pub async fn subtitles_autosync(
 
 /// The blocking pipeline: decode, detect, correlate.
 fn run(url: &str, position_ms: f64, cues: &[(i64, i64)]) -> Result<Outcome, String> {
-    let start_s = (position_ms / 1000.0 - WINDOW_BEFORE_S).max(0.0);
-    let length_s = position_ms / 1000.0 - start_s + WINDOW_AFTER_S;
-    let window_start_ms = (start_s * 1000.0).round() as i64;
+    let window_start_s = (position_ms / 1000.0 - WINDOW_BEFORE_S).max(0.0);
+    let window_end_s = position_ms / 1000.0 + WINDOW_AFTER_S;
 
     let t0 = Instant::now();
-    let samples = decode_pcm(url, start_s, length_s)?;
+    let (start_s, samples) = decode_available(url, window_start_s, window_end_s)?;
     let decoded = t0.elapsed();
-    if samples.len() < VAD_FRAME_SAMPLES * 50 {
-        // Under a second of audio: the window fell off the end of the file or
-        // the stream produced nothing usable.
-        return Err(format!(
-            "autosync: only {} ms of audio decoded at {start_s:.1}s",
-            samples.len() as u64 * 1000 / SAMPLE_RATE as u64
-        ));
-    }
+    let window_start_ms = (start_s * 1000.0).round() as i64;
 
     let t1 = Instant::now();
     let speech = speech_bins(&samples)?;
     let outcome = correlate(&speech, window_start_ms, cues);
     tracing::info!(
-        "autosync: {:.1}s of audio at {start_s:.1}s decoded in {} ms, analysed in {} ms -> {outcome:?}",
+        "autosync: {:.1}s of audio at {start_s:.1}s decoded in {} ms, {} cues ({}..{} ms), analysed in {} ms -> {outcome:?}",
         samples.len() as f64 / SAMPLE_RATE as f64,
         decoded.as_millis(),
+        cues.len(),
+        cues.iter().map(|c| c.0).min().unwrap_or(0),
+        cues.iter().map(|c| c.1).max().unwrap_or(0),
         t1.elapsed().as_millis(),
     );
     Ok(outcome)
 }
 
+/// The window `[from_s, to_s)` in `SLICE_S` slices, keeping the longest run
+/// of slices that decode (a slice that fails or comes back short is a region
+/// the torrent does not have yet, or the end of the file). Returns the run's
+/// start and its samples; an error when no run reaches `MIN_RUN_S`.
+fn decode_available(url: &str, from_s: f64, to_s: f64) -> Result<(f64, Vec<i16>), String> {
+    let full = (SLICE_S * SAMPLE_RATE as f64) as usize;
+    let mut best: Option<(f64, Vec<i16>)> = None;
+    let mut run: Option<(f64, Vec<i16>)> = None;
+    let mut slice_start = from_s;
+    let mut last_error = String::new();
+    while slice_start < to_s {
+        let length = (to_s - slice_start).min(SLICE_S);
+        let decoded = decode_pcm(url, slice_start, length);
+        let complete = decoded.as_ref().map_or(false, |s| s.len() >= (length * SAMPLE_RATE as f64) as usize - full / 100);
+        match decoded {
+            Ok(samples) if complete => {
+                match run.as_mut() {
+                    Some((_, acc)) => acc.extend_from_slice(&samples),
+                    None => run = Some((slice_start, samples)),
+                }
+            }
+            Ok(samples) => {
+                // Short: the file ends inside this slice. Keep what there is
+                // and stop looking further.
+                match run.as_mut() {
+                    Some((_, acc)) => acc.extend_from_slice(&samples),
+                    None => run = Some((slice_start, samples)),
+                }
+                if run.as_ref().map_or(0, |(_, acc)| acc.len()) > best.as_ref().map_or(0, |(_, acc)| acc.len()) {
+                    best = run.take();
+                }
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("autosync: slice at {slice_start:.1}s: {e}");
+                last_error = e;
+                if run.as_ref().map_or(0, |(_, acc)| acc.len()) > best.as_ref().map_or(0, |(_, acc)| acc.len()) {
+                    best = run.take();
+                }
+                run = None;
+            }
+        }
+        slice_start += SLICE_S;
+    }
+    if run.as_ref().map_or(0, |(_, acc)| acc.len()) > best.as_ref().map_or(0, |(_, acc)| acc.len()) {
+        best = run.take();
+    }
+    match best {
+        Some((start, samples)) if samples.len() >= (MIN_RUN_S * SAMPLE_RATE as f64) as usize => Ok((start, samples)),
+        Some((_, samples)) => Err(format!(
+            "autosync: only {:.0}s of audio is available around here (need {MIN_RUN_S:.0}s); let it download a little more",
+            samples.len() as f64 / SAMPLE_RATE as f64
+        )),
+        None => Err(format!("autosync: no audio could be decoded around here ({last_error})")),
+    }
+}
+
 /// Decode `[start_s, start_s + length_s)` of `url` to 16 kHz mono s16 through
 /// a shadow mpv writing a WAV. Synchronous; returns once mpv reports END_FILE
 /// (the pcm ao is untimed, so this runs at decode speed, not playback speed).
-fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i16>, String> {
+pub(crate) fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i16>, String> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -308,7 +366,7 @@ fn parse_wav_s16_mono(bytes: &[u8]) -> Result<Vec<i16>, String> {
 }
 
 /// Speech flags on the 10 ms grid, from the VAD's 20 ms verdicts.
-fn speech_bins(samples: &[i16]) -> Result<Vec<bool>, String> {
+pub(crate) fn speech_bins(samples: &[i16]) -> Result<Vec<bool>, String> {
     let mut vad = Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::Aggressive);
     let per_frame = (VAD_FRAME_MS / BIN_MS) as usize;
     let mut bins = Vec::with_capacity(samples.len() / VAD_FRAME_SAMPLES * per_frame);
@@ -691,6 +749,27 @@ mod tests {
         assert!(parse_wav_s16_mono(&build(1, 1, 44_100, &samples, 10)).is_err());
         assert!(parse_wav_s16_mono(&build(3, 1, 16_000, &samples, 10)).is_err()); // IEEE float
         assert!(parse_wav_s16_mono(b"not a wav at all").is_err());
+    }
+
+    /// Dev diagnostic, not a test: decode the local speech fixture in slices
+    /// and print per-second RMS + voiced fraction, to see what the shadow mpv
+    /// actually hands over. Needs libmpv-2.dll next to the test exe and the
+    /// range server on 8766. `cargo test --lib decode_diag -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn decode_diag() {
+        let url = "http://127.0.0.1:8766/speech-clip.mp4";
+        let (start, samples) = decode_available(url, 0.0, 48.0).expect("decode_available");
+        println!("run starts at {start:.2}s, {} samples ({:.2}s)", samples.len(), samples.len() as f64 / SAMPLE_RATE as f64);
+        let speech = speech_bins(&samples).expect("vad");
+        for (sec, chunk) in samples.chunks(SAMPLE_RATE as usize).enumerate() {
+            let rms = (chunk.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / chunk.len() as f64).sqrt();
+            let bins = &speech[(sec * 100).min(speech.len())..((sec + 1) * 100).min(speech.len())];
+            let voiced = bins.iter().filter(|&&b| b).count();
+            println!("t={sec:>3}s rms={rms:>7.0} voiced={voiced:>3}/100");
+        }
+        let single = decode_pcm(url, 0.0, 48.0).expect("single decode");
+        println!("single decode: {} samples; first 10s equal to sliced: {}", single.len(), single[..160000] == samples[..160000]);
     }
 
     /// The VAD path itself: a 200 Hz tone-with-harmonics burst reads as voiced

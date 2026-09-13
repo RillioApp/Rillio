@@ -16,6 +16,39 @@ type AutoSyncOutcome =
 
 const formatDelaySeconds = (ms: number) => `${ms >= 0 ? '+' : ''}${(ms / 1000).toFixed(2)}`;
 
+// What the shell's whisper worker sends on `subtitles-generate` (src-tauri transcribe.rs).
+type GeneratedSegment = { startMs: number, endMs: number, text: string };
+type GenerateEvent =
+    | { kind: 'status', url: string, state: 'downloading' | 'loading' | 'running' | 'done' | 'idle' | 'error', detail: string | null, progress: number | null }
+    | { kind: 'segments', url: string, language: string | null, segments: GeneratedSegment[] };
+
+const GENERATED_TRACK_ID = 'GENERATED';
+
+const vttTime = (ms: number) => {
+    const total = Math.max(0, Math.round(ms));
+    const h = Math.floor(total / 3600000);
+    const m = Math.floor((total % 3600000) / 60000);
+    const s = Math.floor((total % 60000) / 1000);
+    const f = total % 1000;
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(f).padStart(3, '0')}`;
+};
+
+// The generated track as one VTT (the renderer re-parses the whole thing per
+// batch; a film is a few thousand lines, well inside what that costs).
+const toVtt = (segments: Iterable<GeneratedSegment>): string => {
+    const lines = ['WEBVTT', ''];
+    const sorted = [...segments].sort((a, b) => a.startMs - b.startMs);
+    sorted.forEach((segment, index) => {
+        // The shell times each chunk readably; across chunk edges a held line
+        // may still reach into the next chunk's first line, so clamp here.
+        const next = sorted[index + 1];
+        let end = Math.max(segment.endMs, segment.startMs + 300);
+        if (next && end > next.startMs - 80) end = Math.max(segment.startMs + 300, next.startMs - 80);
+        lines.push(`${vttTime(segment.startMs)} --> ${vttTime(end)}`, segment.text, '');
+    });
+    return lines.join('\n');
+};
+
 const withFallbackLabels = (tracks?: SubtitleTrack[] | null): SubtitleTrack[] => {
     if (!Array.isArray(tracks)) {
         return [];
@@ -91,6 +124,25 @@ const useSubtitles = ({
     const loadedCues = useRef<{ trackId: string, cues: [number, number][] } | null>(null);
     const [cuesTrackId, setCuesTrackId] = useState<string | null>(null);
     const [autoSyncRunning, setAutoSyncRunning] = useState(false);
+    // Generated (whisper) subtitles: the shell transcribes ahead of the
+    // playhead and streams lines; they accumulate here (keyed by start time,
+    // so a re-sent batch never duplicates) and go to the renderer as one VTT.
+    const [generate, setGenerate] = useState<SubtitlesGenerateState>(() => ({
+        supported: Boolean(getTauri()?.core?.invoke),
+        state: 'idle',
+        progress: null,
+        detail: null,
+    }));
+    const generateRef = useRef(generate);
+    generateRef.current = generate;
+    const generatedSegments = useRef<Map<number, GeneratedSegment>>(new Map());
+    const generatedLang = useRef<string | null>(null);
+    // Set by a fresh Generate press: select the track as soon as it has lines
+    // (it does not exist before the first batch). `pendingFrom` remembers what
+    // was selected at the press, so a viewer picking a different track while
+    // the first lines are still coming reads as "stop", not as "waiting".
+    const selectGeneratedWhenReady = useRef(false);
+    const pendingFrom = useRef<{ embedded: string | null, extra: string | null }>({ embedded: null, extra: null });
 
     videoRef.current = video;
     settingsRef.current = settings;
@@ -290,6 +342,162 @@ const useSubtitles = ({
             })
             .finally(() => setAutoSyncRunning(false));
     }, [changeDelay, t, toast]);
+
+    const pushGenerated = useCallback(() => {
+        videoRef.current.setGeneratedSubtitles(
+            toVtt(generatedSegments.current.values()),
+            generatedLang.current,
+            t('SUBTITLES_GENERATED_LABEL'),
+        );
+    }, [t]);
+
+    const stopGenerate = useCallback(() => {
+        const tauri = getTauri();
+        if (tauri?.core?.invoke && generateRef.current.state !== 'idle') {
+            tauri.core.invoke('subtitles_generate_stop').catch((error: unknown) => {
+                console.error('subtitles_generate_stop failed', error);
+            });
+        }
+        setGenerate((current) => ({ ...current, state: 'idle', progress: null, detail: null }));
+    }, []);
+
+    const startGenerate = useCallback(() => {
+        const tauri = getTauri();
+        const url = videoRef.current.state.stream?.url;
+        if (!tauri?.core?.invoke || typeof url !== 'string') return;
+        // Selection is pending until the player REPORTS the generated track
+        // selected (see the stop-on-other-track effect); when the track
+        // already exists (resuming) it is selected right away.
+        selectGeneratedWhenReady.current = true;
+        pendingFrom.current = {
+            embedded: videoRef.current.state.selectedSubtitlesTrackId,
+            extra: videoRef.current.state.selectedExtraSubtitlesTrackId,
+        };
+        if (generatedSegments.current.size > 0) {
+            defaultTrackSelected.current = true;
+            videoRef.current.setExtraSubtitlesTrack(GENERATED_TRACK_ID);
+        }
+        setGenerate((current) => ({ ...current, state: 'loading', progress: null, detail: null }));
+        tauri.core.invoke('subtitles_generate_start', { url }).catch((error: unknown) => {
+            console.error('subtitles_generate_start failed', error);
+            setGenerate((current) => ({ ...current, state: 'error', progress: null, detail: String(error) }));
+            toast.show({ type: 'error', title: t('SUBTITLES_GENERATE_FAILED'), message: String(error), timeout: 5000 });
+        });
+    }, [t, toast]);
+
+    // AI subtitles are never the default while any other track exists. When
+    // NOTHING is offered (no embedded track, no addon track, a few seconds into
+    // playback so both have had time to show up) and the viewer wants
+    // subtitles at all (a language set), generation starts on its own, once
+    // per stream.
+    const autoStarted = useRef(false);
+    // The position playback was at when this stream loaded: the "few seconds"
+    // are counted from there, not from zero, because a resumed stream starts
+    // mid-film and its tracks are still being reported at that moment.
+    const loadTime = useRef<number | null>(null);
+    useEffect(() => {
+        autoStarted.current = false;
+        loadTime.current = null;
+    }, [video.state.stream]);
+    useEffect(() => {
+        if (video.state.stream === null || typeof video.state.time !== 'number') return;
+        if (loadTime.current === null) {
+            loadTime.current = video.state.time;
+            return;
+        }
+        if (autoStarted.current || !generate.supported || generate.state !== 'idle') return;
+        if (hasTracks || settings.subtitlesLanguage === null) return;
+        if (video.state.time - loadTime.current < 3000) return;
+        autoStarted.current = true;
+        startGenerate();
+    }, [generate.supported, generate.state, hasTracks, settings.subtitlesLanguage, startGenerate, video.state.stream, video.state.time]);
+
+    // The "Generate with AI" row behaves like a language: pick it to start
+    // (or, while a run is in flight, to come back to its track). Stopping is
+    // picking any other language, handled below.
+    const selectGenerate = useCallback(() => {
+        const { state } = generateRef.current;
+        if (state === 'idle' || state === 'error' || state === 'done') {
+            startGenerate();
+        } else if (generatedSegments.current.size > 0 &&
+            videoRef.current.state.selectedExtraSubtitlesTrackId !== GENERATED_TRACK_ID) {
+            selectGeneratedWhenReady.current = true;
+            pendingFrom.current = {
+                embedded: videoRef.current.state.selectedSubtitlesTrackId,
+                extra: videoRef.current.state.selectedExtraSubtitlesTrackId,
+            };
+            defaultTrackSelected.current = true;
+            videoRef.current.setExtraSubtitlesTrack(GENERATED_TRACK_ID);
+        }
+    }, [startGenerate]);
+
+    // The shell's status / line batches for the CURRENT stream.
+    useEffect(() => {
+        const tauri = getTauri();
+        if (!tauri?.event?.listen) return;
+        let unlisten: (() => void) | null = null;
+        let cancelled = false;
+        tauri.event.listen('subtitles-generate', (event: { payload: GenerateEvent }) => {
+            const payload = event.payload;
+            const url = videoRef.current.state.stream?.url;
+            if (typeof url !== 'string' || payload.url !== url) return;
+            if (payload.kind === 'status') {
+                setGenerate((current) => ({ ...current, state: payload.state, progress: payload.progress, detail: payload.detail }));
+                if (payload.state === 'error') {
+                    toast.show({ type: 'error', title: t('SUBTITLES_GENERATE_FAILED'), message: payload.detail ?? '', timeout: 6000 });
+                }
+                return;
+            }
+            for (const segment of payload.segments) {
+                generatedSegments.current.set(segment.startMs, segment);
+            }
+            if (typeof payload.language === 'string') {
+                generatedLang.current = payload.language;
+            }
+            pushGenerated();
+            if (selectGeneratedWhenReady.current &&
+                videoRef.current.state.selectedExtraSubtitlesTrackId !== GENERATED_TRACK_ID) {
+                // The track exists as of pushGenerated; the flag stays up until
+                // the selection is observed in state (a render later).
+                defaultTrackSelected.current = true;
+                videoRef.current.setExtraSubtitlesTrack(GENERATED_TRACK_ID);
+            }
+        }).then((fn: () => void) => {
+            if (cancelled) fn(); else unlisten = fn;
+        });
+        return () => {
+            cancelled = true;
+            unlisten?.();
+        };
+    }, [pushGenerated, t, toast]);
+
+    // A new stream: forget the old transcript and stop the worker. Also the
+    // unmount path (leaving the player must not leave whisper running).
+    useEffect(() => {
+        generatedSegments.current = new Map();
+        generatedLang.current = null;
+        selectGeneratedWhenReady.current = false;
+        return () => stopGenerate();
+    }, [video.state.stream, stopGenerate]);
+
+    // Picking another track (or OFF) while generating stops the worker: the
+    // CPU is not worth a track nobody is reading. Not before the generated
+    // track has been observed selected once (it does not exist until the
+    // first batch, and the selection lands a render after it is requested):
+    // clearing the pending flag any earlier stopped the run on its own first
+    // lines.
+    useEffect(() => {
+        if (generate.state === 'idle' || generate.state === 'error' || generate.state === 'done') return;
+        if (video.state.selectedExtraSubtitlesTrackId === GENERATED_TRACK_ID) {
+            selectGeneratedWhenReady.current = false;
+            return;
+        }
+        const unchanged = video.state.selectedExtraSubtitlesTrackId === pendingFrom.current.extra &&
+            video.state.selectedSubtitlesTrackId === pendingFrom.current.embedded;
+        if (selectGeneratedWhenReady.current && unchanged) return;
+        selectGeneratedWhenReady.current = false;
+        stopGenerate();
+    }, [generate.state, stopGenerate, video.state.selectedExtraSubtitlesTrackId, video.state.selectedSubtitlesTrackId]);
 
     const subtitlesAutoSync: 'unsupported' | 'unavailable' | 'ready' | 'running' = useMemo(() => {
         if (!getTauri()?.core?.invoke) return 'unsupported';
@@ -525,8 +733,12 @@ const useSubtitles = ({
         onExtraSubtitlesSizeChanged: changeSize,
         subtitlesAutoSync,
         onSubtitlesAutoSync: autoSync,
+        subtitlesGenerate: generate,
+        onSubtitlesGenerateSelect: selectGenerate,
     }), [
         autoSync,
+        generate,
+        selectGenerate,
         changeDelay,
         changeOffset,
         changeSize,

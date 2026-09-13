@@ -795,6 +795,28 @@ pub fn shell_init(app: AppHandle, state: State<ShellState>) -> ShellInit {
 /// codec/resolution/HDR/bit-depth/fps/bitrate/hwdec (video) and
 /// codec/channels/sample-rate/bitrate (audio). Polled ~1×/s while the panel is
 /// open. Values are whatever mpv last reported (some are null until playback).
+/// One numeric mpv property from the observed-property cache, for shell-side
+/// features that follow playback (generated subtitles read `time-pos` and
+/// `duration`). `None` before playback or when no player is up; never creates
+/// the player.
+pub(crate) fn player_prop_f64(app: &AppHandle, name: &str) -> Option<f64> {
+    use tauri::Manager;
+    let state = app.state::<ShellState>();
+    let guard = state.0.lock().ok()?;
+    let player = guard.as_ref()?;
+    player.stats().get(name)?.as_f64().filter(|v| v.is_finite())
+}
+
+/// The player's current position in seconds.
+pub(crate) fn player_time_pos(app: &AppHandle) -> Option<f64> {
+    player_prop_f64(app, "time-pos")
+}
+
+/// The playing file's duration in seconds (`None` for a live stream).
+pub(crate) fn player_duration(app: &AppHandle) -> Option<f64> {
+    player_prop_f64(app, "duration").filter(|d| *d > 0.0)
+}
+
 #[tauri::command]
 pub fn shell_mpv_stats(app: AppHandle, state: State<ShellState>) -> Value {
     match state.ensure(&app) {

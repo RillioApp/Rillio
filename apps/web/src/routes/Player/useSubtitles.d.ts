@@ -10,6 +10,7 @@ type SubtitleTrack = {
     embedded?: boolean,
     local?: boolean,
     exclusive?: boolean,
+    generated?: boolean,
     buffer?: ArrayBuffer,
 };
 
@@ -43,6 +44,7 @@ type VideoController = {
     state: VideoSubtitleState,
     addExtraSubtitlesTracks: (tracks: SubtitleTrack[]) => void,
     addLocalSubtitles: (filename: string, buffer: ArrayBuffer) => void,
+    setGeneratedSubtitles: (text: string, lang: string | null, label: string) => void,
     setSubtitlesTrack: (id: string | null) => void,
     setExtraSubtitlesTrack: (id: string | null) => void,
     setSubtitlesDelay: (delay: number) => void,
@@ -51,6 +53,14 @@ type VideoController = {
     setSubtitlesTextColor: (color: string) => void,
     setSubtitlesBackgroundColor: (color: string) => void,
     setSubtitlesOutlineColor: (color: string) => void,
+};
+
+type SubtitlesGenerateState = {
+    supported: boolean,
+    state: 'idle' | 'downloading' | 'loading' | 'running' | 'done' | 'error',
+    // 0..1 while downloading the model.
+    progress: number | null,
+    detail: string | null,
 };
 
 type UseSubtitlesArgs = {
@@ -85,6 +95,9 @@ type SubtitlesMenuProps = {
     // no decoder (hidden); embedded tracks expose no cues (disabled).
     subtitlesAutoSync: 'unsupported' | 'unavailable' | 'ready' | 'running',
     onSubtitlesAutoSync: () => void,
+    // Generated (whisper) subtitles: shell-only; the row shows the phase.
+    subtitlesGenerate: SubtitlesGenerateState,
+    onSubtitlesGenerateSelect: () => void,
     onSubtitlesTrackSelected: (track: SubtitleTrack | null) => void,
     onExtraSubtitlesTrackSelected: (track: SubtitleTrack | null) => void,
     onSubtitlesOffsetChanged: (offset: number) => void,
