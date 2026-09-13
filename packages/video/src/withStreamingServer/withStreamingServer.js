@@ -62,6 +62,29 @@ function torrentIdentity(streamingServerURL, mediaURL, infoHash, fileIdx) {
     return { infoHash: infoHash, fileIdx: fileIdxNumber };
 }
 
+// Subtitle tracks routed through the server's `/subtitles.vtt?from=` converter
+// (SRT and friends become VTT for the HTML renderer), keeping the original url
+// as the fallback for when the conversion fails. One rule for every path a
+// track can take into the player: the stream's own tracks on load (direct
+// play AND transcode) and the addon tracks added later. The direct-play load
+// used to rebuild the stream as `{ url }` alone, so stream-attached subtitles
+// silently vanished in the shell, where direct play is the normal case.
+function serverSubtitles(streamingServerURL, subtitles) {
+    if (!Array.isArray(subtitles)) {
+        return [];
+    }
+
+    return subtitles.map(function(track) {
+        return Object.assign({}, track, {
+            fallbackUrl: track.url,
+            url: typeof track.url === 'string' && typeof streamingServerURL === 'string' ?
+                url.resolve(streamingServerURL, '/subtitles.vtt?' + new URLSearchParams([['from', track.url]]).toString())
+                :
+                track.url
+        });
+    });
+}
+
 function withStreamingServer(Video) {
     function VideoWithStreamingServer(options) {
         options = options || {};
@@ -264,7 +287,10 @@ function withStreamingServer(Video) {
                                                 // whose url is a server route with
                                                 // no byte-plane equivalent.
                                                 stream: Object.assign(
-                                                    { url: mediaURL },
+                                                    {
+                                                        url: mediaURL,
+                                                        subtitles: serverSubtitles(commandArgs.streamingServerURL, commandArgs.stream.subtitles)
+                                                    },
                                                     torrentIdentity(commandArgs.streamingServerURL, mediaURL, infoHash, fileIdx)
                                                 )
                                             };
@@ -292,17 +318,7 @@ function withStreamingServer(Video) {
                                             fileIdx: fileIdx,
                                             stream: {
                                                 url: url.resolve(commandArgs.streamingServerURL, '/hlsv2/' + id + '/master.m3u8?' + queryParams.toString()),
-                                                subtitles: Array.isArray(commandArgs.stream.subtitles) ?
-                                                    commandArgs.stream.subtitles.map(function(track) {
-                                                        return Object.assign({}, track, {
-                                                            url: typeof track.url === 'string' ?
-                                                                url.resolve(commandArgs.streamingServerURL, '/subtitles.vtt?' + new URLSearchParams([['from', track.url]]).toString())
-                                                                :
-                                                                track.url
-                                                        });
-                                                    })
-                                                    :
-                                                    [],
+                                                subtitles: serverSubtitles(commandArgs.streamingServerURL, commandArgs.stream.subtitles),
                                                 behaviorHints: {
                                                     headers: {
                                                         'content-type': 'application/vnd.apple.mpegurl'
@@ -386,16 +402,7 @@ function withStreamingServer(Video) {
                                 type: 'command',
                                 commandName: 'addExtraSubtitlesTracks',
                                 commandArgs: Object.assign({}, commandArgs, {
-                                    tracks: commandArgs.tracks.map(function(track) {
-                                        return Object.assign({}, track, {
-                                            // fallback is used in case server conversion fails (if server is offline)
-                                            fallbackUrl: track.url,
-                                            url: typeof track.url === 'string' && typeof loadArgs.streamingServerURL === 'string' ?
-                                                url.resolve(loadArgs.streamingServerURL, '/subtitles.vtt?' + new URLSearchParams([['from', track.url]]).toString())
-                                                :
-                                                track.url
-                                        });
-                                    })
+                                    tracks: serverSubtitles(loadArgs.streamingServerURL, commandArgs.tracks)
                                 })
                             });
                         } else {

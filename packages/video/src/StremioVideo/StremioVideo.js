@@ -63,8 +63,9 @@ function StremioVideo() {
                     video.on('audioTrackLoaded', function(track) {
                         events.emit('audioTrackLoaded', track);
                     });
-                    video.on('extraSubtitlesTrackLoaded', function(track) {
-                        events.emit('extraSubtitlesTrackLoaded', track);
+                    video.on('extraSubtitlesTrackLoaded', function(track, cues) {
+                        // `cues`: the track's [start, end] ms intervals (auto-sync input).
+                        events.emit('extraSubtitlesTrackLoaded', track, cues);
                     });
                     video.on('extraSubtitlesTrackAdded', function(track) {
                         events.emit('extraSubtitlesTrackAdded', track);

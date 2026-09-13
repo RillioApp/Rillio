@@ -25,7 +25,7 @@ import StatisticsMenu from './StatisticsMenu';
 import OptionsMenu from './OptionsMenu';
 import SubtitlesMenu from './SubtitlesMenu';
 import AudioMenu from './AudioMenu';
-import SpeedMenu from './SpeedMenu';
+import SpeedMenu, { MAX_SPEED, MIN_SPEED } from './SpeedMenu';
 import SideDrawerButton from './SideDrawerButton';
 import SideDrawer from './SideDrawer';
 import usePlayer from './usePlayer';
@@ -929,7 +929,8 @@ const Player = () => {
 
     onShortcut('speed', (combo: number) => {
         if (video.state.playbackSpeed !== null) {
-            const speed = combo === 0 ? Math.max(video.state.playbackSpeed - 0.25, 0.25) : Math.min(video.state.playbackSpeed + 0.25, 2);
+            // Same bounds as the speed menu's custom control (0.1x..4x).
+            const speed = combo === 0 ? Math.max(video.state.playbackSpeed - 0.25, MIN_SPEED) : Math.min(video.state.playbackSpeed + 0.25, MAX_SPEED);
             onPlaybackSpeedChanged(speed);
         }
     }, [video.state.playbackSpeed, onPlaybackSpeedChanged], !menusOpen);

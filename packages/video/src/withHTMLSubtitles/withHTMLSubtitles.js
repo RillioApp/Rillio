@@ -447,7 +447,11 @@ function withHTMLSubtitles(Video) {
                                     if (isWebkitDisplayingFullscreen() && nativeTextTrack === null) {
                                         createNativeTrack();
                                     }
-                                    events.emit('extraSubtitlesTrackLoaded', selectedTrack);
+                                    // Second argument: the track's cue intervals
+                                    // (ms), the input to subtitle auto-sync.
+                                    events.emit('extraSubtitlesTrackLoaded', selectedTrack, result.cues.map(function(cue) {
+                                        return [cue.startTime, cue.endTime];
+                                    }));
                                 })
                                 .catch(function(error) {
                                     if (selectedTrackId !== selectedTrack.id) {

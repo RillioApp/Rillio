@@ -1,21 +1,24 @@
 // Copyright (C) 2017-2026 Smart code 203358507
 
 /**
- * Playback-speed picker. Fixed-position, state-driven floating <div> (opened from Player
+ * Playback-speed panel. Fixed-position, state-driven floating <div> (opened from Player
  * state, not a menu/popover trigger) whose close rides native mousedown bubbling to the
  * Player's onContainerMouseDown; see the researched KEEP note at the menu-layer mount in
- * Player.tsx for why no 2026 primitive fits. Restyled onto Tailwind tokens + the kit
- * Button; same reversed 0.25x..2.0x rates, same dispatch.
+ * Player.tsx for why no 2026 primitive fits. One control (FineStepper): a slider for
+ * anything between 0.1x and 4x in 0.05 steps, -/+ for 0.25 jumps, a typed value. The
+ * old 0.25x..2x preset list is gone - every preset is one or two taps away on it.
  */
 
 import React, { forwardRef, memo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button } from 'rillio/components/ui';
 import { cn } from 'rillio/components/ui';
 import ShaderBlurRect from '../ShaderBlurRect';
 import SnapshotBackdrop from '../SnapshotBackdrop';
+import FineStepper from '../FineStepper';
 
-const RATES = Array.from(Array(8).keys(), (n) => n * 0.25 + 0.25).reverse();
+// The control's bounds; the keyboard shortcut in Player.tsx clamps to the same.
+export const MIN_SPEED = 0.1;
+export const MAX_SPEED = 4;
 
 type Props = {
     className?: string;
@@ -28,39 +31,26 @@ const SpeedMenu = memo(forwardRef<HTMLDivElement, Props>(function SpeedMenu({ cl
     const onMouseDown = useCallback((event: React.MouseEvent) => {
         (event.nativeEvent as any).speedMenuClosePrevented = true;
     }, []);
-    const onOptionSelect = useCallback((value: number) => {
+    const onChange = useCallback((value: number) => {
         if (typeof onPlaybackSpeedChanged === 'function') {
             onPlaybackSpeedChanged(value);
         }
     }, [onPlaybackSpeedChanged]);
     return (
-        <div ref={ref} className={cn('w-56', className)} onMouseDown={onMouseDown}>
+        <div ref={ref} className={cn('w-72', className)} onMouseDown={onMouseDown}>
             <SnapshotBackdrop />
             <ShaderBlurRect />
-            <div className={'px-8 py-6 font-bold text-fg'}>
-                {t('PLAYBACK_SPEED')}
-            </div>
-            <div className={'max-h-[32rem] px-4 pb-2'}>
-                {
-                    RATES.map((rate) => {
-                        const selected = rate === playbackSpeed;
-                        return (
-                            <Button
-                                key={rate}
-                                variant={'ghost'}
-                                className={cn(
-                                    'mb-2 flex h-[3.2rem] w-full flex-row items-center rounded-card px-6 hover:bg-surface-hover',
-                                    selected && 'bg-accent-soft',
-                                )}
-                                onClick={() => onOptionSelect(rate)}
-                            >
-                                <div className={'flex-1 text-left font-normal text-fg'}>{rate}x</div>
-                                {selected ? <div className={'ml-4 size-2 flex-none rounded-full bg-primary'} /> : null}
-                            </Button>
-                        );
-                    })
-                }
-            </div>
+            <FineStepper
+                className={'px-6 pb-5 pt-5'}
+                label={'PLAYBACK_SPEED'}
+                value={typeof playbackSpeed === 'number' ? playbackSpeed : null}
+                unit={'x'}
+                min={MIN_SPEED}
+                max={MAX_SPEED}
+                disabled={typeof playbackSpeed !== 'number'}
+                onChange={onChange}
+                resetValue={1}
+            />
         </div>
     );
 }));

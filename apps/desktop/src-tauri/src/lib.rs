@@ -4,6 +4,7 @@
 //! S1: the Rust streaming server runs in-process (no container/sidecar) - the
 //! web client reaches it at http://127.0.0.1:11470 exactly as before.
 
+mod autosync;
 pub mod mpv;
 pub mod platform;
 mod shell;
@@ -513,7 +514,8 @@ pub fn run() {
             shell::player_blur_rect,
             thumbs::player_thumb,
             thumbs::player_thumb_stop,
-            thumbs::player_scene_cuts
+            thumbs::player_scene_cuts,
+            autosync::subtitles_autosync
         ])
         .build(ctx)
         .expect("error while building the Rillio desktop shell")

@@ -14,8 +14,7 @@ import { Button } from 'rillio/components/ui';
 import { cn } from 'rillio/components/ui';
 import ShaderBlurRect from '../ShaderBlurRect';
 import SnapshotBackdrop from '../SnapshotBackdrop';
-import Stepper from '../SubtitlesMenu/Stepper';
-import DelayFineControl from '../DelayFineControl';
+import FineStepper from '../FineStepper';
 
 type Props = {
     className?: string;
@@ -89,20 +88,14 @@ const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ cl
                     steps to get close, 0.05s fine steps to land it. Positive
                     delays the audio (sound too EARLY -> go positive). */}
                 <div className={'flex-none border-t border-line pt-4'}>
-                    <Stepper
-                        className={'px-6 pb-3'}
+                    <FineStepper
+                        className={'px-6 pb-4'}
                         label={'AUDIO_DELAY_TITLE'}
                         value={delaySeconds}
                         unit={'s'}
-                        step={0.25}
                         disabled={delaySeconds === null}
                         onChange={onDelayChanged}
-                    />
-                    <DelayFineControl
-                        className={'px-6 pb-4'}
-                        value={delaySeconds}
-                        disabled={delaySeconds === null}
-                        onChange={onDelayChanged}
+                        resetValue={0}
                     />
                 </div>
             </div>

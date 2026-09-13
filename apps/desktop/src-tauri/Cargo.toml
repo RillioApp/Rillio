@@ -47,6 +47,11 @@ base64 = "0.22"
 # block_on, the AsyncRead/AsyncSeek extension traits, Notify for cancellation
 # and `time::timeout` for the tail prefetch. Same tokio Tauri already pulls in.
 tokio = { version = "1", features = ["rt", "io-util", "sync", "macros", "time"] }
+# Subtitle auto-sync (src/autosync.rs): speech detection over the audio a
+# shadow mpv decodes around the current position. The WebRTC VAD is a small C
+# library (no model file) built by cc at compile time - the detector ffsubsync
+# defaults to. Nothing else here does DSP.
+webrtc-vad = "0.4"
 
 # Desktop-only Tauri plugins. None exist on Android: single-instance is
 # desktop-only; the updater is replaced by the app store; deep links use a

@@ -1,10 +1,20 @@
 // Copyright (C) 2017-2026 Smart code 203358507
 
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { animate } from 'motion';
 import { useTranslation } from 'react-i18next';
 import { CONSTANTS, onFileDrop, onShortcut, useToast } from 'rillio/common';
+import { getTauri } from 'rillio/common/Platform/shell/isShell';
 import { pickSubtitlesTrack } from './smartTracks';
+
+// What the shell's `subtitles_autosync` command answers (src-tauri autosync.rs).
+type AutoSyncOutcome =
+    | { kind: 'synced', delayMs: number, confidence: number, margin: number, speechFraction: number }
+    | { kind: 'no-dialogue', speechFraction: number }
+    | { kind: 'no-cues' }
+    | { kind: 'ambiguous', delayMs: number, confidence: number, margin: number };
+
+const formatDelaySeconds = (ms: number) => `${ms >= 0 ? '+' : ''}${(ms / 1000).toFixed(2)}`;
 
 const withFallbackLabels = (tracks?: SubtitleTrack[] | null): SubtitleTrack[] => {
     if (!Array.isArray(tracks)) {
@@ -74,6 +84,13 @@ const useSubtitles = ({
     const intendedOffset = useRef<number | null>(null);
     const liftOffsetRef = useRef(liftOffset);
     liftOffsetRef.current = liftOffset;
+    // The selected external track's cue intervals, as the renderer parsed
+    // them (handed over with extraSubtitlesTrackLoaded): the subtitle half of
+    // auto-sync. Keyed by track id so a stale list never syncs a new track;
+    // the id is state as well so the menu button follows availability.
+    const loadedCues = useRef<{ trackId: string, cues: [number, number][] } | null>(null);
+    const [cuesTrackId, setCuesTrackId] = useState<string | null>(null);
+    const [autoSyncRunning, setAutoSyncRunning] = useState(false);
 
     videoRef.current = video;
     settingsRef.current = settings;
@@ -204,6 +221,83 @@ const useSubtitles = ({
         streamStateChanged({ subtitleOffset: offset });
     }, [applyOffset, streamStateChanged]);
 
+    // Auto-sync: the shell listens to the audio around the CURRENT position
+    // and correlates it with this track's cues; a confident answer lands
+    // through changeDelay, so it persists per stream exactly like a manual
+    // nudge. Anchored at the position on purpose: drift is not always
+    // uniform, so Sync is pressed where it is wrong and answers for here.
+    const autoSync = useCallback(() => {
+        const tauri = getTauri();
+        const current = videoRef.current;
+        const trackId = current.state.selectedExtraSubtitlesTrackId;
+        const streamUrl = current.state.stream?.url;
+        const cues = loadedCues.current;
+        if (!tauri?.core?.invoke || typeof trackId !== 'string' || typeof streamUrl !== 'string' ||
+            cues === null || cues.trackId !== trackId || typeof current.state.time !== 'number') {
+            return;
+        }
+        setAutoSyncRunning(true);
+        (tauri.core.invoke('subtitles_autosync', {
+            url: streamUrl,
+            positionMs: current.state.time,
+            cues: cues.cues,
+        }) as Promise<AutoSyncOutcome>)
+            .then((outcome) => {
+                switch (outcome.kind) {
+                    case 'synced':
+                        changeDelay(outcome.delayMs);
+                        toast.show({
+                            type: 'success',
+                            title: t('SUBTITLES_AUTO_SYNC_DONE'),
+                            message: t('SUBTITLES_AUTO_SYNC_DONE_DETAIL', { delay: formatDelaySeconds(outcome.delayMs) }),
+                            timeout: 4000,
+                        });
+                        break;
+                    case 'no-dialogue':
+                        toast.show({
+                            type: 'info',
+                            title: t('SUBTITLES_AUTO_SYNC_NO_DIALOGUE'),
+                            message: t('SUBTITLES_AUTO_SYNC_NO_DIALOGUE_DETAIL'),
+                            timeout: 4000,
+                        });
+                        break;
+                    case 'no-cues':
+                        toast.show({
+                            type: 'info',
+                            title: t('SUBTITLES_AUTO_SYNC_NO_CUES'),
+                            message: t('SUBTITLES_AUTO_SYNC_NO_CUES_DETAIL'),
+                            timeout: 4000,
+                        });
+                        break;
+                    case 'ambiguous':
+                        toast.show({
+                            type: 'alert',
+                            title: t('SUBTITLES_AUTO_SYNC_AMBIGUOUS'),
+                            message: t('SUBTITLES_AUTO_SYNC_AMBIGUOUS_DETAIL'),
+                            timeout: 4000,
+                        });
+                        break;
+                }
+            })
+            .catch((error: unknown) => {
+                console.error('subtitles_autosync failed', error);
+                toast.show({
+                    type: 'error',
+                    title: t('SUBTITLES_AUTO_SYNC_FAILED'),
+                    message: String(error),
+                    timeout: 5000,
+                });
+            })
+            .finally(() => setAutoSyncRunning(false));
+    }, [changeDelay, t, toast]);
+
+    const subtitlesAutoSync: 'unsupported' | 'unavailable' | 'ready' | 'running' = useMemo(() => {
+        if (!getTauri()?.core?.invoke) return 'unsupported';
+        if (autoSyncRunning) return 'running';
+        const trackId = video.state.selectedExtraSubtitlesTrackId;
+        return typeof trackId === 'string' && trackId === cuesTrackId ? 'ready' : 'unavailable';
+    }, [autoSyncRunning, cuesTrackId, video.state.selectedExtraSubtitlesTrackId]);
+
     onFileDrop(CONSTANTS.SUPPORTED_LOCAL_SUBTITLES, (file: File, buffer: ArrayBuffer) => {
         videoRef.current.addLocalSubtitles(file.name, buffer);
     });
@@ -323,7 +417,9 @@ const useSubtitles = ({
             });
         };
 
-        const onExtraSubtitlesTrackLoaded = (track: SubtitleTrack) => {
+        const onExtraSubtitlesTrackLoaded = (track: SubtitleTrack, cues: [number, number][]) => {
+            loadedCues.current = { trackId: track.id, cues: Array.isArray(cues) ? cues : [] };
+            setCuesTrackId(track.id);
             toast.show({
                 type: 'success',
                 title: t('PLAYER_SUBTITLES_LOADED'),
@@ -427,11 +523,15 @@ const useSubtitles = ({
         onExtraSubtitlesOffsetChanged: changeOffset,
         onExtraSubtitlesDelayChanged: changeDelay,
         onExtraSubtitlesSizeChanged: changeSize,
+        subtitlesAutoSync,
+        onSubtitlesAutoSync: autoSync,
     }), [
+        autoSync,
         changeDelay,
         changeOffset,
         changeSize,
         selectEmbeddedTrack,
+        subtitlesAutoSync,
         selectExtraTrack,
         settings.interfaceLanguage,
         settings.subtitlesLanguage,

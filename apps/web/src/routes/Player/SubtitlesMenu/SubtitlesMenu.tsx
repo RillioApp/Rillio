@@ -11,6 +11,7 @@
 
 import React, { forwardRef, memo, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { AudioLines, Loader2 } from 'lucide-react';
 import { languages } from 'rillio/common';
 import { SUBTITLES_SIZES, DEFAULT_SUBTITLES_LANGUAGE, LOCAL_SUBTITLES_LANGUAGE } from 'rillio/common/CONSTANTS';
 import { Button } from 'rillio/components/ui';
@@ -19,7 +20,7 @@ import ShaderBlurRect from '../ShaderBlurRect';
 import SnapshotBackdrop from '../SnapshotBackdrop';
 import Stepper from './Stepper';
 import SubtitleVariant from './SubtitleVariant';
-import DelayFineControl from '../DelayFineControl';
+import FineStepper from '../FineStepper';
 
 const ORIGIN_PRIORITIES = ['LOCAL', 'EMBEDDED', 'EXCLUSIVE'];
 
@@ -236,20 +237,32 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
             <div className={'flex w-[17rem] flex-none flex-col self-stretch'}>
                 <div className={HEADER}>{t('PLAYER_SUBTITLES_SETTINGS')}</div>
                 <div className={'overflow-y-scroll'}>
-                    <Stepper
-                        className={'px-6 pb-3'}
+                    <FineStepper
+                        className={'px-6 pb-4'}
                         label={'DELAY'}
                         value={activeSubtitlesDelay !== null ? activeSubtitlesDelay / 1000 : null}
                         unit={'s'}
-                        step={0.25}
                         disabled={activeSubtitlesDelay === null}
                         onChange={onSubtitlesDelayChanged}
-                    />
-                    <DelayFineControl
-                        className={'px-6 pb-4'}
-                        value={activeSubtitlesDelay !== null ? activeSubtitlesDelay / 1000 : null}
-                        disabled={activeSubtitlesDelay === null}
-                        onChange={onSubtitlesDelayChanged}
+                        resetValue={0}
+                        action={
+                            // Auto sync: shell-only (the decoder lives there), and
+                            // only for external tracks (embedded ones expose no cues).
+                            props.subtitlesAutoSync !== 'unsupported' ?
+                                <Button
+                                    variant={'ghost'}
+                                    size={'sm'}
+                                    disabled={props.subtitlesAutoSync !== 'ready'}
+                                    title={props.subtitlesAutoSync === 'unavailable' ? t('SUBTITLES_AUTO_SYNC_EXTERNAL_ONLY') : t('SUBTITLES_AUTO_SYNC_HINT')}
+                                    onClick={props.onSubtitlesAutoSync}
+                                    className={'h-6 gap-1 bg-(--overlay-color) px-2 text-[0.6875rem] text-fg opacity-100 hover:bg-(--overlay-color) hover:brightness-110 [&_svg]:size-3 [&_svg]:text-fg'}
+                                >
+                                    {props.subtitlesAutoSync === 'running' ? <Loader2 className={'animate-spin'} /> : <AudioLines />}
+                                    {t(props.subtitlesAutoSync === 'running' ? 'SUBTITLES_AUTO_SYNC_RUNNING' : 'SUBTITLES_AUTO_SYNC')}
+                                </Button>
+                                :
+                                null
+                        }
                     />
                     <Stepper
                         className={'px-6 pb-4'}

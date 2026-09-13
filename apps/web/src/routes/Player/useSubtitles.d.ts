@@ -19,7 +19,9 @@ type SelectedSubtitleTrack = {
 };
 
 type VideoSubtitleState = {
-    stream: unknown | null,
+    stream: { url?: unknown } | null,
+    time: number | null,
+    subtitlesDelay: number | null,
     subtitlesTracks: SubtitleTrack[],
     selectedSubtitlesTrackId: string | null,
     subtitlesOffset: number | null,
@@ -77,7 +79,12 @@ type SubtitlesMenuProps = {
     selectedExtraSubtitlesTrackId: string | null,
     extraSubtitlesOffset: number | null,
     extraSubtitlesDelay: number | null,
+    subtitlesDelay: number | null,
     extraSubtitlesSize: number | null,
+    // Auto-sync availability for the menu button: outside the shell there is
+    // no decoder (hidden); embedded tracks expose no cues (disabled).
+    subtitlesAutoSync: 'unsupported' | 'unavailable' | 'ready' | 'running',
+    onSubtitlesAutoSync: () => void,
     onSubtitlesTrackSelected: (track: SubtitleTrack | null) => void,
     onExtraSubtitlesTrackSelected: (track: SubtitleTrack | null) => void,
     onSubtitlesOffsetChanged: (offset: number) => void,

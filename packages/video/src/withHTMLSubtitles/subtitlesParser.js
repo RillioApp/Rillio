@@ -59,6 +59,10 @@ function parse(text) {
                         c1.endTime - c2.endTime;
                 });
             }
+            // The plain cue list rides along (like `times`, a non-time key on
+            // the same object): auto-sync correlates cue intervals against
+            // detected speech and wants exactly what the renderer times by.
+            cuesByTime.cues = cues;
 
             parser.oncue = null;
             parser.onparsingerror = null;

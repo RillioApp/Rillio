@@ -260,7 +260,8 @@ impl Shadow {
 /// file competes with the player's for piece priority, which is exactly the
 /// stall the HTTP path avoids by serving the shadow from the same cached bytes.
 /// `resolve_shadow_url` maps the byte-plane url back to HTTP before this runs.
-fn validate_url(url: &str) -> Result<(), String> {
+/// Shared with autosync.rs, whose decode shadow has the same constraints.
+pub(crate) fn validate_url(url: &str) -> Result<(), String> {
     let lower = url.trim().to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         Ok(())
@@ -277,7 +278,7 @@ fn validate_url(url: &str) -> Result<(), String> {
 /// anyway: `rillio://<ih>/<idx>` maps back to `<base_url>/<ih>/<idx>` on the
 /// port the server really bound. Anything else is returned untouched for
 /// [`validate_url`] to judge.
-fn resolve_shadow_url(app: &tauri::AppHandle, url: &str) -> Result<String, String> {
+pub(crate) fn resolve_shadow_url(app: &tauri::AppHandle, url: &str) -> Result<String, String> {
     use tauri::Manager;
 
     if !url.trim().to_ascii_lowercase().starts_with("rillio://") {

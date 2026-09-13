@@ -161,20 +161,28 @@ const SeekBar = ({ className, time, duration, buffered, thumbStreamUrl, chapters
                 // pointer-events-none: it floats over the bar and must never
                 // steal the hover/drag it is following. The overflow-visible on
                 // the container is load-bearing against the global reset.
-                previewFraction !== null && thumb !== null ?
+                // YouTube's shape: a bare rounded frame, and UNDER it a pill
+                // with the timestamp and the chapter title side by side (the
+                // pill is what shows when there is no frame yet).
+                previewFraction !== null ?
                     <div
-                        className={'pointer-events-none absolute bottom-full mb-3 z-0 -translate-x-1/2 overflow-hidden rounded-lg border border-line bg-black shadow-elevated'}
-                        style={{ left: `clamp(5.5rem, ${previewFraction * 100}%, calc(100% - 5.5rem))` }}
+                        className={'pointer-events-none absolute bottom-full z-0 mb-3 flex -translate-x-1/2 flex-col items-center gap-2'}
+                        style={{ left: `clamp(8rem, ${previewFraction * 100}%, calc(100% - 8rem))` }}
                     >
-                        <img src={thumb} alt={''} className={'block w-44'} draggable={false} />
-                        <div className={'bg-black/80 py-0.5 text-center text-xs text-ice'}>
+                        {
+                            thumb !== null ?
+                                <img src={thumb} alt={''} className={'block w-64 rounded-xl shadow-elevated'} draggable={false} />
+                                :
+                                null
+                        }
+                        <div className={'flex max-w-64 items-center gap-2 rounded-full bg-black/60 px-3 py-1 text-sm text-ice backdrop-blur-sm'}>
+                            <span className={'tabular-nums'}>{formatTime(previewTimeMs as number)}</span>
                             {
                                 previewChapterTitle !== null ?
-                                    <div className={'truncate px-2 font-semibold'}>{previewChapterTitle}</div>
+                                    <span className={'truncate font-semibold'}>{previewChapterTitle}</span>
                                     :
                                     null
                             }
-                            <div className={'tabular-nums'}>{formatTime(previewTimeMs as number)}</div>
                         </div>
                     </div>
                     :
