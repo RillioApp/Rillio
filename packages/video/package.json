@@ -7,7 +7,7 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "https://github.com/pek100/rillio.git",
+        "url": "https://github.com/RillioApp/rillio.git",
         "directory": "packages/video"
     },
     "scripts": {
