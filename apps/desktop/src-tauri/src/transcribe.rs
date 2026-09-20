@@ -85,6 +85,18 @@ pub struct Segment {
     text: String,
 }
 
+impl Segment {
+    pub(crate) fn new(start_ms: i64, end_ms: i64, text: String) -> Self {
+        Self { start_ms, end_ms, text }
+    }
+}
+
+/// Lines transcribed by another producer (the dub worker) for the generated
+/// subtitle track; same event the whisper worker sends.
+pub(crate) fn emit_segments(app: &AppHandle, url: &str, language: Option<String>, segments: Vec<Segment>) {
+    emit(app, Event::Segments { url: url.to_owned(), language, segments });
+}
+
 /// What the web layer receives on `subtitles-generate`.
 #[derive(Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
@@ -120,6 +132,10 @@ struct Inner {
     worker_alive: bool,
     /// When the transcript was last written to disk.
     saved_at: Option<Instant>,
+    /// The viewer wants this track but a dub worker is transcribing for it
+    /// (its lines arrive on the same event); the CPU worker resumes when
+    /// the dub stops.
+    yielded: bool,
 }
 
 impl Inner {
@@ -193,13 +209,67 @@ pub async fn subtitles_generate_start(
         status(&app, &url, "done", None, None);
         return Ok(());
     }
-    // A dedicated OS thread: decoding (mpv FFI), the model load and inference
-    // are all blocking, and one run holds a CPU-heavy context for minutes.
+    // A running dub transcribes the dialogue itself (on the GPU, from the
+    // separated stem) and sends the lines on this same event: a second
+    // whisper on the CPU would only fight it for cores (observed live: both
+    // crawled). The CPU worker resumes when the dub stops.
+    if crate::dub::is_active_for(&app, &url) {
+        if let Ok(mut inner) = arc.lock() {
+            inner.worker_alive = false;
+            inner.yielded = true;
+        }
+        status(&app, &url, "running", Some("from the AI dub".into()), None);
+        return Ok(());
+    }
+    spawn_worker(app, arc, generation, url)
+}
+
+/// A dedicated OS thread: decoding (mpv FFI), the model load and inference
+/// are all blocking, and one run holds a CPU-heavy context for minutes.
+fn spawn_worker(app: AppHandle, arc: Arc<Mutex<Inner>>, generation: u64, url: String) -> Result<(), String> {
     std::thread::Builder::new()
         .name("subtitles-generate".into())
         .spawn(move || worker(app, arc, generation, url))
         .map_err(|e| format!("transcribe: spawn: {e}"))?;
     Ok(())
+}
+
+/// A dub worker starts for `url`: a CPU transcription running for it stops
+/// (its lines now come from the dub) and is remembered as wanted.
+pub(crate) fn yield_to_dub(app: &AppHandle, url: &str) {
+    let state = app.state::<TranscribeState>();
+    let Ok(mut inner) = state.0.lock() else { return };
+    if inner.url.as_deref() != Some(url) || !inner.worker_alive {
+        return;
+    }
+    inner.generation += 1;
+    inner.worker_alive = false;
+    inner.yielded = true;
+    drop(inner);
+    status(app, url, "running", Some("from the AI dub".into()), None);
+}
+
+/// The dub for `url` stopped: a transcription that had yielded to it
+/// resumes on the CPU where the dub left off.
+pub(crate) fn resume_after_dub(app: &AppHandle, url: &str) {
+    let state = app.state::<TranscribeState>();
+    let arc = state.0.clone();
+    let generation = {
+        let Ok(mut inner) = arc.lock() else { return };
+        if inner.url.as_deref() != Some(url) || !inner.yielded || inner.worker_alive {
+            return;
+        }
+        inner.yielded = false;
+        inner.generation += 1;
+        inner.worker_alive = true;
+        inner.generation
+    };
+    if let Err(e) = spawn_worker(app.clone(), arc.clone(), generation, url.to_owned()) {
+        tracing::error!("{e}");
+        if let Ok(mut inner) = arc.lock() {
+            inner.worker_alive = false;
+        }
+    }
 }
 
 /// Stop generating (the track keeps what it has).
@@ -210,6 +280,7 @@ pub async fn subtitles_generate_stop(state: State<'_, TranscribeState>) -> Resul
     // The superseded worker exits after its current chunk; a start in the
     // meantime may spawn its successor.
     inner.worker_alive = false;
+    inner.yielded = false;
     Ok(())
 }
 
@@ -398,7 +469,7 @@ fn cache_path(app: &AppHandle, url: &str, extension: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{}.{extension}", cache_key(url))))
 }
 
-fn cache_key(url: &str) -> String {
+pub(crate) fn cache_key(url: &str) -> String {
     let lower = url.trim().to_ascii_lowercase();
     // Everything after the authority for a local server url; the whole url
     // otherwise (a remote host is part of the identity).

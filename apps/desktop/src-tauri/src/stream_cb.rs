@@ -215,9 +215,26 @@ impl CancelFlag {
     }
 }
 
-/// The `user_data` mpv keeps for the registered protocol.
+/// Opens a stream for a full url of one registered scheme. Each scheme owns its
+/// own grammar (`rillio://` is [`parse_url`]; the dub track has its own), so
+/// the plumbing below never interprets urls itself.
+pub trait UrlOpener: Send + Sync + 'static {
+    fn open_url(&self, url: &str) -> Result<Box<dyn ByteSource>, String>;
+}
+
+impl<F> UrlOpener for F
+where
+    F: Fn(&str) -> Result<Box<dyn ByteSource>, String> + Send + Sync + 'static,
+{
+    fn open_url(&self, url: &str) -> Result<Box<dyn ByteSource>, String> {
+        self(url)
+    }
+}
+
+/// The `user_data` mpv keeps for one registered protocol.
 struct Registration {
-    factory: Box<dyn SourceFactory>,
+    scheme: &'static str,
+    opener: Box<dyn UrlOpener>,
 }
 
 /// The per-stream cookie. `source` is a SEPARATE allocation reached through a
@@ -225,23 +242,33 @@ struct Registration {
 /// concurrently takes `&` to `cancel` without the two ever aliasing the same
 /// object.
 struct Cookie {
+    scheme: &'static str,
     source: *mut Box<dyn ByteSource>,
     cancel: Option<Arc<CancelFlag>>,
 }
 
-/// Register [`SCHEME`] on `mpv`, served by `factory`.
+/// Register [`SCHEME`] on `mpv`, served by `factory` after the strict
+/// `rillio://` grammar has been applied.
 ///
 /// Call BEFORE `mpv.initialize()`. Returns `Err` when the DLL has no
 /// `mpv_stream_cb_add_ro` or its client API predates the ABI - the documented
 /// fallback is then to keep loading the HTTP stream url.
 pub fn register<S: SourceFactory>(mpv: &Mpv, factory: S) -> Result<(), String> {
-    let reg = Box::into_raw(Box::new(Registration { factory: Box::new(factory) }));
+    register_protocol(mpv, SCHEME, move |url: &str| {
+        let (info_hash, file_idx) = parse_url(url).map_err(|e| format!("refusing {url:?}: {e}"))?;
+        factory.open(&info_hash, file_idx)
+    })
+}
+
+/// Register any custom `scheme` on `mpv`, served by `opener`, which receives
+/// the full url and applies its own grammar. Same call-before-initialize rule
+/// and the same `Err` meaning as [`register`].
+pub fn register_protocol<O: UrlOpener>(mpv: &Mpv, scheme: &'static str, opener: O) -> Result<(), String> {
+    let reg = Box::into_raw(Box::new(Registration { scheme, opener: Box::new(opener) }));
     // SAFETY: `reg` is a live Box leak; on success mpv takes ownership and
     // `free_registration` runs after mpv_terminate_destroy. On failure we take
     // it back and drop it here, so neither path leaks.
-    let res = unsafe {
-        mpv.add_stream_protocol(SCHEME, reg as *mut c_void, open_cb, free_registration)
-    };
+    let res = unsafe { mpv.add_stream_protocol(scheme, reg as *mut c_void, open_cb, free_registration) };
     if res.is_err() {
         drop(unsafe { Box::from_raw(reg) });
     }
@@ -268,29 +295,24 @@ unsafe extern "C" fn open_cb(
             return MPV_ERROR_LOADING_FAILED;
         }
         let reg = &*(user_data as *const Registration);
+        let scheme = reg.scheme;
         let url = match CStr::from_ptr(uri).to_str() {
             Ok(s) => s,
             Err(_) => {
-                tracing::error!("rillio://: url is not valid utf-8");
+                tracing::error!("{scheme}://: url is not valid utf-8");
                 return MPV_ERROR_LOADING_FAILED;
             }
         };
-        let (info_hash, file_idx) = match parse_url(url) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("rillio://: refusing {url:?}: {e}");
-                return MPV_ERROR_LOADING_FAILED;
-            }
-        };
-        let source = match reg.factory.open(&info_hash, file_idx) {
+        let source = match reg.opener.open_url(url) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("rillio://{info_hash}/{file_idx}: open failed: {e}");
+                tracing::error!("{scheme}://: open failed for {url:?}: {e}");
                 return MPV_ERROR_LOADING_FAILED;
             }
         };
         let cancel = source.canceller();
         let cookie = Box::into_raw(Box::new(Cookie {
+            scheme,
             source: Box::into_raw(Box::new(source)),
             cancel: cancel.clone(),
         }));
@@ -300,7 +322,7 @@ unsafe extern "C" fn open_cb(
         (*info).size_fn = Some(size_cb);
         (*info).close_fn = Some(close_cb);
         (*info).cancel_fn = if cancel.is_some() { Some(cancel_cb) } else { None };
-        tracing::debug!("rillio://{info_hash}/{file_idx}: stream opened");
+        tracing::debug!("{scheme}://: stream opened for {url:?}");
         0
     }));
     result.unwrap_or_else(|_| {
@@ -323,7 +345,7 @@ unsafe extern "C" fn read_cb(cookie: *mut c_void, buf: *mut c_char, nbytes: u64)
         match (*c.source).read(slice) {
             Ok(read) => read as i64,
             Err(e) => {
-                tracing::error!("rillio://: read failed: {e}");
+                tracing::error!("{}://: read failed: {e}", c.scheme);
                 MPV_ERROR_GENERIC
             }
         }
@@ -343,7 +365,7 @@ unsafe extern "C" fn seek_cb(cookie: *mut c_void, offset: i64) -> i64 {
         match (*c.source).seek(offset as u64) {
             Ok(pos) => pos as i64,
             Err(e) => {
-                tracing::error!("rillio://: seek to {offset} failed: {e}");
+                tracing::error!("{}://: seek to {offset} failed: {e}", c.scheme);
                 MPV_ERROR_UNSUPPORTED
             }
         }
@@ -400,7 +422,7 @@ unsafe extern "C" fn close_cb(cookie: *mut c_void) {
             flag.cancel();
         }
         drop(Box::from_raw(c.source));
-        tracing::debug!("rillio://: stream closed");
+        tracing::debug!("{}://: stream closed", c.scheme);
     }));
 }
 

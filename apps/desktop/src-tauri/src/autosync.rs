@@ -232,10 +232,36 @@ fn decode_available(url: &str, from_s: f64, to_s: f64) -> Result<(f64, Vec<i16>)
     }
 }
 
+/// The shape of PCM a shadow decode produces: interleaved s16 at `rate` with
+/// `channels` channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PcmFormat {
+    pub rate: u32,
+    pub channels: u16,
+}
+
+impl PcmFormat {
+    /// What the analysis paths (VAD, whisper, auto-sync) consume.
+    pub(crate) const ANALYSIS: PcmFormat = PcmFormat { rate: SAMPLE_RATE, channels: 1 };
+
+    fn mpv_channels(self) -> &'static str {
+        match self.channels {
+            1 => "mono",
+            2 => "stereo",
+            n => panic!("PcmFormat: {n} channels has no mpv layout name here"),
+        }
+    }
+}
+
 /// Decode `[start_s, start_s + length_s)` of `url` to 16 kHz mono s16 through
 /// a shadow mpv writing a WAV. Synchronous; returns once mpv reports END_FILE
 /// (the pcm ao is untimed, so this runs at decode speed, not playback speed).
 pub(crate) fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i16>, String> {
+    decode_pcm_as(url, start_s, length_s, PcmFormat::ANALYSIS)
+}
+
+/// [`decode_pcm`] for any [`PcmFormat`]; samples come back interleaved.
+pub(crate) fn decode_pcm_as(url: &str, start_s: f64, length_s: f64, format: PcmFormat) -> Result<Vec<i16>, String> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -245,6 +271,7 @@ pub(crate) fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i
 
     let result = (|| {
         let mpv = Mpv::load(&mpv::default_dll_path())?;
+        let rate = format.rate.to_string();
         for (name, value) in [
             ("vo", "null"),
             ("vid", "no"),
@@ -252,8 +279,8 @@ pub(crate) fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i
             ("ao", "pcm"),
             ("ao-pcm-file", wav_path.as_str()),
             ("ao-pcm-waveheader", "yes"),
-            ("audio-samplerate", "16000"),
-            ("audio-channels", "mono"),
+            ("audio-samplerate", rate.as_str()),
+            ("audio-channels", format.mpv_channels()),
             ("audio-format", "s16"),
             ("start", &format!("{start_s:.3}")),
             ("length", &format!("{length_s:.3}")),
@@ -302,15 +329,15 @@ pub(crate) fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i
         // WAV header; read only after that.
         drop(mpv);
         let bytes = std::fs::read(&wav).map_err(|e| format!("autosync: reading {wav_path}: {e}"))?;
-        parse_wav_s16_mono(&bytes)
+        parse_wav_s16(&bytes, format)
     })();
     let _ = std::fs::remove_file(&wav);
     result
 }
 
-/// Minimal RIFF/WAVE reader for exactly what the shadow writes: PCM, mono,
-/// 16-bit, [`SAMPLE_RATE`]. Anything else is a bug upstream and fails loud.
-fn parse_wav_s16_mono(bytes: &[u8]) -> Result<Vec<i16>, String> {
+/// Minimal RIFF/WAVE reader for exactly what the shadow writes: PCM, 16-bit,
+/// in `format`. Anything else is a bug upstream and fails loud.
+pub(crate) fn parse_wav_s16(bytes: &[u8], format: PcmFormat) -> Result<Vec<i16>, String> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(format!("autosync: not a WAV ({} bytes)", bytes.len()));
     }
@@ -337,9 +364,9 @@ fn parse_wav_s16_mono(bytes: &[u8]) -> Result<Vec<i16>, String> {
                     0xFFFE => declared >= 26 && body + 26 <= bytes.len() && u16_at(body + 24) == 1,
                     _ => false,
                 };
-                if !pcm || channels != 1 || rate != SAMPLE_RATE || bits != 16 {
+                if !pcm || channels != format.channels || rate != format.rate || bits != 16 {
                     return Err(format!(
-                        "autosync: unexpected WAV format tag={tag:#x} ch={channels} rate={rate} bits={bits}"
+                        "autosync: unexpected WAV format tag={tag:#x} ch={channels} rate={rate} bits={bits} (wanted {format:?})"
                     ));
                 }
                 format_ok = true;
@@ -739,16 +766,17 @@ mod tests {
             b
         };
         let samples = [0i16, 1000, -1000, i16::MAX, i16::MIN];
-        assert_eq!(parse_wav_s16_mono(&build(1, 1, 16_000, &samples, 10)).unwrap(), samples);
-        assert_eq!(parse_wav_s16_mono(&build(0xFFFE, 1, 16_000, &samples, 10)).unwrap(), samples);
+        assert_eq!(parse_wav_s16(&build(1, 1, 16_000, &samples, 10), PcmFormat::ANALYSIS).unwrap(), samples);
+        assert_eq!(parse_wav_s16(&build(0xFFFE, 1, 16_000, &samples, 10), PcmFormat::ANALYSIS).unwrap(), samples);
         // Unfinalised size field (0): samples run to end of file.
-        assert_eq!(parse_wav_s16_mono(&build(1, 1, 16_000, &samples, 0)).unwrap(), samples);
+        assert_eq!(parse_wav_s16(&build(1, 1, 16_000, &samples, 0), PcmFormat::ANALYSIS).unwrap(), samples);
         // Oversized size field: clamp to what is there.
-        assert_eq!(parse_wav_s16_mono(&build(1, 1, 16_000, &samples, 999)).unwrap(), samples);
-        assert!(parse_wav_s16_mono(&build(1, 2, 16_000, &samples, 10)).is_err());
-        assert!(parse_wav_s16_mono(&build(1, 1, 44_100, &samples, 10)).is_err());
-        assert!(parse_wav_s16_mono(&build(3, 1, 16_000, &samples, 10)).is_err()); // IEEE float
-        assert!(parse_wav_s16_mono(b"not a wav at all").is_err());
+        assert_eq!(parse_wav_s16(&build(1, 1, 16_000, &samples, 999), PcmFormat::ANALYSIS).unwrap(), samples);
+        assert!(parse_wav_s16(&build(1, 2, 16_000, &samples, 10), PcmFormat::ANALYSIS).is_err());
+        assert_eq!(parse_wav_s16(&build(1, 2, 48_000, &samples, 10), PcmFormat { rate: 48_000, channels: 2 }).unwrap(), samples);
+        assert!(parse_wav_s16(&build(1, 1, 44_100, &samples, 10), PcmFormat::ANALYSIS).is_err());
+        assert!(parse_wav_s16(&build(3, 1, 16_000, &samples, 10), PcmFormat::ANALYSIS).is_err()); // IEEE float
+        assert!(parse_wav_s16(b"not a wav at all", PcmFormat::ANALYSIS).is_err());
     }
 
     /// Dev diagnostic, not a test: decode the local speech fixture in slices

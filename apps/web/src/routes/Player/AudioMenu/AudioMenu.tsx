@@ -9,12 +9,14 @@
 
 import React, { forwardRef, memo, MouseEvent, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Loader2, Sparkles } from 'lucide-react';
 import { languages } from 'rillio/common';
 import { Button } from 'rillio/components/ui';
 import { cn } from 'rillio/components/ui';
 import ShaderBlurRect from '../ShaderBlurRect';
 import SnapshotBackdrop from '../SnapshotBackdrop';
 import FineStepper from '../FineStepper';
+import type { DubState } from '../useDub';
 
 type Props = {
     className?: string;
@@ -24,10 +26,36 @@ type Props = {
     audioDelay: number | null;
     onAudioTrackSelected: (id: string) => void;
     onAudioDelayChanged: (delayMs: number) => void;
+    // The AI dub row (shell only): its phase, whether it is the chosen track,
+    // whether its audio is the one heard yet, its click.
+    dub?: DubState;
+    dubChosen?: boolean;
+    dubPlaying?: boolean;
+    onDubSelect?: () => void;
 };
 
-const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ className, selectedAudioTrackId, audioTracks, audioDelay, onAudioTrackSelected, onAudioDelayChanged }, ref) {
+const GIGABYTE = 1e9;
+
+const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ className, selectedAudioTrackId, audioTracks, audioDelay, onAudioTrackSelected, onAudioDelayChanged, dub, dubChosen, dubPlaying, onDubSelect }, ref) {
     const { t } = useTranslation();
+
+    // The dub track's own row carries its state; the plain list never shows it twice.
+    const listedTracks = audioTracks.filter((track) => !track.generated);
+    // The sub-line tells the listener what they hear: while the player holds
+    // on audio not made yet it is buffering (with the seconds ready ahead);
+    // while the audio flows, the dub runs ahead.
+    const working = dub !== undefined && (dub.state === 'preparing' || dub.state === 'running');
+    const buffering = working && (dub.state === 'preparing' || dub.waiting || !dubPlaying);
+    const dubDetail = dub === undefined ? null :
+        dub.state === 'needs-pack' ? t('AUDIO_DUB_DOWNLOAD', { size: `${((dub.packBytes ?? 0) / GIGABYTE).toFixed(1)} GB` }) :
+        dub.state === 'downloading' ? t('AUDIO_DUB_DOWNLOADING', { percent: Math.round((dub.progress ?? 0) * 100) }) :
+        buffering ? t('AUDIO_DUB_PREPARING', { seconds: Math.round(dub.aheadS) }) :
+        working ? t('AUDIO_DUB_RUNNING') :
+        dub.state === 'done' ? t('AUDIO_DUB_DONE') :
+        dub.state === 'error' ? dub.detail :
+        null;
+    // The spinner means "the audio is not flowing yet".
+    const dubBusy = dub !== undefined && (dub.state === 'downloading' || buffering);
 
     const onAudioTrackClick = useCallback(({ currentTarget }: MouseEvent) => {
         const id = currentTarget.getAttribute('data-id')!;
@@ -56,7 +84,7 @@ const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ cl
                 </div>
                 <div className={'flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-4 pb-4'}>
                     {
-                        audioTracks.map(({ id, label, lang }, index) => {
+                        listedTracks.map(({ id, label, lang }, index) => {
                             const selected = selectedAudioTrackId === id;
                             return (
                                 <Button
@@ -82,6 +110,44 @@ const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ cl
                                 </Button>
                             );
                         })
+                    }
+                    {
+                        // The AI dub: a track row of its own. Picking it downloads
+                        // the pack (size shown first), starts the dub, or comes back
+                        // to its track; picking any other track stops the worker.
+                        dub?.supported ?
+                            <Button
+                                variant={'ghost'}
+                                title={t('AUDIO_DUB_HINT')}
+                                onClick={onDubSelect}
+                                className={cn(
+                                    'flex h-16 w-full flex-none gap-4 rounded-card px-6 hover:bg-surface-hover',
+                                    dubChosen && 'bg-accent-soft',
+                                )}
+                            >
+                                {
+                                    dubBusy ?
+                                        <Loader2 className={'size-4 flex-none animate-spin text-fg'} />
+                                        :
+                                        <Sparkles className={'size-4 flex-none text-fg'} />
+                                }
+                                <div className={'flex flex-1 flex-col gap-1 overflow-hidden text-left'}>
+                                    <div className={'truncate text-[1.1rem] leading-6 text-fg'}>
+                                        {t('AUDIO_DUB_AI')}
+                                    </div>
+                                    {
+                                        dubDetail ?
+                                            <div className={'truncate text-[0.9rem] text-fg-muted'}>
+                                                {dubDetail}
+                                            </div>
+                                            :
+                                            null
+                                    }
+                                </div>
+                                {dubChosen ? <div className={'size-2 flex-none rounded-full bg-primary'} /> : null}
+                            </Button>
+                            :
+                            null
                     }
                 </div>
                 {/* A/V sync lives with the audio track it shifts: coarse 0.25s

@@ -440,6 +440,17 @@ impl Controller {
         // without the symbol simply leaves this false and the web keeps using
         // the HTTP URL - the documented fallback, never a hard failure.
         let stream_cb = register_stream_protocol(app, &mpv);
+        // The dub track's timeline (`rillio-dub://`), same rules as above.
+        #[cfg(not(target_os = "android"))]
+        {
+            let app_for_dub = app.clone();
+            match crate::stream_cb::register_protocol(&mpv, crate::dub::SCHEME, move |url: &str| {
+                crate::dub::open(&app_for_dub, url)
+            }) {
+                Ok(()) => tracing::info!("mpv: {}:// registered", crate::dub::SCHEME),
+                Err(e) => tracing::warn!("mpv: {}:// unavailable ({e}); AI dubbing is off", crate::dub::SCHEME),
+            }
+        }
         // ffmpeg's mediacodec hwdec + audiotrack AO and mpv's android VO all
         // reach Java over JNI; hand them the JavaVM before anything initializes.
         // Fail loud: without it they die cryptically at first use instead.
@@ -700,6 +711,12 @@ fn spawn_event_loop(ctrl: Arc<Controller>, app: AppHandle) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(name.clone(), value.clone());
+                    #[cfg(not(target_os = "android"))]
+                    if name == "time-pos" {
+                        if let Some(seconds) = value.as_f64() {
+                            crate::dub::note_playhead(seconds);
+                        }
+                    }
                     // High-signal, low-noise props at debug (skip the per-frame ones).
                     if !matches!(name.as_str(), "time-pos" | "demuxer-cache-time") {
                         tracing::debug!("mpv prop {name} = {value}");
@@ -812,9 +829,29 @@ pub(crate) fn player_time_pos(app: &AppHandle) -> Option<f64> {
     player_prop_f64(app, "time-pos")
 }
 
+/// A boolean player property as last reported (`pause`, `paused-for-cache`).
+pub(crate) fn player_prop_bool(app: &AppHandle, name: &str) -> Option<bool> {
+    use tauri::Manager;
+    let state = app.state::<ShellState>();
+    let guard = state.0.lock().ok()?;
+    let player = guard.as_ref()?;
+    player.stats().get(name)?.as_bool()
+}
+
 /// The playing file's duration in seconds (`None` for a live stream).
 pub(crate) fn player_duration(app: &AppHandle) -> Option<f64> {
     player_prop_f64(app, "duration").filter(|d| *d > 0.0)
+}
+
+/// Run an mpv command issued BY THE SHELL (a Tauri command's own decision, not
+/// web content): this bypasses `MPV_COMMAND_ALLOWLIST`, which guards the web
+/// bridge, so every caller must be a shell module with a fixed argv.
+pub(crate) fn player_command(app: &AppHandle, args: &[&str]) -> Result<(), String> {
+    use tauri::Manager;
+    let state = app.state::<ShellState>();
+    let guard = state.0.lock().map_err(|_| "shell: player state poisoned")?;
+    let player = guard.as_ref().ok_or("shell: no player")?;
+    player.command(args)
 }
 
 #[tauri::command]
@@ -1247,6 +1284,11 @@ pub fn shell_send(
             let value = json_to_mpv_str(list.get(1).unwrap_or(&Value::Null));
             let player = state.ensure(&app)?;
             tracing::debug!("mpv set-prop {name} = {value}");
+            // A seek must not find the dub track's reader parked at its frontier.
+            #[cfg(not(target_os = "android"))]
+            if name == "time-pos" {
+                crate::dub::interrupt_reads(&app);
+            }
             if let Err(e) = player.set_property(name, &value) {
                 // A minimal build may reject a prop (e.g. vo=gpu-next); log but
                 // don't fail the whole load sequence.

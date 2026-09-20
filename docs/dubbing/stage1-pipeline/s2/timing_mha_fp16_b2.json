@@ -1,0 +1,31 @@
+{
+  "tag": "mha_fp16_b2",
+  "fixture": "E:\\datasets\\g2\\f5",
+  "onnx": "E:\\models\\separator\\bs_roformer_ep368_mha_fp16.onnx",
+  "provider": "CUDAExecutionProvider",
+  "batch": 2,
+  "io_binding": true,
+  "fp16_io": false,
+  "opt_level": "all",
+  "mem_pattern": true,
+  "cudnn_conv_algo": "EXHAUSTIVE",
+  "tf32": 1,
+  "cuda_graph": false,
+  "audio_seconds": 60.0,
+  "vocals_si_sdr": 14.892,
+  "residual_si_sdr": 14.942,
+  "si_sdr_delta_vs_torch_db": {
+    "vocals": 0.004,
+    "residual": 0.005
+  },
+  "pass_si_sdr": true,
+  "seconds": 7.1,
+  "rtf": 0.118,
+  "graph_seconds": 4.8,
+  "graph_rtf": 0.081,
+  "session_calls": 7,
+  "session_create_seconds": 0.8,
+  "stft_istft_seconds": 1.9,
+  "pass_rtf": true,
+  "output_finite": true
+}

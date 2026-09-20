@@ -2,11 +2,15 @@ import React, { forwardRef, useLayoutEffect, useMemo, useState } from 'react';
 import { Image } from 'rillio/components';
 import { cn } from 'rillio/components/ui/cn';
 
-// The pre-playback logo: a centered symbol that fills left-to-right by clip-path with
-// download progress (foreground copy) over a dim static copy, both gently breathing.
-// Ported from the former Buffering.less; the breathe keyframe lives in tailwind.css.
-const LOGO = 'absolute block h-auto max-h-60 w-auto max-w-60 ' +
-    'animate-[buffering-pulse_2s_infinite] [transition:clip-path_0.1s_ease-in-out]';
+// The loading mark, everywhere the player waits (before playback, a stall
+// mid-play, the dub's buffering): the title's logo, or its name as text when
+// there is no logo, filling left-to-right by clip-path with progress
+// (foreground copy) over a dim static copy, both gently breathing. Never the
+// brand symbol: it is not part of the player's design. The breathe keyframe
+// lives in tailwind.css.
+const FILL = 'absolute animate-[buffering-pulse_2s_infinite] [transition:clip-path_0.1s_ease-in-out]';
+const LOGO = FILL + ' block h-auto max-h-60 w-auto max-w-60';
+const TITLE = FILL + ' pointer-events-none max-w-[min(44rem,calc(100vw-3rem))] px-6 text-center text-2xl font-semibold leading-snug text-fg [overflow-wrap:anywhere]';
 
 type Props = {
     className: string,
@@ -44,15 +48,14 @@ const Buffering = forwardRef<HTMLDivElement, Props>(({ className, logo, title, p
         };
     }, [progress]);
 
-    // A logo that is missing, or one that failed to load, would render the
-    // generic symbol - when a title is available (the stream/file name for
-    // meta-less playback) show that text instead, it is strictly more useful.
+    // A logo that is missing, or one that failed to load, gives way to the
+    // title text (the stream/file name for meta-less playback), same fill.
     const [logoBroken, setLogoBroken] = useState(false);
     useLayoutEffect(() => {
         setLogoBroken(false);
     }, [logo]);
     const hasLogo = typeof logo === 'string' && logo.length > 0 && !logoBroken;
-    const showTitle = !hasLogo && typeof title === 'string' && title.length > 0;
+    const titleText = typeof title === 'string' && title.length > 0 ? title : null;
 
     // Only a torrent stream that has not started playing yet gets the panel;
     // direct (non-torrent) streams have no infoHash, and once loaded is true the
@@ -83,30 +86,38 @@ const Buffering = forwardRef<HTMLDivElement, Props>(({ className, logo, title, p
     return (
         <div ref={ref} className={cn('flex items-center justify-center', className)}>
             {
-                showTitle ?
-                    <div
-                        className="pointer-events-none max-w-[min(44rem,calc(100vw-3rem))] px-6 text-center text-2xl font-semibold leading-snug text-fg [overflow-wrap:anywhere]"
-                        title={title as string}
-                    >
-                        {title}
-                    </div>
-                    :
+                hasLogo ?
                     <>
                         <Image
                             className={LOGO}
                             style={style}
                             src={logo}
                             alt={' '}
-                            fallbackSrc={require('/assets/images/symbol.svg')}
+                            fallbackSrc={''}
+                            renderFallback={() => null}
                             onError={() => setLogoBroken(true)}
                         />
                         <Image
                             className={cn(LOGO, 'opacity-20!')}
                             src={logo}
                             alt={' '}
-                            fallbackSrc={require('/assets/images/symbol.svg')}
+                            fallbackSrc={''}
+                            renderFallback={() => null}
+                            onError={() => undefined}
                         />
                     </>
+                    :
+                    titleText !== null ?
+                        <>
+                            <div className={TITLE} style={style} title={titleText}>
+                                {titleText}
+                            </div>
+                            <div className={cn(TITLE, 'opacity-20!')}>
+                                {titleText}
+                            </div>
+                        </>
+                        :
+                        null
             }
             {
                 showStatus ?

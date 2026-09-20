@@ -1,0 +1,26 @@
+{
+  "fixture": "E:\\datasets\\g2\\f5",
+  "onnx": "E:\\models\\separator\\bs_roformer_ep368.onnx",
+  "chunk_size": 352800,
+  "overlap": 2,
+  "audio_seconds": 60.0,
+  "max_abs_diff_vocals": 1.1518597602844238e-05,
+  "vocals_peak_torch": 0.6563830971717834,
+  "torch": {
+    "vocals_si_sdr": 14.888,
+    "residual_si_sdr": 14.937,
+    "seconds": 462.2,
+    "rtf_cpu": 7.703
+  },
+  "onnx_cpu": {
+    "vocals_si_sdr": 14.888,
+    "residual_si_sdr": 14.937,
+    "seconds": 412.0,
+    "rtf_cpu": 6.867
+  },
+  "si_sdr_delta_db": {
+    "vocals_si_sdr": 0.0,
+    "residual_si_sdr": 0.0
+  },
+  "pass": true
+}

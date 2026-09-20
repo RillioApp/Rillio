@@ -301,6 +301,9 @@ function ShellVideo(options) {
                             embedded: true,
                             forced: x.forced === true,
                             default: x['default'] === true,
+                            // The only external audio track is the one the shell
+                            // adds itself (the AI dub, `audio-add` is shell-issued).
+                            generated: x.external === true,
                             mode: x.id === props.aid ? 'showing' : 'disabled',
                         };
                     });

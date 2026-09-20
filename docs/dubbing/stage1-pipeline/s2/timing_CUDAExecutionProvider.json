@@ -1,0 +1,10 @@
+{
+  "fixture": "E:\\datasets\\g2\\f5",
+  "onnx": "E:\\models\\separator\\bs_roformer_ep368.onnx",
+  "provider": "CUDAExecutionProvider",
+  "audio_seconds": 60.0,
+  "vocals_si_sdr": 14.888,
+  "residual_si_sdr": 14.937,
+  "seconds": 98.8,
+  "rtf": 1.646
+}

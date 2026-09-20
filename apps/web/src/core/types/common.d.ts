@@ -67,6 +67,8 @@ type AudioTrack = {
     label: string,
     lang: string,
     origin: string,
+    // The track the shell added itself (the AI dub): shown as its own row.
+    generated?: boolean,
 };
 
 type Rating = 'liked' | 'loved' | null;

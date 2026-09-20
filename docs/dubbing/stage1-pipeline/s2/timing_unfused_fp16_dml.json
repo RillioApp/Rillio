@@ -1,0 +1,31 @@
+{
+  "tag": "unfused_fp16_dml",
+  "fixture": "E:\\datasets\\g2\\f5",
+  "onnx": "E:\\models\\separator\\bs_roformer_ep368_fp16.onnx",
+  "provider": "DmlExecutionProvider",
+  "batch": 1,
+  "io_binding": false,
+  "fp16_io": false,
+  "opt_level": "all",
+  "mem_pattern": true,
+  "cudnn_conv_algo": "EXHAUSTIVE",
+  "tf32": 1,
+  "cuda_graph": false,
+  "audio_seconds": 60.0,
+  "vocals_si_sdr": 14.891,
+  "residual_si_sdr": 14.941,
+  "si_sdr_delta_vs_torch_db": {
+    "vocals": 0.003,
+    "residual": 0.004
+  },
+  "pass_si_sdr": true,
+  "seconds": 11.9,
+  "rtf": 0.199,
+  "graph_seconds": 9.7,
+  "graph_rtf": 0.162,
+  "session_calls": 14,
+  "session_create_seconds": 1.1,
+  "stft_istft_seconds": 1.9,
+  "pass_rtf": true,
+  "output_finite": true
+}

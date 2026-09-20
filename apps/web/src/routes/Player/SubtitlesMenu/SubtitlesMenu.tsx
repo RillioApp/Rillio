@@ -240,7 +240,8 @@ const SubtitlesMenu = memo(forwardRef<HTMLDivElement, any>(function SubtitlesMen
                                 )}
                             >
                                 {
-                                    ['downloading', 'loading', 'running'].includes(props.subtitlesGenerate.state) ?
+                                    // The spinner means "no lines yet"; a running transcription shows steady.
+                                    ['downloading', 'loading'].includes(props.subtitlesGenerate.state) ?
                                         <Loader2 className={'mr-3 size-4 flex-none animate-spin text-fg'} />
                                         :
                                         <Sparkles className={'mr-3 size-4 flex-none text-fg'} />

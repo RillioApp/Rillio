@@ -31,3 +31,7 @@ Thumbs.db
 
 # cargo-run session log (dev harness)
 apps/desktop/src-tauri/.cargo-run.log
+
+# python caches of the dubbing gate scripts
+__pycache__/
+*.pyc

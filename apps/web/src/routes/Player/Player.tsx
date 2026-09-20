@@ -37,9 +37,11 @@ import useCacheMetadata from './useCacheMetadata';
 import NextEpisodePreloadPrompt from './NextEpisodePreloadPrompt';
 import { useSkipSegments, activeSegment } from './skipIntro';
 import SkipPill from './SkipPill/SkipPill';
+import GeneratingPill from './GeneratingPill/GeneratingPill';
 import { pickAudioTrack } from './smartTracks';
 import useVideo from './useVideo';
 import useSubtitles from './useSubtitles';
+import useDub from './useDub';
 import useTimelineChapters from './timelineChapters';
 import useVideoSnapshotBackdrop from './useVideoSnapshotBackdrop';
 import useShaderBlurRect from './useShaderBlurRect';
@@ -273,6 +275,13 @@ const Player = () => {
         // audio, ...) keep the lift, or opening them visibly shifts the subs.
         liftOffset: !overlayHidden && !subtitlesMenuOpen,
     });
+
+    const dubAbout = React.useMemo(() => {
+        const content = player?.metaItem?.content;
+        const parts = [content?.name, content?.description].filter((p): p is string => typeof p === 'string' && p.length > 0);
+        return parts.length > 0 ? parts.join('. ') : null;
+    }, [player?.metaItem?.content]);
+    const { dub, dubChosen, dubPlaying, onDubSelect } = useDub({ video, about: dubAbout });
 
     // Seek-bar segments: real chapter marks merged with subtitle silence gaps
     // (the selected EXTERNAL track's cues) and the shell's visual scene sweep,
@@ -1115,7 +1124,7 @@ const Player = () => {
                     null
             }
             {
-                (video.state.buffering || !video.state.loaded) && !error ?
+                (video.state.buffering || !video.state.loaded || dub.waiting) && !error ?
                     <Buffering
                         ref={bufferingRef}
                         className={LAYER}
@@ -1262,6 +1271,16 @@ const Player = () => {
                     null
             }
             {
+                // The AI dub / subtitles are chosen but not flowing yet.
+                !casting ?
+                    <GeneratingPill
+                        dub={dubChosen && !dubPlaying || dub.waiting}
+                        subtitles={['downloading', 'loading'].includes(subtitlesMenuProps.subtitlesGenerate?.state ?? '')}
+                    />
+                    :
+                    null
+            }
+            {
                 nextVideoPopupOpen ?
                     <NextVideoPopup
                         className={MENU_LAYER}
@@ -1347,6 +1366,10 @@ const Player = () => {
                             audioDelay={video.state.audioDelay}
                             onAudioTrackSelected={onAudioTrackSelected}
                             onAudioDelayChanged={onAudioDelayChanged}
+                            dub={dub}
+                            dubChosen={dubChosen}
+                            dubPlaying={dubPlaying}
+                            onDubSelect={onDubSelect}
                         />
                     </Presence>
                     <Presence when={speedMenuOpen}>

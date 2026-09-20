@@ -20,10 +20,16 @@ tauri-build = { version = "2", features = [] }
 # The stream_cb cancellation / worker-guard tests stand up their own
 # multi-threaded runtime (the flavor production uses); the library itself only
 # needs a `runtime::Handle`, so this stays out of [dependencies].
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# The download tests (src/download.rs) stand up a local range-capable HTTP
+# server. Same axum line the streaming server already pulls in.
+axum = "0.8"
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Verifies large model downloads (src/download.rs). Already in the tree via
+# the torrent engine.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -78,6 +84,19 @@ tauri-plugin-deep-link = "2"
 # downloaded on first use, never bundled). Desktop-only: the Android port has
 # no cmake toolchain wired up and no CPU budget for it anyway.
 whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+# The dub's two ONNX models (docs/dubbing/stage1-pipeline): dialogue
+# separation (src/separate.rs, BS-RoFormer on ONNX Runtime's DirectML
+# provider) and the GE2E speaker encoder (src/turns.rs, CPU provider).
+# `load-dynamic`: nothing is linked at build time; onnxruntime.dll +
+# DirectML.dll travel in the dub pack and are loaded from its directory at
+# runtime (one runtime per process: ort keeps the first path it is given).
+# `api-24`: the pack is ONNX Runtime 1.24 (the onnxruntime-directml wheel's
+# DLL), and ort refuses a runtime older than the API generation its feature
+# selects, so this feature tracks the shipped DLL, not ort's default (27).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "tracing", "load-dynamic", "directml", "api-24"] }
+# Real-input FFT for the separator's STFT/iSTFT (kept outside the ONNX
+# export: no complex-tensor lowering) and the speaker encoder's mel frames.
+realfft = "3.5"
 # Fetches the whisper model from Hugging Face on first use, streaming to disk
 # with progress. rustls so no system TLS surprises; same 0.12 line the updater
 # already pulls in.
@@ -100,6 +119,13 @@ windows = { version = "0.61", features = [
     # Version-resource APIs (GetFileVersionInfoW/VerQueryValueW) for the
     # stale-image self-heal: read what the exe ON DISK would run.
     "Win32_Storage_FileSystem",
+    # Job object with KILL_ON_JOB_CLOSE for the dub pack's GPU sidecars
+    # (src/sidecar.rs): they die with the shell even when it crashes.
+    # Threading is needed for IO_COUNTERS inside the job's limit struct,
+    # Security for the SECURITY_ATTRIBUTES in CreateJobObjectW's signature.
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
 # WebView2 COM interfaces (same 0.38.x wry already pins, so the types unify
 # with what PlatformWebview::controller() returns). Used solely to set the

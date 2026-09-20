@@ -27,10 +27,82 @@ mod transcribe {
         Ok(())
     }
 }
+/// The ranged downloader and the dub pack ride on reqwest, a desktop-only
+/// dependency here; the pack commands exist on Android as clean refusals.
+#[cfg(not(target_os = "android"))]
+mod download;
+#[cfg(not(target_os = "android"))]
+mod packs;
+#[cfg(target_os = "android")]
+mod packs {
+    #[derive(Default)]
+    pub struct PackState;
+
+    #[tauri::command]
+    pub async fn pack_status() -> Result<(), String> {
+        Err("AI dubbing packs are not available on this device".into())
+    }
+
+    #[tauri::command]
+    pub async fn pack_install() -> Result<(), String> {
+        Err("AI dubbing packs are not available on this device".into())
+    }
+
+    #[tauri::command]
+    pub async fn pack_remove() -> Result<(), String> {
+        Err("AI dubbing packs are not available on this device".into())
+    }
+}
+#[cfg(not(target_os = "android"))]
+pub mod sidecar;
+#[cfg(not(target_os = "android"))]
+pub mod dubclients;
+#[cfg(not(target_os = "android"))]
+mod dubhandle;
+#[cfg(not(target_os = "android"))]
+mod dubplace;
+#[cfg(not(target_os = "android"))]
+mod instrument;
+#[cfg(not(target_os = "android"))]
+pub mod dubfit;
+#[cfg(not(target_os = "android"))]
+mod dub;
+/// AI dubbing is desktop-only (it rides on the shadow decoder and, later, the
+/// GPU sidecars); the commands exist so the invoke surface is identical.
+#[cfg(target_os = "android")]
+mod dub {
+    #[derive(Default)]
+    pub struct DubState;
+
+    #[tauri::command]
+    pub async fn dub_start(_url: String, _about: Option<String>) -> Result<(), String> {
+        Err("AI dubbing is not available on this device".into())
+    }
+
+    #[tauri::command]
+    pub async fn dub_select() -> Result<bool, String> {
+        Err("AI dubbing is not available on this device".into())
+    }
+
+    #[tauri::command]
+    pub async fn dub_stop() -> Result<(), String> {
+        Ok(())
+    }
+}
 mod shell;
 pub mod stream_cb;
 mod surface;
 mod thumbs;
+#[cfg(not(target_os = "android"))]
+mod turns;
+/// Dialogue separation (BS-RoFormer on ONNX Runtime's DirectML provider) is
+/// desktop-only: the runtime pack is a Windows DirectML build of
+/// onnxruntime.dll, and the Android port has neither that pack nor the GPU
+/// budget for a 300 MB transformer per 8 s of audio.
+#[cfg(not(target_os = "android"))]
+pub mod separate;
+#[cfg(not(target_os = "android"))]
+pub mod dubpipe;
 #[cfg(desktop)]
 mod update_window;
 
@@ -438,6 +510,8 @@ pub fn run() {
         .manage(shell::ShellState::default())
         .manage(thumbs::ThumbsState::default())
         .manage(transcribe::TranscribeState::default())
+        .manage(dub::DubState::default())
+        .manage(packs::PackState::default())
         .manage(DeepLinkState::default())
         // Filled in once the server binds (see start_streaming_server). Managed
         // up front so `streaming_server_url` can answer "not yet" instead of
@@ -538,7 +612,13 @@ pub fn run() {
             thumbs::player_scene_cuts,
             autosync::subtitles_autosync,
             transcribe::subtitles_generate_start,
-            transcribe::subtitles_generate_stop
+            transcribe::subtitles_generate_stop,
+            dub::dub_start,
+            dub::dub_select,
+            dub::dub_stop,
+            packs::pack_status,
+            packs::pack_install,
+            packs::pack_remove
         ])
         .build(ctx)
         .expect("error while building the Rillio desktop shell")
