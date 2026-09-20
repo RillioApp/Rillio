@@ -1,7 +1,7 @@
 # rillio-core-web
 
 Wasm bridge exposing `rillio-core` (`crates/core`) to the Rillio web app
-(`apps/web`). Part of the Rillio monorepo (https://github.com/pek100/rillio),
+(`apps/web`). Part of the Rillio monorepo (https://github.com/RillioApp/rillio),
 a hard fork of stremio-core-web.
 
 ## Build

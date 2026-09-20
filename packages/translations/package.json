@@ -10,15 +10,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/pek100/rillio.git",
+    "url": "https://github.com/RillioApp/rillio.git",
     "directory": "packages/translations"
   },
   "author": "Ivo Georgiev",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/pek100/rillio/issues"
+    "url": "https://github.com/RillioApp/rillio/issues"
   },
-  "homepage": "https://github.com/pek100/rillio",
+  "homepage": "https://github.com/RillioApp/rillio",
   "devDependencies": {
     "tape": "^5.9.0"
   }

@@ -43,7 +43,7 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/pek100/rillio/releases/latest/download/latest.json"
+        "https://github.com/RillioApp/rillio/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQyMTRDQUE4NzA0QUVFQjUKUldTMTdrcHdxTW9VMHZVWWlVSlF1ZEdqUldlQlUvbERpN1kwVEUzMjBhSE54d21RSWtGa2pwTGMK",
       "windows": {

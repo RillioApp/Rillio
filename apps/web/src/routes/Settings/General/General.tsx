@@ -196,11 +196,11 @@ const General = forwardRef<HTMLDivElement, Props>(({ profile }: Props, ref) => {
             }
             <Link
                 label={t('SETTINGS_SUPPORT')}
-                href={'https://github.com/pek100/rillio/issues'}
+                href={'https://github.com/RillioApp/rillio/issues'}
             />
             <Link
                 label={t('SETTINGS_SOURCE_CODE')}
-                href={'https://github.com/pek100/rillio'}
+                href={'https://github.com/RillioApp/rillio'}
             />
             <Link
                 label={'Website'}
