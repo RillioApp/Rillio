@@ -106,6 +106,11 @@ const HANDLE_ENV: &str = "RILLIO_DUB_HANDLE";
 /// out, `=1` demands the file (a pack without it is then an error, never a
 /// silent plain clone).
 const INSTRUMENT_ENV: &str = "RILLIO_DUB_INSTRUMENT";
+/// Phrase-anchored placement (`dubplace`): the take cut between phrases and
+/// each phrase put back on its planned time. On by default;
+/// `RILLIO_DUB_ANCHOR=0` leaves the take in one piece (the A/B for cuts that
+/// are heard as abruptions, Michael 2026-09-21).
+const ANCHOR_ENV: &str = "RILLIO_DUB_ANCHOR";
 
 /// Why a window could not be produced: the source is not decodable yet (a
 /// torrent region still downloading: the player stalls there too, retry
@@ -209,6 +214,8 @@ pub struct Pipeline {
     handle: bool,
     /// The reference's instrument for the TTS (see [`INSTRUMENT_ENV`]).
     instrument: Option<Instrument>,
+    /// Put the take's phrases back on their planned times (see [`ANCHOR_ENV`]).
+    anchor: bool,
 }
 
 impl Pipeline {
@@ -216,7 +223,8 @@ impl Pipeline {
     pub fn open(pack_dir: &Path, log_dir: &Path) -> Result<Self, String> {
         let style_segment = std::env::var(STYLE_SEGMENT_ENV).map_or(true, |v| v != "0");
         let handle = std::env::var(HANDLE_ENV).map_or(true, |v| v != "0");
-        let file = |name: &str| -> PathBuf { pack_dir.join(name) };
+        let anchor = std::env::var(ANCHOR_ENV).map_or(true, |v| v != "0");
+        let file =|name: &str| -> PathBuf { pack_dir.join(name) };
         let instrument_file = file(instrument::FILE);
         let want_instrument = match std::env::var(INSTRUMENT_ENV).as_deref() {
             Ok("0") => false,
@@ -225,10 +233,12 @@ impl Pipeline {
             Err(_) => instrument_file.exists(),
         };
         tracing::info!(
-            "dubpipe: style segment {}, handle {}, instrument {}",
+            "dubpipe: pack {}, style segment {}, handle {}, instrument {}, anchor {}",
+            pack_dir.display(),
             if style_segment { "on (M1)" } else { "off (plain clone)" },
             if handle { "on" } else { "off" },
-            if want_instrument { "on (M3)" } else { "off" }
+            if want_instrument { "on (M3)" } else { "off" },
+            if anchor { "on" } else { "off" }
         );
         let mut supervisor = Supervisor::new(log_dir.to_path_buf())?;
         supervisor.start(&file(SidecarKind::Asr.exe_name()), SidecarModels::Asr { model: file(ASR_MODEL), dtw_preset: ASR_DTW_PRESET })?;
@@ -245,7 +255,7 @@ impl Pipeline {
         let separator = Separator::open(&file(SEPARATOR_ONNX), pack_dir).map_err(|e| format!("dubpipe: separator: {e}"))?;
         let encoder = SpeakerEncoder::load(&file(SPEAKER_ENCODER_ONNX))?;
         let instrument = want_instrument.then(|| Instrument::load(&instrument_file)).transpose()?;
-        Ok(Self { supervisor, translator, tts, asr, separator, encoder, source_language: None, about: None, buffer: None, style_segment, handle, instrument })
+        Ok(Self { supervisor, translator, tts, asr, separator, encoder, source_language: None, about: None, buffer: None, style_segment, handle, instrument, anchor })
     }
 
     /// What the stream is (name, synopsis), from the player's metadata.
@@ -311,7 +321,12 @@ impl Pipeline {
             // as the style segment, what the take's delivery follows.
             let style16 = to_i16(slice(&buffer.vocals16, ASR_RATE, turn.start_ms, turn.end_ms));
             let heard = self.asr.transcribe(&style16, &language, self.about.as_deref())?;
+            // Where the line's time goes (ms): hear, translate, instrument, takes.
+            let mut stage_ms = [t0.elapsed().as_millis(), 0, 0, 0];
             let src = heard.text;
+            // Heard and translated side by side in the log: a wrong line is
+            // either misheard here or mistranslated below, and only this tells which.
+            tracing::info!("dubpipe: heard {:>7.1}s {src:?}", (turn.start_ms + origin_ms) as f64 / 1000.0);
             // The line's voiced runs and which of them are a sound without a
             // word: the handle's rests, and the spoken time the translator
             // writes to.
@@ -342,7 +357,9 @@ impl Pipeline {
                 Err("non-speech")
             } else {
                 let context: Vec<String> = buffer.history.iter().rev().take(CONTEXT_TURNS).rev().cloned().collect();
+                let translate_t0 = Instant::now();
                 let en = self.translator.translate(&src, &context, &source_name, TARGET_LANGUAGE, budget_syllables(spoken_ms, room), self.about.as_deref())?;
+                stage_ms[1] = translate_t0.elapsed().as_millis();
                 buffer.history.push(src.clone());
                 if en.is_empty() || is_non_speech(&en) {
                     tracing::warn!("dubpipe: nothing to say for {src:?} (translated as {en:?})");
@@ -374,11 +391,16 @@ impl Pipeline {
                 };
                 let style = self.style_segment.then_some(style16.as_slice());
                 // the voice as the model's instrument: from the same reference the take clones
+                let instrument_t0 = Instant::now();
                 let patches = match self.instrument.as_mut() {
                     Some(instrument) => Some(instrument.patches(&reference)?),
                     None => None,
                 };
-                match synthesize_verified(&self.tts, &self.asr, &spoken, &line.en, &to_i16(&reference), style, patches.as_deref(), max_s)? {
+                stage_ms[2] = instrument_t0.elapsed().as_millis();
+                let takes_t0 = Instant::now();
+                let verified = synthesize_verified(&self.tts, &self.asr, &spoken, &line.en, &to_i16(&reference), style, patches.as_deref(), max_s)?;
+                stage_ms[3] = takes_t0.elapsed().as_millis();
+                match verified {
                     Some(VerifiedTake { audio: take, wer, word_starts_s }) => {
                         let turn_ms = (turn.end_ms - turn.start_ms).max(0) as u32;
                         // The model holds the asked tempo inside a phrase but
@@ -389,7 +411,7 @@ impl Pipeline {
                         let lead_s = sounding_range(&take).map_or(0.0, |(from, _)| from as f64 / RATE as f64);
                         let take = trim_silence(take);
                         let starts: Vec<f64> = word_starts_s.iter().map(|t| (t - lead_s).max(0.0)).collect();
-                        let anchored = handle.as_ref().and_then(|handle| dubplace::anchor_phrases(&take, RATE, &starts, &handle.entries));
+                        let anchored = handle.as_ref().filter(|_| self.anchor).and_then(|handle| dubplace::anchor_phrases(&take, RATE, &starts, &handle.entries));
                         let was_anchored = anchored.is_some();
                         let (take, how) = fit(anchored.unwrap_or(take), turn_ms, room);
                         let original = slice(&buffer.vocals48, RATE, turn.start_ms, turn.end_ms);
@@ -410,7 +432,10 @@ impl Pipeline {
                 }
             }
             line.ms = t0.elapsed().as_millis();
-            tracing::info!("dubpipe: {}/{} {:>7.1}s {:<22} {} {}", i + 1, due.len(), line.start_ms as f64 / 1000.0, line.fit, line.handle, line.en);
+            tracing::info!(
+                "dubpipe: {}/{} {:>7.1}s {:<22} {} {} [{} ms: hear {} translate {} instrument {} takes {}]",
+                i + 1, due.len(), line.start_ms as f64 / 1000.0, line.fit, line.handle, line.en, line.ms, stage_ms[0], stage_ms[1], stage_ms[2], stage_ms[3]
+            );
             lines.push(line);
         }
 
@@ -479,11 +504,12 @@ impl Pipeline {
 
 /// The buffer's voiced flags and turns, from its whole dialogue stem.
 fn resegment(buffer: &mut Buffer, encoder: &mut SpeakerEncoder) -> Result<(), String> {
+    let t0 = Instant::now();
     let stem = to_i16(&buffer.vocals16);
     buffer.voiced = turns::voiced_flags(&stem)?;
     buffer.turns = segment(&stem, &buffer.voiced, encoder)?;
+    tracing::info!("dubpipe: segmented {:.1} s into {} turns in {} ms", stem.len() as f64 / ASR_RATE as f64, buffer.turns.len(), t0.elapsed().as_millis());
     Ok(())
-
 }
 
 /// Decode and separate `[start, end)` with `margin` frames of context on
@@ -492,7 +518,9 @@ fn resegment(buffer: &mut Buffer, encoder: &mut SpeakerEncoder) -> Result<(), St
 fn separate_span(separator: &Separator, url: &str, start: u64, end: u64, margin: u64) -> Result<(Stems, u64), ProduceError> {
     let from = start.saturating_sub(margin);
     let head = (start - from) as usize;
+    let decode_t0 = Instant::now();
     let pcm = decode_pcm_as(url, from as f64 / RATE as f64, (end + margin - from) as f64 / RATE as f64, FORMAT).map_err(ProduceError::NotReady)?;
+    let decode_ms = decode_t0.elapsed().as_millis();
     let frames = pcm.len() / 2;
     if frames <= head {
         return Err(ProduceError::NotReady(format!("dubpipe: decoded nothing past frame {start}")));
@@ -501,7 +529,7 @@ fn separate_span(separator: &Separator, url: &str, start: u64, end: u64, margin:
     let right: Vec<f32> = pcm.iter().skip(1).step_by(2).map(|&s| s as f32 / 32768.0).collect();
     let t0 = Instant::now();
     let separated = separator.separate([&left, &right], RATE)?;
-    tracing::info!("dubpipe: separated {:.1} s in {} ms", frames as f64 / RATE as f64, t0.elapsed().as_millis());
+    tracing::info!("dubpipe: separated {:.1} s in {} ms (decoded in {decode_ms} ms) for {:.1} s kept", frames as f64 / RATE as f64, t0.elapsed().as_millis(), (end - start) as f64 / RATE as f64);
     let wanted = (frames - head).min((end - start) as usize);
     let range = head..head + wanted;
     let mix: Vec<f32> = range.clone().flat_map(|i| [left[i], right[i]]).collect();

@@ -37,7 +37,6 @@ import useCacheMetadata from './useCacheMetadata';
 import NextEpisodePreloadPrompt from './NextEpisodePreloadPrompt';
 import { useSkipSegments, activeSegment } from './skipIntro';
 import SkipPill from './SkipPill/SkipPill';
-import GeneratingPill from './GeneratingPill/GeneratingPill';
 import { pickAudioTrack } from './smartTracks';
 import useVideo from './useVideo';
 import useSubtitles from './useSubtitles';
@@ -1142,6 +1141,10 @@ const Player = () => {
                         fastModeAvailable={slowDownload.fastModeAvailable}
                         onTryDifferentSource={onTryDifferentSource}
                         onSwitchToFastMode={slowDownload.switchToFastMode}
+                        // Held for the AI dub: the wait says so, with what is ready.
+                        note={dub.waiting || (dubChosen && !dubPlaying) ?
+                            { heading: t('PLAYER_GENERATING_DUB'), detail: t('PLAYER_GENERATING_DUB_READY', { seconds: Math.round(dub.aheadS) }) } :
+                            null}
                     />
                     :
                     null
@@ -1266,16 +1269,6 @@ const Player = () => {
                     <SkipPill
                         segment={skipTarget}
                         onSkip={(segment) => onSeekRequested(Math.round(segment.endSec * 1000))}
-                    />
-                    :
-                    null
-            }
-            {
-                // The AI dub / subtitles are chosen but not flowing yet.
-                !casting ?
-                    <GeneratingPill
-                        dub={dubChosen && !dubPlaying || dub.waiting}
-                        subtitles={['downloading', 'loading'].includes(subtitlesMenuProps.subtitlesGenerate?.state ?? '')}
                     />
                     :
                     null

@@ -378,6 +378,11 @@ const useSubtitles = ({
             videoRef.current.setExtraSubtitlesTrack(GENERATED_TRACK_ID);
         }
         setGenerate((current) => ({ ...current, state: 'loading', progress: null, detail: null }));
+        // Said once, at the start, and only when there is a wait: a resumed
+        // run already has lines on screen.
+        if (generatedSegments.current.size === 0) {
+            toast.show({ type: 'info', title: t('PLAYER_GENERATING_SUBTITLES'), message: t('PLAYER_GENERATING_SUBTITLES_HINT'), timeout: 5000 });
+        }
         tauri.core.invoke('subtitles_generate_start', { url }).catch((error: unknown) => {
             console.error('subtitles_generate_start failed', error);
             setGenerate((current) => ({ ...current, state: 'error', progress: null, detail: String(error) }));

@@ -350,18 +350,39 @@ fn setup_deep_links(app: &tauri::App) {
     });
 }
 
+const LOG_FILE: &str = "rillio.log";
+/// Past this size the log starts over at the next boot.
+const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The app's own log file, `%LOCALAPPDATA%\<identifier>\logs\rillio.log`
+/// (Tauri's `app_log_dir`, where the dub sidecars' `dub\` logs already are).
+/// Appended across sessions. `None` where there is no such directory (mobile)
+/// or it cannot be written: the log is then stderr alone, never a failed boot.
+fn open_log_file(identifier: &str) -> Option<std::fs::File> {
+    let dir = std::path::Path::new(&std::env::var_os("LOCALAPPDATA")?).join(identifier).join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(LOG_FILE);
+    let oversized = std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES);
+    std::fs::OpenOptions::new().create(true).write(true).append(!oversized).truncate(oversized).open(path).ok()
+}
+
+/// `tracing` to stderr AND the log file. A windowed release build has no
+/// stderr, so before the file every line was lost, the dub's per-stage
+/// timings among them (2026-09-21: a slow dub could not be diagnosed).
+fn init_tracing(identifier: &str) {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,rillio_desktop_lib=debug".into());
+    let _ = match open_log_file(identifier) {
+        Some(file) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::io::stderr.and(std::sync::Mutex::new(file))).try_init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).try_init(),
+    };
+}
+
 /// Build and run the Tauri application. On mobile there is no `main()`: the
 /// Android Activity loads this `.so` via JNI and calls the entry point the
 /// `mobile_entry_point` macro generates. On desktop `main.rs` calls it directly.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,rillio_desktop_lib=debug".into()),
-        )
-        .try_init();
-
     // Must run BEFORE any WebView2 initialization (i.e. before Builder::run),
     // otherwise the running WebView2 holds its own cache dirs open and they
     // cannot be deleted. Uses the context (available before .run()) for the
@@ -395,6 +416,9 @@ pub fn run() {
         }
         ctx
     };
+
+    // After the identifier is settled: the log file lives in the profile's dir.
+    init_tracing(&ctx.config().identifier);
 
     // Process-birth journal line: written for EVERY rillio process (main app,
     // update splash, second instances that single-instance will kill) BEFORE

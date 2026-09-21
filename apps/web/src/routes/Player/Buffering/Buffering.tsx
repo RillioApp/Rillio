@@ -33,6 +33,9 @@ type Props = {
     fastModeAvailable?: boolean,
     onTryDifferentSource?: () => void,
     onSwitchToFastMode?: () => void,
+    // Why the player waits when the stream itself is not the reason (the AI
+    // dub is not made yet): a heading and a progress line under the mark.
+    note?: { heading: string, detail: string } | null,
 };
 
 // Pre-playback status panel for torrent streams. When a torrent has been added
@@ -41,7 +44,7 @@ type Props = {
 // how much has downloaded, the current speed, and how many peers we are pulling
 // from. All stats are optional-chained with defaults, so missing stats fall
 // back to a plain "Buffering" without numbers rather than crashing.
-const Buffering = forwardRef<HTMLDivElement, Props>(({ className, logo, title, progress, infoHash, loaded, hasStatistics, peers, speed, completed, escalated, connectionSlow, fastModeAvailable, onTryDifferentSource, onSwitchToFastMode }, ref) => {
+const Buffering = forwardRef<HTMLDivElement, Props>(({ className, logo, title, progress, infoHash, loaded, hasStatistics, peers, speed, completed, escalated, connectionSlow, fastModeAvailable, onTryDifferentSource, onSwitchToFastMode, note }, ref) => {
     const style = useMemo(() => {
         return {
             clipPath: `inset(0 ${100 - progress}% 0 0)`,
@@ -186,7 +189,17 @@ const Buffering = forwardRef<HTMLDivElement, Props>(({ className, logo, title, p
                         }
                     </div>
                     :
-                    null
+                    note ?
+                        <div role="status" className="pointer-events-none absolute bottom-[16%] left-1/2 flex w-[min(28rem,calc(100vw-3rem))] -translate-x-1/2 flex-col items-center gap-2 px-6 text-center">
+                            <div className="text-sm font-semibold uppercase tracking-[0.08em] text-fg">
+                                {note.heading}
+                            </div>
+                            <div className="text-sm text-fg-muted">
+                                {note.detail}
+                            </div>
+                        </div>
+                        :
+                        null
             }
         </div>
     );
