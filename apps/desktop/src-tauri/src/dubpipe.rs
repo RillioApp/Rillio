@@ -787,6 +787,31 @@ mod tests {
         assert_eq!(capitalized(""), "");
     }
 
+    /// An SRT file as script cues (the live test's stand-in for the web's parser).
+    fn srt_cues(srt: &str) -> Vec<crate::dubscript::ScriptCue> {
+        let ms = |stamp: &str| -> Option<i64> {
+            let (clock, millis) = stamp.trim().split_once(',')?;
+            let mut parts = clock.split(':').map(|p| p.parse::<i64>().ok());
+            Some(((parts.next()?? * 60 + parts.next()??) * 60 + parts.next()??) * 1000 + millis.parse::<i64>().ok()?)
+        };
+        srt.replace("\r\n", "\n")
+            .split("\n\n")
+            .filter_map(|block| {
+                let mut rows = block.lines().skip_while(|row| !row.contains("-->"));
+                let (start, end) = rows.next()?.split_once("-->")?;
+                Some(crate::dubscript::ScriptCue { start_ms: ms(start)?, end_ms: ms(end)?, text: rows.collect::<Vec<_>>().join("\n") })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_srt_becomes_script_cues() {
+        let cues = srt_cues("1\r\n00:01:39,600 --> 00:01:44,600\r\n<b>Silver Axe!</b>\r\nBlow away the enemy!\r\n\r\n2\r\n00:02:06,700 --> 00:02:08,600\r\nA pirate's sword, huh?\r\n");
+        assert_eq!(cues.len(), 2);
+        assert_eq!((cues[0].start_ms, cues[0].end_ms), (99_600, 104_600));
+        assert_eq!(Script::new(cues).lines(&[(98_000, 105_300), (126_900, 128_400)]), vec![Some("Silver Axe! Blow away the enemy!".to_owned()), Some("A pirate's sword, huh?".to_owned())]);
+    }
+
     /// The whole pipeline on the pack, offline: F6's windows 3 and 4 (90-150 s,
     /// inside the S5 sample span) through the pack's own sidecars and models.
     /// Needs the staged pack (`RILLIO_DUB_PACK_DIR`, default `E:\packs\dubbing\1`),
@@ -803,6 +828,14 @@ mod tests {
         let t0 = Instant::now();
         let mut pipeline = Pipeline::open(Path::new(&pack), &out.join("logs")).expect("pipeline");
         eprintln!("pipeline open in {:.1} s", t0.elapsed().as_secs_f64());
+        // RILLIO_DUB_SCRIPT_SRT=<file.srt>: the "Loaded subtitles" translation
+        // source, with that track as the viewer's (the episode's own English
+        // track, extracted: `ffmpeg -i <mkv> -map 0:2 official-eng.srt`).
+        if let Ok(srt) = std::env::var("RILLIO_DUB_SCRIPT_SRT") {
+            let cues = srt_cues(&std::fs::read_to_string(&srt).unwrap_or_else(|e| panic!("{srt}: {e}")));
+            eprintln!("script: {} cues from {srt}", cues.len());
+            pipeline.set_script(Some(Arc::new(Script::new(cues))));
+        }
         let url = r"E:\datasets\g0\tomb-raider-king-s01e09.mkv";
         let mut pcm = Vec::new();
         let mut lines = Vec::new();
