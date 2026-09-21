@@ -117,6 +117,11 @@ const ANCHOR_ENV: &str = "RILLIO_DUB_ANCHOR";
 /// test (2026-09-21) found whisper small mishearing Korean and Japanese lines,
 /// which the translator then turns into fluent wrong English.
 const ASR_ENV: &str = "RILLIO_DUB_ASR";
+/// Bench knob: a directory that receives every turn's separated voice as
+/// `<start ms>.wav` (16 kHz mono), the clip the recognizer hears. It makes
+/// the set another recognizer is compared on, line for line. Unset: nothing
+/// is written.
+const DUMP_ENV: &str = "RILLIO_DUB_DUMP_DIR";
 
 /// Why a window could not be produced: the source is not decodable yet (a
 /// torrent region still downloading: the player stalls there too, retry
@@ -222,6 +227,8 @@ pub struct Pipeline {
     instrument: Option<Instrument>,
     /// Put the take's phrases back on their planned times (see [`ANCHOR_ENV`]).
     anchor: bool,
+    /// Where every turn's separated voice is written (see [`DUMP_ENV`]).
+    dump_dir: Option<PathBuf>,
 }
 
 impl Pipeline {
@@ -230,7 +237,11 @@ impl Pipeline {
         let style_segment = std::env::var(STYLE_SEGMENT_ENV).map_or(true, |v| v != "0");
         let handle = std::env::var(HANDLE_ENV).map_or(true, |v| v != "0");
         let anchor = std::env::var(ANCHOR_ENV).map_or(true, |v| v != "0");
-        let file =|name: &str| -> PathBuf { pack_dir.join(name) };
+        let dump_dir = std::env::var(DUMP_ENV).ok().filter(|v| !v.is_empty()).map(PathBuf::from);
+        if let Some(dir) = &dump_dir {
+            std::fs::create_dir_all(dir).map_err(|e| format!("dubpipe: {DUMP_ENV} {}: {e}", dir.display()))?;
+        }
+        let file = |name: &str| -> PathBuf { pack_dir.join(name) };
         let instrument_file = file(instrument::FILE);
         let want_instrument = match std::env::var(INSTRUMENT_ENV).as_deref() {
             Ok("0") => false,
@@ -273,7 +284,7 @@ impl Pipeline {
         let separator = Separator::open(&file(SEPARATOR_ONNX), pack_dir).map_err(|e| format!("dubpipe: separator: {e}"))?;
         let encoder = SpeakerEncoder::load(&file(SPEAKER_ENCODER_ONNX))?;
         let instrument = want_instrument.then(|| Instrument::load(&instrument_file)).transpose()?;
-        Ok(Self { supervisor, translator, tts, asr, separator, encoder, source_language: None, about: None, buffer: None, style_segment, handle, instrument, anchor })
+        Ok(Self { supervisor, translator, tts, asr, separator, encoder, source_language: None, about: None, buffer: None, style_segment, handle, instrument, anchor, dump_dir })
     }
 
     /// What the stream is (name, synopsis), from the player's metadata.
@@ -338,6 +349,11 @@ impl Pipeline {
             // The line's own separated voice: what the recognizer hears and,
             // as the style segment, what the take's delivery follows.
             let style16 = to_i16(slice(&buffer.vocals16, ASR_RATE, turn.start_ms, turn.end_ms));
+            if let Some(dir) = &self.dump_dir {
+                // the recognizer bench set: exactly what the recognizer is given
+                let path = dir.join(format!("{:08}.wav", turn.start_ms + origin_ms));
+                std::fs::write(&path, crate::dubclients::wav_bytes(&style16, ASR_RATE, 1)).map_err(|e| format!("dubpipe: {}: {e}", path.display()))?;
+            }
             let heard = self.asr.transcribe(&style16, &language, self.about.as_deref())?;
             // Where the line's time goes (ms): hear, translate, instrument, takes.
             let mut stage_ms = [t0.elapsed().as_millis(), 0, 0, 0];
