@@ -258,6 +258,8 @@ const Player = () => {
         extraSubtitleTracks,
         selectedExtraSubtitleTrackId,
         subtitlesMenuProps,
+        dubScript,
+        dubScriptDelay,
     } = useSubtitles({
         player,
         video,
@@ -280,7 +282,8 @@ const Player = () => {
         const parts = [content?.name, content?.description].filter((p): p is string => typeof p === 'string' && p.length > 0);
         return parts.length > 0 ? parts.join('. ') : null;
     }, [player?.metaItem?.content]);
-    const { dub, dubChosen, dubPlaying, onDubSelect } = useDub({ video, about: dubAbout });
+    const { dub, dubChosen, dubPlaying, onDubSelect, dubSource, dubSourceInUse, dubSubtitlesUsable, onDubSourceChange } =
+        useDub({ video, about: dubAbout, script: dubScript, scriptDelay: dubScriptDelay });
 
     // Seek-bar segments: real chapter marks merged with subtitle silence gaps
     // (the selected EXTERNAL track's cues) and the shell's visual scene sweep,
@@ -1363,6 +1366,10 @@ const Player = () => {
                             dubChosen={dubChosen}
                             dubPlaying={dubPlaying}
                             onDubSelect={onDubSelect}
+                            dubSource={dubSource}
+                            dubSourceInUse={dubSourceInUse}
+                            dubSubtitlesUsable={dubSubtitlesUsable}
+                            onDubSourceChange={onDubSourceChange}
                         />
                     </Presence>
                     <Presence when={speedMenuOpen}>

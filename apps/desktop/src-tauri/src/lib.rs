@@ -61,6 +61,7 @@ pub mod dubclients;
 mod dubhandle;
 #[cfg(not(target_os = "android"))]
 mod dubplace;
+mod dubscript;
 #[cfg(not(target_os = "android"))]
 mod instrument;
 #[cfg(not(target_os = "android"))]
@@ -639,6 +640,7 @@ pub fn run() {
             transcribe::subtitles_generate_stop,
             dub::dub_start,
             dub::dub_select,
+            dub::dub_forget_track,
             dub::dub_stop,
             packs::pack_status,
             packs::pack_install,

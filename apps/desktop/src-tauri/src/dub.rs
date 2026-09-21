@@ -32,6 +32,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::autosync::PcmFormat;
 use crate::dubpipe::{Pipeline, ProduceError};
+use crate::dubscript::{Script, ScriptCue};
 use crate::stream_cb::{ByteSource, CancelFlag};
 
 /// The scheme, without `://`. Registered with mpv under exactly this name.
@@ -549,6 +550,8 @@ struct Inner {
     phase: Option<&'static str>,
     /// The title's name and synopsis (the player's metadata), for the models.
     about: Option<String>,
+    /// The viewer's loaded subtitle track, when it is the translation source.
+    script: Option<Arc<Script>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -606,16 +609,32 @@ pub(crate) fn open(app: &AppHandle, url: &str) -> Result<Box<dyn ByteSource>, St
 
 /// Start (or resume) producing the dub for `url`; returns the track url to
 /// add to the player. Idempotent for the same url while the worker is alive.
+///
+/// `lines`: the cues of the viewer's loaded subtitle track when the
+/// translation source is "Loaded subtitles" (`dubscript`), `None` for the AI
+/// source. A title, a pack and a source make one dub: the key holds all three
+/// (`dubpipe::recipe`), so another pack or source never replays this audio.
 #[tauri::command]
-pub async fn dub_start(app: AppHandle, state: State<'_, DubState>, url: String, about: Option<String>) -> Result<DubInfo, String> {
+pub async fn dub_start(app: AppHandle, state: State<'_, DubState>, url: String, about: Option<String>, lines: Option<Vec<ScriptCue>>) -> Result<DubInfo, String> {
     let url = crate::thumbs::resolve_shadow_url(&app, &url)?;
     crate::thumbs::validate_url(&url)?;
     let duration = crate::shell::player_duration(&app).ok_or("dub: the player reports no duration yet")?;
-    let key = crate::transcribe::cache_key(&url);
+    let script = match lines {
+        Some(cues) => {
+            let script = Script::new(cues);
+            if script.is_empty() {
+                return Err("dub: the loaded subtitle track holds no line to speak".into());
+            }
+            Some(Arc::new(script))
+        }
+        None => None,
+    };
+    let recipe = crate::dubpipe::recipe(&crate::packs::pack_dir(&app)?, script.as_deref());
+    let key = crate::transcribe::cache_key(&format!("{url}#dub:{recipe}"));
     let arc = state.0.clone();
     let (spawn, generation, timeline) = {
         let mut inner = arc.lock().map_err(|_| "dub: poisoned")?;
-        if inner.url.as_deref() != Some(url.as_str()) {
+        if inner.key.as_deref() != Some(key.as_str()) {
             let path = app
                 .path()
                 .app_data_dir()
@@ -626,6 +645,7 @@ pub async fn dub_start(app: AppHandle, state: State<'_, DubState>, url: String, 
             inner.url = Some(url.clone());
             inner.key = Some(key.clone());
             inner.about = about.clone();
+            inner.script = script.clone();
             inner.added = false;
             inner.generation += 1;
             inner.worker_alive = false;
@@ -675,6 +695,17 @@ pub async fn dub_select(app: AppHandle, state: State<'_, DubState>) -> Result<bo
     }
     crate::shell::player_command(&app, &["audio-add", &track_url, "select", TRACK_TITLE, TRACK_LANG])?;
     Ok(true)
+}
+
+/// Remove the dub's audio track from the player (`id` is mpv's track id, which
+/// the web reads off the track list): the viewer changed the translation
+/// source, so the track's audio is no longer the dub they asked for and the
+/// next start adds the new one. Issued by the shell, like `audio-add`.
+#[tauri::command]
+pub async fn dub_forget_track(app: AppHandle, id: u32) -> Result<(), String> {
+    // `added` is not touched here: the next `dub_start` has another key and
+    // resets it, and this call may land on either side of that start.
+    crate::shell::player_command(&app, &["audio-remove", &id.to_string()])
 }
 
 /// Whether a dub worker is producing for `url` right now: while it is, it
@@ -753,9 +784,10 @@ fn worker(app: AppHandle, arc: Arc<Mutex<Inner>>, generation: u64, url: String, 
         status(&app, &url, &timeline, "preparing", None);
         match resident_pipeline(&app, &arc) {
             Ok(pipeline) => {
-                let about = arc.lock().ok().and_then(|inner| inner.about.clone());
+                let (about, script) = arc.lock().ok().map(|inner| (inner.about.clone(), inner.script.clone())).unwrap_or((None, None));
                 if let Ok(mut pipeline) = pipeline.lock() {
                     pipeline.set_about(about);
+                    pipeline.set_script(script);
                 }
                 Some(pipeline)
             }

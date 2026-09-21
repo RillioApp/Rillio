@@ -24,6 +24,10 @@ type GenerateEvent =
 
 const GENERATED_TRACK_ID = 'GENERATED';
 
+// A loaded external track as the AI dub's lines (src-tauri dubscript.rs).
+export type DubScriptLine = { startMs: number, endMs: number, text: string };
+export type DubScript = { trackId: string, lang: string | null, lines: DubScriptLine[] };
+
 const vttTime = (ms: number) => {
     const total = Math.max(0, Math.round(ms));
     const h = Math.floor(total / 3600000);
@@ -123,6 +127,11 @@ const useSubtitles = ({
     // the id is state as well so the menu button follows availability.
     const loadedCues = useRef<{ trackId: string, cues: [number, number][] } | null>(null);
     const [cuesTrackId, setCuesTrackId] = useState<string | null>(null);
+    // The loaded external track with its lines, for the AI dub (useDub).
+    const [dubScript, setDubScript] = useState<DubScript | null>(null);
+    useEffect(() => {
+        setDubScript(null);
+    }, [video.state.stream]);
     const [autoSyncRunning, setAutoSyncRunning] = useState(false);
     // Generated (whisper) subtitles: the shell transcribes ahead of the
     // playhead and streams lines; they accumulate here (keyed by start time,
@@ -630,9 +639,15 @@ const useSubtitles = ({
             });
         };
 
-        const onExtraSubtitlesTrackLoaded = (track: SubtitleTrack, cues: [number, number][]) => {
+        const onExtraSubtitlesTrackLoaded = (track: SubtitleTrack, cues: [number, number][], lines: DubScriptLine[]) => {
             loadedCues.current = { trackId: track.id, cues: Array.isArray(cues) ? cues : [] };
             setCuesTrackId(track.id);
+            // The AI dub can speak this track's lines (its "Loaded subtitles"
+            // translation source). Never the generated track: those lines come
+            // from the dub or the recognizer themselves.
+            setDubScript(track.id !== GENERATED_TRACK_ID && Array.isArray(lines) && lines.length > 0 ?
+                { trackId: track.id, lang: typeof track.lang === 'string' ? track.lang : null, lines } :
+                null);
             toast.show({
                 type: 'success',
                 title: t('PLAYER_SUBTITLES_LOADED'),
@@ -770,6 +785,9 @@ const useSubtitles = ({
         extraSubtitleTracks: video.state.extraSubtitlesTracks,
         selectedExtraSubtitleTrackId: video.state.selectedExtraSubtitlesTrackId,
         subtitlesMenuProps: menuProps,
+        // The loaded external track's lines and the delay the viewer set on it.
+        dubScript,
+        dubScriptDelay: typeof video.state.extraSubtitlesDelay === 'number' ? video.state.extraSubtitlesDelay : 0,
     };
 };
 

@@ -16,7 +16,7 @@ import { cn } from 'rillio/components/ui';
 import ShaderBlurRect from '../ShaderBlurRect';
 import SnapshotBackdrop from '../SnapshotBackdrop';
 import FineStepper from '../FineStepper';
-import type { DubState } from '../useDub';
+import type { DubSource, DubState } from '../useDub';
 
 type Props = {
     className?: string;
@@ -32,11 +32,21 @@ type Props = {
     dubChosen?: boolean;
     dubPlaying?: boolean;
     onDubSelect?: () => void;
+    // The dub's translation source: the viewer's choice, the one in effect,
+    // whether loaded English subtitles exist to be it, and the change.
+    dubSource?: DubSource;
+    dubSourceInUse?: DubSource;
+    dubSubtitlesUsable?: boolean;
+    onDubSourceChange?: (source: DubSource) => void;
 };
 
 const GIGABYTE = 1e9;
+const DUB_SOURCES: { source: DubSource, label: string }[] = [
+    { source: 'ai', label: 'AUDIO_DUB_SOURCE_AI' },
+    { source: 'subtitles', label: 'AUDIO_DUB_SOURCE_SUBTITLES' },
+];
 
-const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ className, selectedAudioTrackId, audioTracks, audioDelay, onAudioTrackSelected, onAudioDelayChanged, dub, dubChosen, dubPlaying, onDubSelect }, ref) {
+const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ className, selectedAudioTrackId, audioTracks, audioDelay, onAudioTrackSelected, onAudioDelayChanged, dub, dubChosen, dubPlaying, onDubSelect, dubSource, dubSourceInUse, dubSubtitlesUsable, onDubSourceChange }, ref) {
     const { t } = useTranslation();
 
     // The dub track's own row carries its state; the plain list never shows it twice.
@@ -146,6 +156,50 @@ const AudioMenu = memo(forwardRef<HTMLDivElement, Props>(function AudioMenu({ cl
                                 </div>
                                 {dubChosen ? <div className={'size-2 flex-none rounded-full bg-primary'} /> : null}
                             </Button>
+                            :
+                            null
+                    }
+                    {
+                        // Where the dub's lines come from: the recognizer and the
+                        // translator, or the external subtitles the viewer loaded.
+                        dub?.supported && dubSource !== undefined && onDubSourceChange ?
+                            <div className={'flex flex-none flex-col gap-2 px-6 pt-1 pb-2'}>
+                                <div className={'text-[0.6875rem] font-medium uppercase tracking-wider text-fg-muted'}>
+                                    {t('AUDIO_DUB_SOURCE')}
+                                </div>
+                                <div className={'flex gap-2'}>
+                                    {
+                                        DUB_SOURCES.map(({ source, label }) => {
+                                            const unavailable = source === 'subtitles' && !dubSubtitlesUsable;
+                                            return (
+                                                <button
+                                                    key={source}
+                                                    type={'button'}
+                                                    aria-pressed={dubSource === source}
+                                                    title={unavailable ? t('AUDIO_DUB_SOURCE_SUBTITLES_MISSING') : undefined}
+                                                    onClick={() => onDubSourceChange(source)}
+                                                    className={cn(
+                                                        'rounded-full px-3 py-1.5 text-sm font-medium text-fg transition hover:brightness-110',
+                                                        dubSource === source ? 'bg-accent-soft' : 'bg-surface',
+                                                        unavailable && 'opacity-50',
+                                                    )}
+                                                >
+                                                    {t(label)}
+                                                </button>
+                                            );
+                                        })
+                                    }
+                                </div>
+                                {
+                                    // The choice is kept, and says why it is not in effect yet.
+                                    dubSource === 'subtitles' && dubSourceInUse === 'ai' ?
+                                        <div className={'text-xs leading-relaxed text-fg-muted'}>
+                                            {t('AUDIO_DUB_SOURCE_SUBTITLES_MISSING')}
+                                        </div>
+                                        :
+                                        null
+                                }
+                            </div>
                             :
                             null
                     }

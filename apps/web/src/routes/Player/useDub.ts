@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { useToast } from 'rillio/common';
 import { getTauri } from 'rillio/common/Platform/shell/isShell';
 import { getItem, removeItem, setItem } from 'rillio/common/profileStorage';
+import type { DubScript } from './useSubtitles';
 
 // The viewer's choice per stream, so a title they dubbed comes back dubbed
 // (the shell keeps the audio it made; the choice lives here, web-only).
@@ -57,8 +58,29 @@ export type DubState = {
     waiting: boolean,
 };
 
+// Where the dub's lines come from: the recognizer and the translator ("AI"),
+// or the external subtitle track the viewer has loaded. The subtitles win on
+// accuracy where they exist (measured 2026-09-21: the recognizers mishear
+// names and homophones the subtitles simply have), so the viewer chooses.
+export type DubSource = 'ai' | 'subtitles';
+const SOURCE_KEY = 'rillio.dub.source';
+// The dub speaks English today, so only an English track can be its lines.
+const DUB_LANGUAGE_PREFIX = 'en';
+const readSource = (): DubSource => {
+    try {
+        return getItem(SOURCE_KEY) === 'subtitles' ? 'subtitles' : 'ai';
+    } catch (error) {
+        console.error('useDub: failed to read the translation source', error);
+        return 'ai';
+    }
+};
+
 // The slice of the video controller the dub uses (`useVideo`).
 type Args = {
+    // The loaded external subtitle track with its lines, and the delay the
+    // viewer set on it (`useSubtitles`).
+    script: DubScript | null,
+    scriptDelay: number,
     video: {
         state: {
             stream: { url?: unknown } | null,
@@ -74,13 +96,28 @@ type Args = {
     about: string | null,
 };
 
-const useDub = ({ video, about }: Args) => {
+const useDub = ({ video, about, script, scriptDelay }: Args) => {
     const { t } = useTranslation();
     const toast = useToast();
     const videoRef = useRef(video);
     videoRef.current = video;
     const aboutRef = useRef(about);
     aboutRef.current = about;
+    const [source, setSourceState] = useState<DubSource>(readSource);
+    // The subtitles can be the source only when an English external track is loaded.
+    const scriptUsable = script !== null && (script.lang ?? '').toLowerCase().startsWith(DUB_LANGUAGE_PREFIX);
+    const lines = source === 'subtitles' && scriptUsable && script !== null ?
+        script.lines.map((line) => ({ startMs: line.startMs + scriptDelay, endMs: line.endMs + scriptDelay, text: line.text })) :
+        null;
+    const linesRef = useRef(lines);
+    linesRef.current = lines;
+    // What the running dub was started with: a change of it is another dub.
+    const sourceId = lines === null ? 'ai' : `subtitles:${script?.trackId}:${scriptDelay}`;
+    const startedWith = useRef<string | null>(null);
+    // The player's track of a dub that another source replaced.
+    const staleTrackId = useRef<string | null>(null);
+    const sourceIdRef = useRef(sourceId);
+    sourceIdRef.current = sourceId;
     const [dub, setDub] = useState<DubState>(() => ({
         supported: Boolean(getTauri()?.core?.invoke),
         state: 'idle',
@@ -152,7 +189,9 @@ const useDub = ({ video, about }: Args) => {
         if (!tauri?.core?.invoke || switchRequested.current) return;
         switchRequested.current = true;
         pendingFrom.current = videoRef.current.state.selectedAudioTrackId;
-        const existing = videoRef.current.state.audioTracks.find((track: AudioTrack) => track.generated);
+        // Never the track of a dub that was just replaced (another source): it
+        // is being removed and may still be listed for a moment.
+        const existing = videoRef.current.state.audioTracks.find((track: AudioTrack) => track.generated && track.id !== staleTrackId.current);
         if (existing) {
             videoRef.current.setAudioTrack(existing.id);
             return;
@@ -169,7 +208,8 @@ const useDub = ({ video, about }: Args) => {
         pendingFrom.current = videoRef.current.state.selectedAudioTrackId;
         writeChoice(url, true);
         setDub((current) => ({ ...current, state: 'preparing', progress: null, detail: null, aheadS: 0, waiting: false }));
-        tauri.core.invoke('dub_start', { url, about: aboutRef.current }).then(switchToDub).catch(fail);
+        startedWith.current = sourceIdRef.current;
+        tauri.core.invoke('dub_start', { url, about: aboutRef.current, lines: linesRef.current }).then(switchToDub).catch(fail);
     }, [fail, switchToDub]);
 
     const install = useCallback(() => {
@@ -253,7 +293,7 @@ const useDub = ({ video, about }: Args) => {
     // nobody hears is not worth the GPU). The dub track is the one the shell
     // added (`generated`); until it is observed selected, the pre-press track
     // still reads as "waiting".
-    const dubTrackId = video.state.audioTracks.find((track: AudioTrack) => track.generated)?.id ?? null;
+    const dubTrackId = video.state.audioTracks.find((track: AudioTrack) => track.generated && track.id !== staleTrackId.current)?.id ?? null;
     const selected = dubTrackId !== null && video.state.selectedAudioTrackId === dubTrackId;
     useEffect(() => {
         if (!armed.current || (dub.state !== 'preparing' && dub.state !== 'running')) return;
@@ -268,10 +308,49 @@ const useDub = ({ video, about }: Args) => {
         stop();
     }, [dub.state, selected, stop, video.state.selectedAudioTrackId]);
 
+    const setSource = useCallback((next: DubSource) => {
+        try {
+            setItem(SOURCE_KEY, next);
+        } catch (error) {
+            console.error('useDub: failed to persist the translation source', error);
+        }
+        setSourceState(next);
+    }, []);
+
+    // Another source (the choice, another loaded track, a new delay) is another
+    // dub: the running one stops, its track leaves the player, and the choice
+    // for this title starts the new one through the resume effect above.
+    useEffect(() => {
+        const active = dub.state === 'preparing' || dub.state === 'running' || dub.state === 'done';
+        if (!active || startedWith.current === null || startedWith.current === sourceId) return;
+        const tauri = getTauri();
+        const stale = videoRef.current.state.audioTracks.find((track: AudioTrack) => track.generated);
+        stop();
+        startedWith.current = null;
+        staleTrackId.current = stale?.id ?? null;
+        const id = Number.parseInt(stale?.id ?? '', 10);
+        if (tauri?.core?.invoke && Number.isInteger(id)) {
+            tauri.core.invoke('dub_forget_track', { id }).catch((error: unknown) => {
+                console.error('dub_forget_track failed', error);
+            });
+        }
+    }, [dub.state, sourceId, stop]);
+
     // The row reads as the chosen track from the pick onwards; `dubPlaying`
     // says whether its audio is the one heard yet.
     const chosen = selected || (armed.current && (dub.state === 'preparing' || dub.state === 'running' || dub.state === 'done'));
-    return { dub, dubChosen: chosen, dubPlaying: selected, onDubSelect: select };
+    return {
+        dub,
+        dubChosen: chosen,
+        dubPlaying: selected,
+        onDubSelect: select,
+        // The translation source: the choice, whether the subtitles can be it
+        // right now, and which one the dub actually uses.
+        dubSource: source,
+        dubSourceInUse: (lines === null ? 'ai' : 'subtitles') as DubSource,
+        dubSubtitlesUsable: scriptUsable,
+        onDubSourceChange: setSource,
+    };
 };
 
 export default useDub;

@@ -218,8 +218,8 @@ const useVideo = () => {
         events.emit('subtitlesTrackLoaded', track);
     };
 
-    const onExtraSubtitlesTrackLoaded = (track: any, cues: [number, number][]) => {
-        events.emit('extraSubtitlesTrackLoaded', track, cues);
+    const onExtraSubtitlesTrackLoaded = (track: any, cues: [number, number][], lines: { startMs: number, endMs: number, text: string }[]) => {
+        events.emit('extraSubtitlesTrackLoaded', track, cues, lines);
     };
 
     const onExtraSubtitlesTrackAdded = (track: any) => {

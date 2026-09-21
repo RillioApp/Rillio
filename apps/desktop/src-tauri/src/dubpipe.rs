@@ -20,12 +20,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::autosync::{decode_pcm_as, PcmFormat};
 use crate::dubclients::{synthesize_verified, Asr, Translator, Tts, VerifiedTake};
 use crate::dubhandle;
 use crate::dubplace;
+use crate::dubscript::{self, Script};
 use crate::dubfit::{self, budget_syllables, duck, fit, level_gain, mix_into, room_ms, sounding_range, trim_silence, Fit, DUCK_GAIN};
 use crate::instrument::{self, Instrument};
 use crate::separate::Separator;
@@ -229,6 +231,30 @@ pub struct Pipeline {
     anchor: bool,
     /// Where every turn's separated voice is written (see [`DUMP_ENV`]).
     dump_dir: Option<PathBuf>,
+    /// The loaded subtitle track as the source of the lines (see `set_script`).
+    script: Option<Arc<Script>>,
+}
+
+/// What a dub's audio depends on besides the stream: the models (length and
+/// modification time of each file, so a hard link to the same model is the
+/// same model), the switches, and the translation source. `dub.rs` folds it
+/// into the cache key. Without it a title dubbed by one pack replayed that
+/// audio under every other pack (2026-09-21: Michael compared v1.1, v1 and a
+/// stock-decoder pack on one episode and the first five minutes were the first
+/// pack's audio each time).
+pub fn recipe(pack_dir: &Path, script: Option<&Script>) -> String {
+    let file = |name: &str| match std::fs::metadata(pack_dir.join(name)) {
+        Ok(meta) => format!("{name}:{}:{}", meta.len(), meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())),
+        Err(_) => format!("{name}:absent"),
+    };
+    let switch = |name: &str| format!("{name}={}", std::env::var(name).unwrap_or_default());
+    [TTS_BASE_LM_GGUF, TTS_ACOUSTIC_GGUF, instrument::FILE, TRANSLATOR_GGUF, ASR_MODEL, SEPARATOR_ONNX]
+        .into_iter()
+        .map(file)
+        .chain([STYLE_SEGMENT_ENV, HANDLE_ENV, INSTRUMENT_ENV, ANCHOR_ENV, ASR_ENV].into_iter().map(switch))
+        .chain([script.map_or("source=ai".to_owned(), |s| format!("source={}", s.id()))])
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 impl Pipeline {
@@ -284,7 +310,18 @@ impl Pipeline {
         let separator = Separator::open(&file(SEPARATOR_ONNX), pack_dir).map_err(|e| format!("dubpipe: separator: {e}"))?;
         let encoder = SpeakerEncoder::load(&file(SPEAKER_ENCODER_ONNX))?;
         let instrument = want_instrument.then(|| Instrument::load(&instrument_file)).transpose()?;
-        Ok(Self { supervisor, translator, tts, asr, separator, encoder, source_language: None, about: None, buffer: None, style_segment, handle, instrument, anchor, dump_dir })
+        Ok(Self { supervisor, translator, tts, asr, separator, encoder, source_language: None, about: None, buffer: None, style_segment, handle, instrument, anchor, dump_dir, script: None })
+    }
+
+    /// The viewer's translation source: a loaded subtitle track's lines
+    /// (`dubscript`), or `None` for the recognizer and the translator.
+    pub fn set_script(&mut self, script: Option<Arc<Script>>) {
+        tracing::info!("dubpipe: translation source {}", script.as_ref().map_or("AI (recognizer + translator)", |s| s.id()));
+        if self.script.as_ref().map(|s| s.id()) != script.as_ref().map(|s| s.id()) {
+            // the buffer remembers which turns it has dubbed: another source dubs them again
+            self.buffer = None;
+        }
+        self.script = script;
     }
 
     /// What the stream is (name, synopsis), from the player's metadata.
@@ -340,6 +377,13 @@ impl Pipeline {
             .filter(|t| (from_ms..to_ms).contains(&t.start_ms) && !buffer.produced.contains(&((t.start_ms + origin_ms) as u32)))
             .cloned()
             .collect();
+        // With a loaded subtitle track as the source: the line of every turn
+        // of the buffer (a cue goes to the turn it overlaps most, so the
+        // assignment needs the turn's neighbours, not the due turns alone).
+        let scripted: Option<Vec<Option<String>>> = self.script.as_ref().map(|script| {
+            let spans: Vec<(i64, i64)> = buffer.turns.iter().map(|t| (t.start_ms + origin_ms, t.end_ms + origin_ms)).collect();
+            script.lines(&spans)
+        });
         for (i, turn) in due.iter().enumerate() {
             let t0 = Instant::now();
             buffer.produced.insert((turn.start_ms + origin_ms) as u32);
@@ -387,12 +431,36 @@ impl Pipeline {
             };
             // Only a turn with nothing to SAY keeps its original voice; a
             // translator failure is a failure, never Japanese in the dub.
-            let outcome: Result<(), &str> = if src.chars().count() < MIN_TURN_TEXT_CHARS || is_non_speech(&src) {
+            let budget = budget_syllables(spoken_ms, room);
+            let outcome: Result<(), &str> = if let Some(scripted) = &scripted {
+                // The viewer's loaded subtitles are the line: the recognizer's
+                // opinion of the turn does not veto them, and a turn they have
+                // no cue for keeps its original voice.
+                match buffer.turns.iter().position(|t| t.start_ms == turn.start_ms).and_then(|index| scripted[index].clone()) {
+                    None => Err("no subtitle line"),
+                    Some(text) => {
+                        // Subtitles are written to be read, not to fit a mouth: a
+                        // line over the turn's budget is shortened by the
+                        // translator (English to English), never cut off by `fit`.
+                        let needs = dubscript::syllable_count(&text);
+                        line.en = if needs > budget {
+                            let translate_t0 = Instant::now();
+                            let shorter = self.translator.translate(&text, &[], TARGET_LANGUAGE, TARGET_LANGUAGE, budget, self.about.as_deref())?;
+                            stage_ms[1] = translate_t0.elapsed().as_millis();
+                            tracing::info!("dubpipe: subtitle line over budget ({needs} > {budget} syllables): {text:?} -> {shorter:?}");
+                            if shorter.is_empty() || is_non_speech(&shorter) { text } else { shorter }
+                        } else {
+                            text
+                        };
+                        Ok(())
+                    }
+                }
+            } else if src.chars().count() < MIN_TURN_TEXT_CHARS || is_non_speech(&src) {
                 Err("non-speech")
             } else {
                 let context: Vec<String> = buffer.history.iter().rev().take(CONTEXT_TURNS).rev().cloned().collect();
                 let translate_t0 = Instant::now();
-                let en = self.translator.translate(&src, &context, &source_name, TARGET_LANGUAGE, budget_syllables(spoken_ms, room), self.about.as_deref())?;
+                let en = self.translator.translate(&src, &context, &source_name, TARGET_LANGUAGE, budget, self.about.as_deref())?;
                 stage_ms[1] = translate_t0.elapsed().as_millis();
                 buffer.history.push(src.clone());
                 if en.is_empty() || is_non_speech(&en) {

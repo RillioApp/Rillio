@@ -449,8 +449,13 @@ function withHTMLSubtitles(Video) {
                                     }
                                     // Second argument: the track's cue intervals
                                     // (ms), the input to subtitle auto-sync.
+                                    // Third: the same cues with their text, the
+                                    // AI dub's lines when the viewer picks the
+                                    // loaded subtitles as its translation source.
                                     events.emit('extraSubtitlesTrackLoaded', selectedTrack, result.cues.map(function(cue) {
                                         return [cue.startTime, cue.endTime];
+                                    }), result.cues.map(function(cue) {
+                                        return { startMs: cue.startTime, endMs: cue.endTime, text: String(cue.text || '') };
                                     }));
                                 })
                                 .catch(function(error) {

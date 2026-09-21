@@ -63,9 +63,10 @@ function StremioVideo() {
                     video.on('audioTrackLoaded', function(track) {
                         events.emit('audioTrackLoaded', track);
                     });
-                    video.on('extraSubtitlesTrackLoaded', function(track, cues) {
+                    video.on('extraSubtitlesTrackLoaded', function(track, cues, lines) {
                         // `cues`: the track's [start, end] ms intervals (auto-sync input).
-                        events.emit('extraSubtitlesTrackLoaded', track, cues);
+                        // `lines`: the same cues with their text (the AI dub's subtitle source).
+                        events.emit('extraSubtitlesTrackLoaded', track, cues, lines);
                     });
                     video.on('extraSubtitlesTrackAdded', function(track) {
                         events.emit('extraSubtitlesTrackAdded', track);
