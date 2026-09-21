@@ -111,6 +111,12 @@ const INSTRUMENT_ENV: &str = "RILLIO_DUB_INSTRUMENT";
 /// `RILLIO_DUB_ANCHOR=0` leaves the take in one piece (the A/B for cuts that
 /// are heard as abruptions, Michael 2026-09-21).
 const ANCHOR_ENV: &str = "RILLIO_DUB_ANCHOR";
+/// Bench knob: another recognizer for the dub, as `<ggml file>,<dtw preset>`
+/// (`ggml-large-v3-turbo-q5_0.bin,large.v3.turbo`). A bare name is looked up
+/// in the pack, an absolute path stands. Unset: [`ASR_MODEL`]. The first app
+/// test (2026-09-21) found whisper small mishearing Korean and Japanese lines,
+/// which the translator then turns into fluent wrong English.
+const ASR_ENV: &str = "RILLIO_DUB_ASR";
 
 /// Why a window could not be produced: the source is not decodable yet (a
 /// torrent region still downloading: the player stalls there too, retry
@@ -241,7 +247,19 @@ impl Pipeline {
             if anchor { "on" } else { "off" }
         );
         let mut supervisor = Supervisor::new(log_dir.to_path_buf())?;
-        supervisor.start(&file(SidecarKind::Asr.exe_name()), SidecarModels::Asr { model: file(ASR_MODEL), dtw_preset: ASR_DTW_PRESET })?;
+        let (asr_model, asr_dtw) = match std::env::var(ASR_ENV) {
+            Ok(spec) => {
+                let (model, preset) = spec.split_once(',').ok_or_else(|| format!("dubpipe: {ASR_ENV} is \"<ggml file>,<dtw preset>\", got {spec:?}"))?;
+                // an absolute path stands as it is, a bare name is looked up in the pack
+                (file(model), preset.to_owned())
+            }
+            Err(_) => (file(ASR_MODEL), ASR_DTW_PRESET.to_owned()),
+        };
+        if !asr_model.exists() {
+            return Err(format!("dubpipe: no recognizer model at {}", asr_model.display()));
+        }
+        tracing::info!("dubpipe: recognizer {} (dtw {asr_dtw})", asr_model.display());
+        supervisor.start(&file(SidecarKind::Asr.exe_name()), SidecarModels::Asr { model: asr_model, dtw_preset: asr_dtw })?;
         supervisor.start(&file(SidecarKind::Translator.exe_name()), SidecarModels::Translator { gguf: file(TRANSLATOR_GGUF) })?;
         supervisor.start(
             &file(SidecarKind::Tts.exe_name()),

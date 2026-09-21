@@ -81,7 +81,7 @@ pub enum SidecarModels {
     /// timestamps (the recognizer's token points, `dubclients::Heard`) need
     /// flash attention off (whisper.cpp disables DTW under it); the preset
     /// names the model's size, so it travels with the model file.
-    Asr { model: PathBuf, dtw_preset: &'static str },
+    Asr { model: PathBuf, dtw_preset: String },
 }
 
 impl SidecarModels {
@@ -114,7 +114,7 @@ impl SidecarModels {
                 "--voxcpm2-acoustic".into(),
                 path(acoustic),
             ],
-            SidecarModels::Asr { model, dtw_preset } => vec!["-m".into(), path(model), "-nfa".into(), "-dtw".into(), (*dtw_preset).into()],
+            SidecarModels::Asr { model, dtw_preset } => vec!["-m".into(), path(model), "-nfa".into(), "-dtw".into(), dtw_preset.clone()],
         };
         args.extend(["--host".into(), LOOPBACK.into(), "--port".into(), port.to_string()]);
         args
