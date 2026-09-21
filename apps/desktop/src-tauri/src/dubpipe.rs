@@ -411,7 +411,15 @@ impl Pipeline {
                         let lead_s = sounding_range(&take).map_or(0.0, |(from, _)| from as f64 / RATE as f64);
                         let take = trim_silence(take);
                         let starts: Vec<f64> = word_starts_s.iter().map(|t| (t - lead_s).max(0.0)).collect();
-                        let anchored = handle.as_ref().filter(|_| self.anchor).and_then(|handle| dubplace::anchor_phrases(&take, RATE, &starts, &handle.entries));
+                        let placed = handle.as_ref().filter(|_| self.anchor).and_then(|handle| dubplace::layout(&take, RATE, &starts, &dubplace::plan_items(&handle.entries)));
+                        let anchored = placed.map(|placed| {
+                            let out = dubplace::apply(&take, RATE, &placed);
+                            tracing::info!(
+                                "dubpipe: anchored {} phrases, level at the cuts {:?} dB, take {:.2} s -> {:.2} s (turn {:.2} s, room {:.2} s)",
+                                placed.len(), dubplace::cut_levels_db(&take, RATE, &placed), take.len() as f64 / RATE as f64, out.len() as f64 / RATE as f64, turn_ms as f64 / 1000.0, room as f64 / 1000.0
+                            );
+                            out
+                        });
                         let was_anchored = anchored.is_some();
                         let (take, how) = fit(anchored.unwrap_or(take), turn_ms, room);
                         let original = slice(&buffer.vocals48, RATE, turn.start_ms, turn.end_ms);

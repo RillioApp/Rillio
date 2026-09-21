@@ -11,7 +11,10 @@
 //! - the take is cut between the plan's phrases at the quietest frame of the
 //!   second half of the stretch between the last word start of one phrase
 //!   and the first word start of the next (word starts are all the
-//!   recognizer gives; the quiet frame is what is left of the pause);
+//!   recognizer gives; the quiet frame is what is left of the pause), but
+//!   only where that frame is a real pause of the take: where the take speaks
+//!   through the plan's rest the two phrases stay one chunk, since a cut in
+//!   running speech is heard as an abruption;
 //! - every phrase's first word is placed on its planned time, the audio
 //!   before it kept before it; a phrase never starts before the previous one
 //!   ended, never before the onset.
@@ -24,6 +27,13 @@ use crate::dubhandle::Entry;
 const FADE_MS: usize = 10;
 /// The energy frame the cut is searched on.
 const FRAME_MS: usize = 20;
+/// A cut is made only in a real pause of the TAKE: the quietest frame's mean
+/// energy under this share of the take's own (-30 dB). Without it a cut
+/// landed in running speech wherever the model spoke through the plan's rest
+/// (first app test, 2026-09-21: four cuts measured at -5 to -14 dB, heard as
+/// abruptions). Relative, so it holds at any take level. The literal is the
+/// owner's (`placement.py`), so both sides compare the same f64.
+const PAUSE_RATIO: f64 = 0.001;
 
 /// One entry of the plan: a word or a rest, and when it starts (seconds from
 /// the take's onset).
@@ -76,9 +86,28 @@ fn phrase_groups(plan: &[PlanItem]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// Sample index of the centre of the quietest frame in `[a_s, b_s)`. The
-/// energies come from one running f64 sum, the order the Python owner adds in.
-fn quietest_frame(take: &[f32], rate: u32, a_s: f64, b_s: f64) -> usize {
+/// The quietest frame of a stretch: the sample index of its centre, its
+/// energy (`None` when the stretch holds no whole frame) and its length.
+struct QuietFrame {
+    centre: usize,
+    energy: Option<f64>,
+    len: usize,
+}
+
+/// The frame is a real pause: its mean energy is under [`PAUSE_RATIO`] of the
+/// take's own (the owner's `is_pause`, same operation order).
+fn is_pause(frame_energy: f64, frame_len: usize, take_energy: f64, take_len: usize) -> bool {
+    frame_energy * take_len as f64 <= (take_energy * frame_len as f64) * PAUSE_RATIO
+}
+
+/// Sum of squares of the whole take, as one running f64 sum.
+fn take_energy(take: &[f32]) -> f64 {
+    take.iter().fold(0.0f64, |sum, &x| sum + x as f64 * x as f64)
+}
+
+/// The quietest frame in `[a_s, b_s)`. The energies come from one running
+/// f64 sum, the order the Python owner adds in.
+fn quietest_frame(take: &[f32], rate: u32, a_s: f64, b_s: f64) -> QuietFrame {
     let n = (FRAME_MS * rate as usize / 1000).max(1);
     let a = (a_s * rate as f64) as usize;
     let b = ((b_s * rate as f64) as usize).max(a + n);
@@ -96,7 +125,7 @@ fn quietest_frame(take: &[f32], rate: u32, a_s: f64, b_s: f64) -> usize {
             best_energy = Some(energy);
         }
     }
-    (best + n / 2).min(take.len())
+    QuietFrame { centre: (best + n / 2).min(take.len()), energy: best_energy, len: n }
 }
 
 /// Where each phrase of the take goes (see the module doc).
@@ -105,17 +134,27 @@ pub(crate) fn layout(take: &[f32], rate: u32, word_starts: &[f64], plan: &[PlanI
     if word_starts.is_empty() || word_starts.len() != planned.len() {
         return None;
     }
-    let groups = phrase_groups(plan);
+    let total = take_energy(take);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut cuts = vec![0usize];
+    for group in phrase_groups(plan) {
+        if let Some(previous) = groups.last_mut() {
+            let a = word_starts[*previous.last()?];
+            let b = word_starts[group[0]].max(a);
+            let quiet = quietest_frame(take, rate, (a + b) / 2.0, b);
+            if !quiet.energy.is_some_and(|energy| is_pause(energy, quiet.len, total, take.len())) {
+                // the take speaks through the plan's rest: one chunk, no cut
+                previous.extend(group);
+                continue;
+            }
+            cuts.push(quiet.centre);
+        }
+        groups.push(group);
+    }
+    cuts.push(take.len());
     if groups.len() < 2 && planned[0] == 0.0 {
         return None;
     }
-    let mut cuts = vec![0usize];
-    for pair in groups.windows(2) {
-        let a = word_starts[*pair[0].last()?];
-        let b = word_starts[pair[1][0]].max(a);
-        cuts.push(quietest_frame(take, rate, (a + b) / 2.0, b));
-    }
-    cuts.push(take.len());
     let mut cursor = 0usize;
     let placed = groups
         .iter()
@@ -152,7 +191,24 @@ pub(crate) fn apply(take: &[f32], rate: u32, placed: &[Placed]) -> Vec<f32> {
     out
 }
 
-/// The take with its phrases on the plan, or `None` (block placement).
+/// How loud the take is at each inner cut, in dB against the take's own RMS
+/// (diagnostic): a cut in a real pause reads far below 0, a cut in running
+/// speech reads near it and is heard as an abruption.
+pub(crate) fn cut_levels_db(take: &[f32], rate: u32, placed: &[Placed]) -> Vec<f32> {
+    let rms = |x: &[f32]| (x.iter().map(|&s| s as f64 * s as f64).sum::<f64>() / x.len().max(1) as f64).sqrt().max(1e-9);
+    let whole = rms(take);
+    let half = FRAME_MS * rate as usize / 2000;
+    placed
+        .iter()
+        .skip(1)
+        .map(|p| (20.0 * (rms(&take[p.from.saturating_sub(half)..(p.from + half).min(take.len())]) / whole).log10()) as f32)
+        .collect()
+}
+
+/// The take with its phrases on the plan, or `None` (block placement): the
+/// engine's `anchor_phrases`, kept whole for the laws below (the pipeline
+/// calls `layout` and `apply` itself to log what the layout did).
+#[cfg(test)]
 pub(crate) fn anchor_phrases(take: &[f32], rate: u32, word_starts: &[f64], entries: &[Entry]) -> Option<Vec<f32>> {
     layout(take, rate, word_starts, &plan_items(entries)).map(|placed| apply(take, rate, &placed))
 }
@@ -211,6 +267,22 @@ mod tests {
         assert!(placed[1600] > 0.0, "the second phrase speaks at its planned time");
         // heard words that do not match the plan keep the block placement
         assert_eq!(anchor_phrases(&take, rate, &[0.0, 0.3, 0.7], &entries), None);
+    }
+
+    #[test]
+    fn a_take_that_speaks_through_the_rest_is_not_cut() {
+        let rate = 1000;
+        // four words with no pause at all between the second and the third
+        let take = vec![0.5f32; 1200];
+        let entries = vec![
+            Entry::Word { notes: vec![0.3] },
+            Entry::Word { notes: vec![0.3] },
+            Entry::Pause { dur: 1.0, nonverbal: false },
+            Entry::Word { notes: vec![0.3] },
+            Entry::Word { notes: vec![0.3] },
+        ];
+        // one phrase at the onset is left: nothing to anchor, the take stays whole
+        assert_eq!(anchor_phrases(&take, rate, &[0.0, 0.3, 0.6, 0.9], &entries), None);
     }
 
     #[test]
