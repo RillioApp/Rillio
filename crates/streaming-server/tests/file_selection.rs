@@ -370,6 +370,69 @@ async fn explicit_cache_select_still_adds_and_drops_files() {
     assert_eq!(s.selected(&ih).await, vec![false, true, true]);
 }
 
+/// Selection changes are read-modify-write: read `only_files`, add a file,
+/// write the whole list back. Two plays of DIFFERENT files landing at once (two
+/// first plays of different episodes, a play beside the next-episode preload)
+/// must both survive; an unserialized pair can each write back a list missing
+/// the other's file, and that episode then silently never downloads.
+///
+/// Probabilistic by nature: the unlocked window has no await point, so only
+/// true thread parallelism can hit it. Many OS threads are released at once
+/// through a barrier, round after round, and every round must end with every
+/// file selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_plays_of_different_files_all_stay_selected() {
+    const FILES: usize = 24;
+    const ROUNDS: usize = 40;
+    let s = spawn("concurrent-select").await;
+    let names: Vec<String> = (0..FILES).map(|i| format!("E{i:02}.mkv")).collect();
+    let files: Vec<F> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| F { path: name, fill: i as u8 + 1, pieces: 1 })
+        .collect();
+    // Equal-sized episodes: an ambiguous pack, added with nothing selected.
+    let ih = s.create(&make_torrent("Race.Pack", &files)).await;
+    s.wait_ready(&ih).await;
+    let handle = s.engine.get(&ih).expect("managed");
+    let rt = tokio::runtime::Handle::current();
+
+    let mut lost_rounds = Vec::new();
+    for round in 0..ROUNDS {
+        // Back to an empty selection (the engine API refuses an empty list on
+        // purpose; the test resets through librqbit directly).
+        s.engine
+            .session()
+            .update_only_files(&handle, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(FILES));
+        let threads: Vec<_> = (0..FILES)
+            .map(|idx| {
+                let (engine, handle, rt, barrier) =
+                    (s.engine.clone(), handle.clone(), rt.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    rt.block_on(engine.ensure_selected(&handle, idx))
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().expect("ensure_selected failed");
+        }
+        let mut got = handle.only_files().expect("an explicit selection");
+        got.sort_unstable();
+        if got.len() != FILES {
+            lost_rounds.push((round, FILES - got.len()));
+        }
+    }
+    assert!(
+        lost_rounds.is_empty(),
+        "concurrent selections lost files in {} of {ROUNDS} rounds, (round, files lost): {lost_rounds:?}",
+        lost_rounds.len()
+    );
+}
+
 /// An index that does not exist fails the stream and leaves the selection
 /// alone (it must not fall back to selecting anything).
 #[tokio::test]
