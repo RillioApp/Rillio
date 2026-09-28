@@ -279,6 +279,10 @@ fn mark_prefetch_in(
 #[derive(Clone)]
 pub struct Engine {
     session: Arc<Session>,
+    /// How long an add may spend resolving a torrent's metadata from the
+    /// swarm. [`METADATA_TIMEOUT`] always; a field only so the tests can
+    /// shorten it instead of waiting minutes.
+    resolve_timeout: Duration,
     /// Absolute cache root; torrents whose files would escape it are refused.
     cache_root: Arc<PathBuf>,
     /// Last time each torrent (by lowercase hex infohash) was streamed or queried.
@@ -753,12 +757,19 @@ impl Engine {
         // preallocations served as a 100%-complete stream.
         invalidate_stale_fastresume(&cache_dir.join("session"));
         let session = Session::new_with_opts(cache_dir, opts).await?;
+        Ok(Self::from_session(session, cache_root))
+    }
+
+    /// The engine around an already-built session, reading the persisted
+    /// sidecars (pins, watched marks, metadata, added dates) from `cache_root`.
+    fn from_session(session: Arc<Session>, cache_root: PathBuf) -> Self {
         let pinned = read_pins(&cache_root);
         let watched = read_watched(&cache_root);
         let meta = read_meta(&cache_root);
         let added = read_added(&cache_root);
-        Ok(Self {
+        Self {
             session,
+            resolve_timeout: METADATA_TIMEOUT,
             cache_root: Arc::new(cache_root),
             last_access: Arc::new(Mutex::new(HashMap::new())),
             prefetched: Arc::new(Mutex::new(HashSet::new())),
@@ -768,7 +779,7 @@ impl Engine {
             meta: Arc::new(Mutex::new(meta)),
             added: Arc::new(Mutex::new(added)),
             selection: Arc::new(tokio::sync::Mutex::new(())),
-        })
+        }
     }
 
     /// When this torrent entered the cache, as unix epoch milliseconds.
@@ -1794,6 +1805,81 @@ mod tests {
         let dir = fresh_dir("fastresume-fresh");
         // Must not panic or create anything on a fresh boot.
         invalidate_stale_fastresume(&dir.join("session"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata resolution is bounded
+    // -----------------------------------------------------------------------
+
+    use super::{Engine, Pick};
+
+    /// An engine that can never reach anything outside this machine: no DHT,
+    /// no listener, no persistence, and a short resolve bound so a test does
+    /// not wait out the production one.
+    async fn offline_engine(tag: &str, resolve_timeout: std::time::Duration) -> Engine {
+        let dir = fresh_dir(&format!("offline-{tag}"));
+        let session = librqbit::Session::new_with_opts(
+            dir.clone(),
+            librqbit::SessionOptions {
+                disable_dht: true,
+                disable_dht_persistence: true,
+                listen_port_range: None,
+                enable_upnp_port_forwarding: false,
+                persistence: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut engine = Engine::from_session(session, dir);
+        engine.resolve_timeout = resolve_timeout;
+        engine
+    }
+
+    /// A magnet for an infohash nobody has, whose only peer source is a UDP
+    /// tracker that receives every announce and never answers: the shape of a
+    /// real magnet whose swarm never delivers metadata. Returns the magnet, its
+    /// infohash, and the socket (kept alive so the port stays silent, not
+    /// refused).
+    fn unanswerable_magnet(seed: u8) -> (String, String, std::net::UdpSocket) {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ih = format!("{seed:02x}{nanos:038x}");
+        let magnet = format!("magnet:?xt=urn:btih:{ih}&tr=udp%3A%2F%2F127.0.0.1%3A{port}%2Fannounce");
+        (magnet, ih, silent)
+    }
+
+    /// librqbit resolves a magnet's metadata with no deadline, so a magnet whose
+    /// peers never deliver it used to hang its request forever. Both add shapes
+    /// (a known file index, and a selection decided from the file list) must
+    /// fail loud within the bound and leave nothing behind in the session.
+    #[tokio::test]
+    async fn a_magnet_whose_metadata_never_arrives_fails_within_the_bound() {
+        let bound = std::time::Duration::from_secs(2);
+        let engine = offline_engine("resolve-timeout", bound).await;
+        let decide = |_: &[crate::types::File]| Ok(vec![0]);
+        for (seed, pick) in [(1u8, Pick::Files(vec![0])), (2u8, Pick::Decide(&decide))] {
+            let (magnet, ih, _silent) = unanswerable_magnet(seed);
+            let started = std::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                bound * 10,
+                engine.add_source(librqbit::AddTorrent::from_url(magnet), pick),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the add of {ih} hung past 10x its {bound:?} bound"));
+            let err = match outcome {
+                Ok(handle) => panic!("an unresolvable magnet was added: {:?}", handle.info_hash()),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(started.elapsed() >= bound, "gave up before the bound: {:?}", started.elapsed());
+            assert!(err.contains("metadata"), "the error must say what timed out: {err}");
+            assert!(engine.get(&ih).is_none(), "a timed-out add left {ih} in the session");
+            assert!(engine.all().is_empty(), "a timed-out add left a torrent behind");
+        }
     }
 
     #[test]
