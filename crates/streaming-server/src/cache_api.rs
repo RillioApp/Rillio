@@ -14,8 +14,8 @@ use axum::Json;
 use librqbit::TorrentStatsState;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::Engine;
-use crate::torrent::is_valid_infohash;
+use crate::engine::{Engine, FileRef};
+use crate::torrent::{guess_file_idx, is_valid_infohash};
 
 /// One cached torrent, as the Cached page renders it. Everything is scoped to
 /// the SELECTED files (what we actually download), not the whole torrent, so a
@@ -70,7 +70,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "ogv", "ogm", "divx", "vob", "rmvb", "3gp",
 ];
 
-fn is_video(name: &str) -> bool {
+pub(crate) fn is_video(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(_, ext)| VIDEO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
@@ -83,7 +83,7 @@ const MAIN_FEATURE_RATIO: u64 = 3;
 
 /// Which video (if any) "the Play button" should mean, given the video file
 /// indices and their sizes.
-fn main_feature(videos: &[usize], length: impl Fn(usize) -> u64) -> Option<usize> {
+pub(crate) fn main_feature(videos: &[usize], length: impl Fn(usize) -> u64) -> Option<usize> {
     match videos.len() {
         0 => None,
         1 => Some(videos[0]),
@@ -187,14 +187,22 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DownloadBody {
     info_hash: String,
-    /// Optional: ensure this file is part of the download selection (a stream
-    /// row knows which file it points at).
+    /// The stream's file. Absent when the stream carries no index, which is
+    /// the same stream the player opens as `/{ih}/-1`.
     file_idx: Option<usize>,
 }
 
 /// `POST /cache/download` - "download to cache": add-or-get the torrent, make
-/// sure it is running and the requested file is selected, and PIN it so the
+/// sure it is running and the stream's file is selected, and PIN it so the
 /// cache sweeper never evicts it.
+///
+/// It downloads ONE file, the stream's, never the whole torrent: both callers
+/// (the player's "download" action and the next-episode preload) hand it a
+/// stream. With `fileIdx` that file joins the selection (a preload of the next
+/// episode of the pack being watched adds that episode and keeps the current
+/// one). Without it, the file is the one the player would open for that stream
+/// (`/{ih}/-1`, the largest media file). Fetching more of a torrent is the
+/// Cache page's explicit per-file `/cache/select`.
 pub(crate) async fn download(
     State(engine): State<Engine>,
     Json(body): Json<DownloadBody>,
@@ -203,16 +211,22 @@ pub(crate) async fn download(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let info_hash = body.info_hash.to_lowercase();
-    let handle = match engine.get_or_create(&info_hash).await {
-        Ok(h) => h,
+    let stream_default = |files: &[crate::types::File]| usize::try_from(guess_file_idx(files)).ok();
+    let file = match body.file_idx {
+        Some(idx) => FileRef::Index(idx),
+        None => FileRef::Resolve(&stream_default),
+    };
+    let handle = match engine.get_or_create_for_file(&info_hash, file).await {
+        Ok((h, _)) => h,
         Err(e) => {
-            tracing::error!("cache/download add failed: {e:#}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            tracing::error!("cache/download {info_hash} fileIdx={:?}: {e:#}", body.file_idx);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+                .into_response();
         }
     };
-    if let Some(idx) = body.file_idx {
-        engine.select_file(&handle, idx).await;
-    }
     // A fresh add is already unpaused and still initializing, which librqbit
     // reports as "not paused" - so this is a no-op there and only does work when
     // re-downloading something the user had paused. Not fatal either way: the

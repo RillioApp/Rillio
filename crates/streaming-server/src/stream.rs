@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::engine::{Engine, Handle};
+use crate::engine::{Engine, FileRef, Handle};
 use crate::torrent;
 
 /// `contentFeatures.dlna.org` - byte-for-byte from server.js:18291, including
@@ -92,28 +92,29 @@ async fn handle_stream(
     let info_hash = info_hash.to_lowercase();
     let flags = parse_flags(&query);
 
-    // Idempotent get-or-create; needs metadata for file resolution. Reuses the
-    // live handle if already managed (never re-adds - that would reset a playing
-    // torrent to `initializing` and 500 concurrent reads).
-    let handle = match engine.get_or_create(&info_hash).await {
-        Ok(h) => h,
+    // Idempotent get-or-create that downloads ONLY the streamed file: a new
+    // torrent is added with just this file selected, an existing one gets it
+    // added to its selection (a legacy all-files selection is narrowed). Reuses
+    // the live handle if already managed (never re-adds - that would reset a
+    // playing torrent to `initializing` and 500 concurrent reads). A plain
+    // numeric index skips the file-list resolution on a fresh add.
+    let resolve = |files: &[crate::types::File]| resolve_index(files, &idx, &flags);
+    let file_ref = match idx.parse::<usize>() {
+        Ok(n) if flags.f.is_empty() => FileRef::Index(n),
+        _ => FileRef::Resolve(&resolve),
+    };
+    let (handle, i) = match engine.get_or_create_for_file(&info_hash, file_ref).await {
+        Ok(found) => found,
         Err(e) => {
-            tracing::error!("stream {info_hash}: get_or_create failed: {e:#}");
+            // Invalid index/filename, unresolved metadata or a refused
+            // selection: 500, never 404 (blob parity).
+            tracing::error!("stream {info_hash}/{idx}: {e:#}");
             return err500();
         }
     };
     // Mark active so the cache sweeper never evicts the title being played.
     engine.touch(&info_hash);
     let files = Engine::files(&handle);
-    if files.is_empty() {
-        tracing::error!("stream {info_hash}: metadata not resolved (no files)");
-        return err500(); // metadata never resolved
-    }
-
-    let Some(i) = resolve_index(&files, &idx, &flags) else {
-        tracing::error!("stream {info_hash}: index {idx} did not resolve");
-        return err500(); // invalid index/filename → 500, never 404 (blob parity)
-    };
     let file = &files[i];
 
     // Best-effort: on the first stream of this file, warm its tail (the MKV Cues,

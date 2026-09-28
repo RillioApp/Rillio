@@ -10,7 +10,8 @@ use axum::Json;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::engine::Engine;
+use crate::cache_api::{is_video, main_feature};
+use crate::engine::{Engine, Pick};
 use crate::types::{self, CreateResponse, PeerSearch};
 
 /// Media extensions GuessFileIdx considers (server.js:62039).
@@ -78,7 +79,8 @@ pub(crate) async fn create_blob(
     let Ok(bytes) = hex::decode(blob.trim()) else {
         return err500();
     };
-    let handle = match engine.add_blob(bytes).await {
+    let select = |files: &[types::File]| Ok(browse_selection(files, None));
+    let handle = match engine.add_blob(bytes, Pick::Decide(&select)).await {
         Ok(h) => h,
         Err(e) => {
             tracing::error!("add_blob failed: {e:#}");
@@ -108,7 +110,8 @@ pub(crate) async fn create_magnet(
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
     let magnet = build_magnet(&info_hash, body.peer_search.as_ref());
-    let handle = match engine.add_magnet(&magnet).await {
+    let select = |files: &[types::File]| Ok(browse_selection(files, resolve_index(files, &body)));
+    let handle = match engine.add_magnet(&magnet, Pick::Decide(&select)).await {
         Ok(h) => h,
         Err(e) => {
             tracing::error!("add_magnet failed: {e:#}");
@@ -150,6 +153,35 @@ pub(crate) async fn remove(State(engine): State<Engine>, Path(info_hash): Path<S
 pub(crate) async fn remove_all(State(engine): State<Engine>) -> Response {
     engine.remove_all().await;
     Json(serde_json::json!({})).into_response()
+}
+
+/// What a create downloads when it is NEW. Both create routes are the "open
+/// this magnet / .torrent" flow: they add the torrent so the app can list its
+/// files, and no file has been played yet. So:
+/// - a file the request itself asked for (`guessFileIdx` / `fileMustInclude`,
+///   the same `guessedFileIdx` the response reports) is selected alone;
+/// - otherwise the torrent's unambiguous main feature (the only video, or one
+///   that dwarfs the rest, [`main_feature`]) is selected alone: a movie starts
+///   while its trailer, extras and .nfo do not;
+/// - otherwise (a season pack, or no video at all) NOTHING is selected. The
+///   torrent is added and browsable but downloads nothing until a file is
+///   actually played (the stream route then selects exactly that file) or
+///   fetched from the Cache page. Guessing an episode would be a coin flip,
+///   and "everything" is the bug this replaced.
+///
+/// An already-managed torrent keeps whatever selection it has (see
+/// `Engine::add_magnet`); this only decides a fresh add.
+fn browse_selection(files: &[types::File], requested: Option<i64>) -> Vec<usize> {
+    if let Some(i) = requested.and_then(|i| usize::try_from(i).ok()).filter(|&i| i < files.len()) {
+        return vec![i];
+    }
+    let videos: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| is_video(&f.name))
+        .map(|(i, _)| i)
+        .collect();
+    main_feature(&videos, |i| files[i].length).into_iter().collect()
 }
 
 /// Resolve `guessedFileIdx`: fileMustInclude selector wins, else guessFileIdx.
@@ -309,6 +341,31 @@ mod tests {
         // A skipped pattern just yields no match, never a panic.
         let files = vec![file("x.mkv", 1)];
         assert_eq!(file_must_include(&files, &[r"(a)\1".to_owned()]), None);
+    }
+
+    #[test]
+    fn browse_selection_never_means_everything() {
+        let movie = vec![
+            file("Movie.mkv", 4_000_000),
+            file("Movie.trailer.mp4", 300_000),
+            file("Movie.nfo", 2_000),
+        ];
+        // No request: the unambiguous main feature alone.
+        assert_eq!(browse_selection(&movie, None), vec![0]);
+        // A file the request asked for (guessFileIdx / fileMustInclude) wins.
+        assert_eq!(browse_selection(&movie, Some(1)), vec![1]);
+        // A guess that found no media (-1) or an out-of-range one falls back.
+        assert_eq!(browse_selection(&movie, Some(-1)), vec![0]);
+        assert_eq!(browse_selection(&movie, Some(9)), vec![0]);
+
+        // A season pack is ambiguous: nothing until an episode is played.
+        let pack = vec![file("S01E01.mkv", 1_000_000), file("S01E02.mkv", 1_100_000)];
+        assert!(browse_selection(&pack, None).is_empty());
+        // ...unless the request itself named one.
+        assert_eq!(browse_selection(&pack, Some(1)), vec![1]);
+
+        // No video at all: nothing.
+        assert!(browse_selection(&[file("readme.txt", 10), file("a.zip", 99)], None).is_empty());
     }
 
     #[test]

@@ -113,7 +113,7 @@ fn rate_limit_from_env(var: &str) -> Option<std::num::NonZeroU32> {
 /// bytes path (session.rs extends the announce-list with them). The MAGNET path
 /// builds its tracker list purely from `magnet.trackers` and drops `opts.trackers`
 /// on the floor. Every infohash-only add - the stream route AND /cache/download -
-/// goes through `get_or_create` -> a bare `magnet:?xt=urn:btih:<ih>`, so the
+/// goes through `get_or_create_for_file` -> a bare `magnet:?xt=urn:btih:<ih>`, so the
 /// injection above was silently dead for ALL of them: those torrents ran DHT-only
 /// and less-popular titles sat at 0 peers / 0 bytes forever (the exact failure the
 /// DEFAULT_TRACKERS doc warns about). Putting them in the URI is the only channel
@@ -131,8 +131,15 @@ fn magnet_with_default_trackers(magnet: &str) -> String {
     out
 }
 
-fn add_torrent_options() -> librqbit::AddTorrentOptions {
+/// Options for every add that creates a managed torrent. The download
+/// selection is a REQUIRED argument, not an optional field left to its
+/// default: librqbit's default (`only_files: None`) means "every file", and
+/// leaving it there on every add is exactly how streaming one episode of a
+/// season pack used to download the whole pack. Every caller states which
+/// files it wants (see [`Pick`]).
+fn add_torrent_options(only_files: Vec<usize>) -> librqbit::AddTorrentOptions {
     librqbit::AddTorrentOptions {
+        only_files: Some(only_files),
         // Honoured on the .torrent-bytes path only (add_blob); the magnet path
         // ignores this, which is why magnets get theirs via the URI instead.
         trackers: Some(DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect()),
@@ -149,6 +156,60 @@ fn add_torrent_options() -> librqbit::AddTorrentOptions {
         overwrite: true,
         ..Default::default()
     }
+}
+
+/// Which files a NEW torrent downloads from the moment it is added.
+///
+/// There is deliberately no "everything" variant: no caller wants a whole
+/// torrent by default. Fetching more is always an explicit act (the Cache
+/// page's `/cache/select`).
+pub enum Pick<'a> {
+    /// The caller already knows the files (a numeric stream index, a preload's
+    /// `fileIdx`). Handed straight to librqbit as `only_files`, which validates
+    /// the indices against the real file list and refuses the add if one is out
+    /// of range; costs nothing extra over a plain add.
+    Files(Vec<usize>),
+    /// Decided from the file list, which a magnet only has once its metadata
+    /// arrives. See [`Engine::add_source`] for how that stays add-time. `Ok(vec![])`
+    /// is a valid answer: the torrent is added with nothing downloading (a
+    /// browsed season pack before any episode is played).
+    Decide(&'a (dyn Fn(&[types::File]) -> anyhow::Result<Vec<usize>> + Send + Sync)),
+}
+
+/// The one file a playback request names.
+pub enum FileRef<'a> {
+    /// A plain index (`/{ih}/7`, the rillio:// byte plane, a preload fileIdx).
+    Index(usize),
+    /// Needs the file list to resolve (`/{ih}/-1`, a filename, a `?f=`
+    /// selector). `None` means the request names no file of this torrent.
+    Resolve(&'a (dyn Fn(&[types::File]) -> Option<usize> + Send + Sync)),
+}
+
+impl FileRef<'_> {
+    fn resolve(&self, files: &[types::File]) -> anyhow::Result<usize> {
+        match self {
+            FileRef::Index(i) if *i < files.len() => Ok(*i),
+            FileRef::Index(i) => {
+                anyhow::bail!("file index {i} is out of range ({} files)", files.len())
+            }
+            FileRef::Resolve(resolve) => {
+                resolve(files).context("the request does not name a file of this torrent")
+            }
+        }
+    }
+}
+
+/// The wire `File` for one torrent entry. Shared by [`Engine::files`] (a
+/// managed torrent's metadata) and the pre-add file list of [`Engine::add_source`],
+/// so a selection decided before the add addresses exactly the indices the
+/// stream route resolves afterwards.
+fn wire_file(relative: &Path, length: u64, offset: u64) -> types::File {
+    let path = relative.to_string_lossy().replace('\\', "/");
+    let name = relative
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    types::File { name, path, length, offset }
 }
 
 /// BitTorrent tuning knobs the web's torrent-profile selector drives (POST
@@ -897,18 +958,63 @@ impl Engine {
         self.session.unpause(handle).await.context("unpause failed")
     }
 
-    /// Make sure `file_idx` is part of the torrent's download selection.
-    /// `only_files() == None` means every file is selected already.
-    pub async fn select_file(&self, handle: &Handle, file_idx: usize) {
-        if let Some(only) = handle.only_files() {
-            if !only.contains(&file_idx) {
-                let mut set: Vec<usize> = only;
-                set.push(file_idx);
-                if let Err(e) = self.session.update_only_files(handle, &set.into_iter().collect()).await {
-                    tracing::warn!("select_file({file_idx}) failed: {e:#}");
-                }
+    /// Make sure `file_idx` is downloading: the invariant every playback entry
+    /// point (stream route, rillio:// byte plane, /cache/download) needs.
+    ///
+    /// - An explicit selection (`Some`) only ever GROWS here: the file joins
+    ///   it, nothing the user or an earlier play selected is dropped. Already
+    ///   selected is a no-op with no librqbit call, which matters because mpv
+    ///   opens many connections per title and every one lands here.
+    /// - `None` ("every file") is never produced by this code any more: every
+    ///   add states its selection ([`Pick`]) and every update is explicit. It
+    ///   only survives on torrents added before that fix (restored from
+    ///   `session/session.json` with `only_files: null`), and there it was
+    ///   never anyone's choice - `/cache/select` on such a torrent always
+    ///   writes an explicit list. So the first play NARROWS it: to the played
+    ///   file plus every file already COMPLETE on disk. Nothing downloaded is
+    ///   discarded or hidden (deselecting never deletes bytes, and complete
+    ///   files stay selected so the Cache page still counts them); partial
+    ///   files of unplayed episodes stop growing, keeping what they have.
+    ///
+    /// Fails loud: librqbit refuses a selection change while the torrent is
+    /// still hash-checking ("can't update initializing torrent"), and the
+    /// caller must not serve a stream that silently keeps pulling the pack.
+    pub async fn ensure_selected(&self, handle: &Handle, file_idx: usize) -> anyhow::Result<()> {
+        let ih = Self::info_hash_hex(handle);
+        let next: Vec<usize> = match handle.only_files() {
+            Some(only) if only.contains(&file_idx) => return Ok(()),
+            Some(mut only) => {
+                only.push(file_idx);
+                only.sort_unstable();
+                tracing::info!("selection {ih}: adding file {file_idx} -> {only:?}");
+                only
             }
-        }
+            None => {
+                let files = Self::files(handle);
+                let progress = handle.stats().file_progress;
+                let mut keep: Vec<usize> = files
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| f.length > 0 && progress.get(*i) == Some(&f.length))
+                    .map(|(i, _)| i)
+                    .collect();
+                if !keep.contains(&file_idx) {
+                    keep.push(file_idx);
+                    keep.sort_unstable();
+                }
+                tracing::warn!(
+                    "selection {ih}: legacy all-files selection ({} files) narrowed on play of \
+                     file {file_idx} to {keep:?} (the played file + files already complete on \
+                     disk); no bytes on disk are touched",
+                    files.len()
+                );
+                keep
+            }
+        };
+        self.session
+            .update_only_files(handle, &next.into_iter().collect())
+            .await
+            .with_context(|| format!("selecting file {file_idx} of {ih} failed"))
     }
 
     /// Set the exact download selection (the Cache page's per-file toggles).
@@ -1043,12 +1149,80 @@ impl Engine {
         &self.session
     }
 
-    /// Add a raw `.torrent` blob (`POST /create`). Metadata is immediate.
-    pub async fn add_blob(&self, bytes: Vec<u8>) -> anyhow::Result<Handle> {
-        let resp = self
-            .session
-            .add_torrent(AddTorrent::from_bytes(bytes), Some(add_torrent_options()))
-            .await?;
+    /// Add a raw `.torrent` blob (`POST /create`), downloading only `pick`.
+    /// Metadata is immediate. Re-adding a managed torrent returns it untouched.
+    pub async fn add_blob(&self, bytes: Vec<u8>, pick: Pick<'_>) -> anyhow::Result<Handle> {
+        self.add_source(AddTorrent::from_bytes(bytes), pick).await
+    }
+
+    /// The one place a torrent enters the session. The selection is set AT ADD
+    /// TIME, so no byte of an unwanted file is ever requested and no unwanted
+    /// file is ever preallocated (librqbit's initial check sizes only the
+    /// selected files).
+    ///
+    /// [`Pick::Decide`] needs the file list before the add, which a magnet
+    /// only has once its metadata is fetched from peers. librqbit resolves a
+    /// magnet's metadata INSIDE `add_torrent`, before the torrent exists, with
+    /// no hook in between; its supported way to see the files first is
+    /// `list_only`, which resolves and returns the metadata (as a complete
+    /// `.torrent` carrying the magnet's trackers) without creating anything.
+    /// We decide from that list, then add those `.torrent` bytes with the
+    /// selection set, handing the peers met during resolution back as
+    /// `initial_peers` so the real add does not start its swarm cold.
+    ///
+    /// Rejected alternatives: add-then-narrow and add-paused-then-select both
+    /// create the torrent with every file selected first, and librqbit's
+    /// initial check then preallocates every selected file on disk (a paused
+    /// add still initializes), so a 100 GB pack reserves 100 GB before the
+    /// selection lands; add-then-narrow additionally races the swarm for the
+    /// unwanted pieces.
+    async fn add_source(&self, add: AddTorrent<'_>, pick: Pick<'_>) -> anyhow::Result<Handle> {
+        let (add, opts) = match pick {
+            Pick::Files(files) => (add, add_torrent_options(files)),
+            Pick::Decide(decide) => {
+                let listed = match self
+                    .session
+                    .add_torrent(
+                        add,
+                        Some(librqbit::AddTorrentOptions { list_only: true, ..Default::default() }),
+                    )
+                    .await
+                    .context("resolving the torrent's file list")?
+                {
+                    librqbit::AddTorrentResponse::ListOnly(listed) => listed,
+                    _ => anyhow::bail!("bug: a list_only add created a torrent"),
+                };
+                // A concurrent add of the same torrent may have landed while
+                // we resolved: its selection stands, and re-adding would only
+                // come back as AlreadyManaged anyway.
+                if let Some(handle) = self.get(&listed.info_hash.as_string()) {
+                    return Ok(handle);
+                }
+                let mut offset = 0u64;
+                let files: Vec<types::File> = listed
+                    .info
+                    .iter_file_details()
+                    .context("listing the torrent's files")?
+                    .map(|fd| {
+                        let file = wire_file(&fd.filename.to_pathbuf()?, fd.len, offset);
+                        offset += fd.len;
+                        Ok(file)
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                let selection = decide(&files)?;
+                tracing::info!(
+                    "add {}: selecting {selection:?} of {} files",
+                    listed.info_hash.as_string(),
+                    files.len()
+                );
+                let mut opts = add_torrent_options(selection);
+                if !listed.seen_peers.is_empty() {
+                    opts.initial_peers = Some(listed.seen_peers);
+                }
+                (AddTorrent::TorrentFileBytes(listed.torrent_bytes), opts)
+            }
+        };
+        let resp = self.session.add_torrent(add, Some(opts)).await?;
         let handle = resp.into_handle().context("add_torrent returned list-only")?;
         self.reject_if_unconfined(&handle).await?;
         self.stamp_added_if_new(&Self::info_hash_hex(&handle));
@@ -1065,40 +1239,82 @@ impl Engine {
     }
 
     /// Get-or-create a torrent from a magnet URL (`POST /:ih/create`, and the
-    /// idempotent auto-create on stream). Waits, bounded, for magnet metadata so
-    /// files are available for index resolution.
-    pub async fn add_magnet(&self, magnet: &str) -> anyhow::Result<Handle> {
-        // The defaults ride in the URI, the only channel librqbit reads for a
-        // magnet; an addon magnet's own trackers are preserved and ours are added
-        // on top, which is what the DEFAULT_TRACKERS doc always claimed happened.
-        let magnet = magnet_with_default_trackers(magnet);
-        let resp = self
-            .session
-            .add_torrent(AddTorrent::from_url(&magnet), Some(add_torrent_options()))
-            .await?;
-        let handle = resp.into_handle().context("add_torrent returned list-only")?;
+    /// auto-create behind [`Engine::get_or_create_for_file`]), downloading only
+    /// `pick` if it is new. An already-managed torrent is returned as it is,
+    /// selection untouched and WITHOUT re-adding (see
+    /// [`Engine::get_or_create_for_file`] for why a re-add is harmful), which
+    /// also skips a pointless metadata round trip to the swarm. Waits, bounded,
+    /// for the hash check so files are available for index resolution.
+    pub async fn add_magnet(&self, magnet: &str, pick: Pick<'_>) -> anyhow::Result<Handle> {
+        let info_hash = librqbit::Magnet::parse(magnet)
+            .context("not a valid magnet url")?
+            .as_id20()
+            .context("magnet has no BTv1 infohash")?
+            .as_string();
+        let handle = match self.get(&info_hash) {
+            Some(handle) => handle,
+            None => {
+                // The defaults ride in the URI, the only channel librqbit reads
+                // for a magnet; an addon magnet's own trackers are preserved and
+                // ours are added on top, which is what the DEFAULT_TRACKERS doc
+                // always claimed happened.
+                let magnet = magnet_with_default_trackers(magnet);
+                self.add_source(AddTorrent::from_url(magnet), pick).await?
+            }
+        };
         // Bounded wait: a magnet with no reachable peers must not hang the request.
         let _ = tokio::time::timeout(METADATA_TIMEOUT, handle.wait_until_initialized()).await;
-        self.reject_if_unconfined(&handle).await?;
-        self.stamp_added_if_new(&Self::info_hash_hex(&handle));
         Ok(handle)
     }
 
-    /// Get-or-create by infohash for the stream route. Crucially, if the torrent
-    /// is already managed it returns the LIVE handle without re-adding: the media
-    /// player opens many connections per title (header read, mkv-index seek,
-    /// read-ahead), and calling `add_torrent` again on a live torrent resets it
-    /// to the `initializing` state (`overwrite: true` re-runs storage init),
-    /// which makes the concurrent stream reads fail with "invalid state:
-    /// initializing" and playback abort. Only a genuinely new infohash adds.
-    pub async fn get_or_create(&self, info_hash: &str) -> anyhow::Result<Handle> {
-        if let Some(handle) = self.get(info_hash) {
-            // Already managed: make sure metadata is ready, but never re-add.
-            let _ = tokio::time::timeout(METADATA_TIMEOUT, handle.wait_until_initialized()).await;
-            return Ok(handle);
+    /// Get-or-create by infohash for PLAYING one file, and make sure that file
+    /// is downloading ([`Engine::ensure_selected`]). Returns the handle and the
+    /// resolved file index. Every playback entry point goes through here: the
+    /// stream route, the rillio:// byte plane, and `/cache/download`.
+    ///
+    /// A new torrent is added with ONLY that file selected. A known index goes
+    /// to librqbit directly ([`Pick::Files`], the common `/{ih}/7` case, no
+    /// extra round trip); one that needs the file list is resolved first
+    /// ([`Pick::Decide`]), and if it names no file the add is refused outright,
+    /// nothing is added and nothing downloads.
+    ///
+    /// Crucially, if the torrent is already managed it returns the LIVE handle
+    /// without re-adding: the media player opens many connections per title
+    /// (header read, mkv-index seek, read-ahead), and calling `add_torrent`
+    /// again on a live torrent resets it to the `initializing` state
+    /// (`overwrite: true` re-runs storage init), which makes the concurrent
+    /// stream reads fail with "invalid state: initializing" and playback abort.
+    pub async fn get_or_create_for_file(
+        &self,
+        info_hash: &str,
+        file: FileRef<'_>,
+    ) -> anyhow::Result<(Handle, usize)> {
+        let handle = match self.get(info_hash) {
+            Some(handle) => {
+                // Already managed: make sure metadata is ready, but never re-add.
+                let _ =
+                    tokio::time::timeout(METADATA_TIMEOUT, handle.wait_until_initialized()).await;
+                handle
+            }
+            None => {
+                let magnet = format!("magnet:?xt=urn:btih:{info_hash}");
+                let decide = |files: &[types::File]| file.resolve(files).map(|i| vec![i]);
+                let pick = match &file {
+                    FileRef::Index(i) => Pick::Files(vec![*i]),
+                    FileRef::Resolve(_) => Pick::Decide(&decide),
+                };
+                self.add_magnet(&magnet, pick).await?
+            }
+        };
+        let files = Self::files(&handle);
+        if files.is_empty() {
+            anyhow::bail!("{info_hash}: metadata not resolved (no files)");
         }
-        let magnet = format!("magnet:?xt=urn:btih:{info_hash}");
-        self.add_magnet(&magnet).await
+        let idx = file.resolve(&files).with_context(|| format!("{info_hash}"))?;
+        // A no-op for the fresh add above (it already selected exactly idx);
+        // real work for a torrent that was already managed.
+        self.ensure_selected(&handle, idx).await?;
+        Ok((handle, idx))
     }
 
     /// Lowercase hex infohash of a handle. Uses librqbit-core's stable
@@ -1174,20 +1390,7 @@ impl Engine {
             .with_metadata(|m| {
                 m.file_infos
                     .iter()
-                    .map(|fi| {
-                        let path = fi.relative_filename.to_string_lossy().replace('\\', "/");
-                        let name = fi
-                            .relative_filename
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.clone());
-                        types::File {
-                            name,
-                            path,
-                            length: fi.len,
-                            offset: fi.offset_in_torrent,
-                        }
-                    })
+                    .map(|fi| wire_file(&fi.relative_filename, fi.len, fi.offset_in_torrent))
                     .collect()
             })
             .unwrap_or_default()

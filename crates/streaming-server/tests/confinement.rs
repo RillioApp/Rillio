@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 
+use rillio_streaming_server::engine::Pick;
 use rillio_streaming_server::{router, Config, Engine};
 
 /// Build a minimal valid single-file `.torrent` (bencode) declaring `length`
@@ -40,7 +41,7 @@ async fn traversal_path_torrent_is_rejected() {
     // ConfinedStorage would independently reject the resolved path too).
     let engine = engine("traversal").await;
     let torrent = make_torrent("../../Startup/evil.exe", 1000);
-    let result = engine.add_blob(torrent).await;
+    let result = engine.add_blob(torrent, Pick::Files(vec![0])).await;
     assert!(result.is_err(), "a traversal path must never be added");
 }
 
@@ -54,7 +55,7 @@ async fn large_torrent_not_rejected_by_size_quota() {
     // may still error inside librqbit's own file handling; that is not our gate.)
     let engine = engine("large").await;
     let torrent = make_torrent("movie-8gb.mkv", 8_000_000_000);
-    if let Err(e) = engine.add_blob(torrent).await {
+    if let Err(e) = engine.add_blob(torrent, Pick::Files(vec![0])).await {
         let msg = e.to_string();
         assert!(
             !msg.contains("quota") && !msg.contains("exceeds"),

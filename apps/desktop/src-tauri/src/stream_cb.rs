@@ -11,8 +11,9 @@
 //!     because widening what a player may open is a security decision;
 //!  2. the generic callback plumbing ([`register`], [`ByteSource`]) - the raw
 //!     FFI is in [`crate::mpv`], everything unsafe about lifetimes is here;
-//!  3. the [`Engine`] bridge ([`EngineSources`]) - `get_or_create` + `touch` +
-//!     tail prefetch, then a `FileStream` driven with `Handle::block_on`.
+//!  3. the [`Engine`] bridge ([`EngineSources`]) - `get_or_create_for_file`
+//!     (which also selects the played file) + `touch` + tail prefetch, then a
+//!     `FileStream` driven with `Handle::block_on`.
 //!
 //! THREADING RULE. mpv calls these callbacks synchronously from its demuxer /
 //! stream threads, which are NOT tokio workers, and blocking in them is both
@@ -26,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rillio_streaming_server::engine::{Engine, Handle};
+use rillio_streaming_server::engine::{Engine, FileRef, Handle};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::mpv::{
@@ -460,21 +461,18 @@ impl SourceFactory for EngineSources {
             let open = async {
                 // Idempotent get-or-create; never re-adds a live torrent (that
                 // would reset it to `initializing` and fail concurrent reads).
-                let handle = engine
-                    .get_or_create(&ih)
+                // It also makes sure the played file is the one downloading:
+                // parity with the HTTP stream route, so playing over this byte
+                // plane never leaves a torrent pulling every file (a legacy
+                // all-files selection is narrowed here too).
+                let (handle, idx) = engine
+                    .get_or_create_for_file(&ih, FileRef::Index(idx))
                     .await
-                    .map_err(|e| format!("get_or_create({ih}) failed: {e:#}"))?;
+                    .map_err(|e| format!("rillio:// open {ih}/{idx} failed: {e:#}"))?;
                 // Mark active so the cache sweeper never evicts what is playing.
                 engine.touch(&ih);
 
-                let files = Engine::files(&handle);
-                if files.is_empty() {
-                    return Err(format!("{ih}: metadata not resolved (no files)"));
-                }
-                let file = files
-                    .get(idx)
-                    .ok_or_else(|| format!("{ih}: file index {idx} out of range ({})", files.len()))?;
-                let len = file.length;
+                let len = Engine::files(&handle)[idx].length;
 
                 // Tail-prefetch parity with the HTTP route: warm the Cues once per
                 // file so mpv's opening tail seek does not race the front read.
@@ -621,6 +619,7 @@ fn spawn_tail_prefetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rillio_streaming_server::engine::Pick;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
@@ -1120,7 +1119,7 @@ mod tests {
         let (engine, info_hash) = rt.block_on(async {
             let engine = Engine::new(dir.clone()).await.expect("engine");
             let blob = make_torrent("Spike.Movie.2026", &[("Spike.Movie.2026.mkv", FILE_LEN)]);
-            let handle = engine.add_blob(blob).await.expect("add_blob");
+            let handle = engine.add_blob(blob, Pick::Files(vec![0])).await.expect("add_blob");
             let ih = Engine::info_hash_hex(&handle);
             (engine, ih)
         });
@@ -1149,6 +1148,42 @@ mod tests {
         watcher.join().unwrap();
         eprintln!("[engine] parked read cancelled after {:?}: {err}", started.elapsed());
         assert!(err.contains("cancelled"), "unexpected error: {err}");
+
+        drop(source);
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Playing over the byte plane selects the played file, exactly like the
+    /// HTTP stream route: a torrent must never download files nobody played.
+    /// Here the pack was added with episode 1 selected and episode 2 is opened;
+    /// episode 2 joins the selection, episode 3 stays out.
+    #[test]
+    fn engine_bridge_selects_the_played_file() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let dir = std::env::temp_dir().join("rillio-stream-cb-select");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+
+        let (engine, info_hash) = rt.block_on(async {
+            let engine = Engine::new(dir.clone()).await.expect("engine");
+            let blob = make_torrent(
+                "Some.Show.S01",
+                &[("E01.mkv", 400_000), ("E02.mkv", 400_000), ("E03.mkv", 400_000)],
+            );
+            let handle = engine.add_blob(blob, Pick::Files(vec![0])).await.expect("add_blob");
+            (engine, Engine::info_hash_hex(&handle))
+        });
+
+        let sources = EngineSources::new(engine.clone(), rt.handle().clone());
+        let source = sources.open(&info_hash, 1).expect("open episode 2 through the bridge");
+        let selected = engine.get(&info_hash).expect("managed").only_files();
+        assert_eq!(selected, Some(vec![0, 1]), "the played file joins, nothing else does");
 
         drop(source);
         drop(rt);

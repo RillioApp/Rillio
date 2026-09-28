@@ -53,7 +53,7 @@ async fn spawn(tag: &str) -> (String, reqwest::Client) {
     (base, reqwest::Client::new())
 }
 
-async fn add(c: &reqwest::Client, base: &str, blob: Vec<u8>) {
+async fn add(c: &reqwest::Client, base: &str, blob: Vec<u8>) -> String {
     let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
     let created: Value = c
         .post(format!("{base}/create"))
@@ -64,7 +64,32 @@ async fn add(c: &reqwest::Client, base: &str, blob: Vec<u8>) {
         .json()
         .await
         .unwrap();
-    assert!(created["infoHash"].as_str().is_some(), "create failed: {created}");
+    created["infoHash"].as_str().unwrap_or_else(|| panic!("create failed: {created}")).to_owned()
+}
+
+/// A fresh add selects at most the main feature (tests/file_selection.rs), so
+/// these tests select every file explicitly, the Cache page's file-browser
+/// path, to exercise the playable-file rule over a multi-file SELECTION.
+/// Waits out the hash check first: librqbit refuses selection changes on an
+/// initializing torrent.
+async fn select_all(c: &reqwest::Client, base: &str, ih: &str, count: usize) {
+    for _ in 0..100 {
+        if only_entry(c, base).await["state"] != "initializing" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for idx in 0..count {
+        let resp = c
+            .post(format!("{base}/cache/select"))
+            .json(&serde_json::json!({ "infoHash": ih, "fileIdx": idx, "selected": true }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "select {idx} failed: {status} {body}");
+    }
 }
 
 async fn only_entry(c: &reqwest::Client, base: &str) -> Value {
@@ -83,12 +108,13 @@ async fn only_entry(c: &reqwest::Client, base: &str) -> Value {
 #[tokio::test]
 async fn movie_with_an_nfo_beside_it_is_still_playable() {
     let (base, c) = spawn("nfo").await;
-    add(
+    let ih = add(
         &c,
         &base,
         make_multi_torrent("Some.Movie.2026.1080p", &[("Some.Movie.2026.1080p.mkv", 4_000_000), ("Some.Movie.2026.1080p.nfo", 2_689)]),
     )
     .await;
+    select_all(&c, &base, &ih, 2).await;
 
     let entry = only_entry(&c, &base).await;
     // Both files are selected (honest count), but the lone VIDEO is playable.
@@ -101,7 +127,7 @@ async fn movie_with_an_nfo_beside_it_is_still_playable() {
 #[tokio::test]
 async fn a_movie_beside_its_extras_still_plays_the_feature() {
     let (base, c) = spawn("extras").await;
-    add(
+    let ih = add(
         &c,
         &base,
         make_multi_torrent(
@@ -110,8 +136,10 @@ async fn a_movie_beside_its_extras_still_plays_the_feature() {
         ),
     )
     .await;
+    select_all(&c, &base, &ih, 2).await;
 
     let entry = only_entry(&c, &base).await;
+    assert_eq!(entry["fileCount"], 2);
     // Two videos, but not a coin flip: the feature dwarfs the extra.
     assert_eq!(entry["fileIdx"], 0);
     assert_eq!(entry["name"], "Some.Movie.2026.mkv");
@@ -120,12 +148,13 @@ async fn a_movie_beside_its_extras_still_plays_the_feature() {
 #[tokio::test]
 async fn season_pack_stays_ambiguous() {
     let (base, c) = spawn("pack").await;
-    add(
+    let ih = add(
         &c,
         &base,
         make_multi_torrent("Some.Show.S01", &[("S01E01.mkv", 1_000_000), ("S01E02.mkv", 1_000_000)]),
     )
     .await;
+    select_all(&c, &base, &ih, 2).await;
 
     let entry = only_entry(&c, &base).await;
     // Two videos: which one would Play mean? Correctly offers none.
@@ -137,9 +166,11 @@ async fn season_pack_stays_ambiguous() {
 #[tokio::test]
 async fn selection_with_no_video_is_not_playable() {
     let (base, c) = spawn("novideo").await;
-    add(&c, &base, make_multi_torrent("Just.Extras", &[("readme.nfo", 100), ("cover.jpg", 2_000)])).await;
+    let ih = add(&c, &base, make_multi_torrent("Just.Extras", &[("readme.nfo", 100), ("cover.jpg", 2_000)])).await;
+    select_all(&c, &base, &ih, 2).await;
 
     let entry = only_entry(&c, &base).await;
+    assert_eq!(entry["fileCount"], 2);
     assert!(entry.get("fileIdx").is_none());
     assert_eq!(entry["name"], "Just.Extras");
 }

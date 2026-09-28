@@ -109,8 +109,22 @@ async fn lists_every_file_in_the_torrent_and_marks_videos() {
     assert_eq!(listed[1]["path"], "extras/behind.mp4");
     assert_eq!(listed[1]["video"], true);
     assert_eq!(listed[2]["video"], false, ".nfo is not playable");
-    // A fresh add selects everything.
-    assert!(listed.iter().all(|f| f["selected"] == true));
+    // Listing is not selecting: two videos within 3x of each other are
+    // ambiguous, so a fresh browse-time add downloads nothing until a file is
+    // played or picked here (tests/file_selection.rs owns that contract).
+    assert!(listed.iter().all(|f| f["selected"] == false));
+}
+
+async fn select(c: &reqwest::Client, base: &str, ih: &str, idx: usize, selected: bool) {
+    let resp = c
+        .post(format!("{base}/cache/select"))
+        .json(&serde_json::json!({ "infoHash": ih, "fileIdx": idx, "selected": selected }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "select {idx}={selected} failed: {status} {body}");
 }
 
 #[tokio::test]
@@ -118,28 +132,18 @@ async fn a_file_can_be_dropped_from_and_added_back_to_the_selection() {
     let (base, c, _dir) = spawn("select").await;
     let ih = add(&c, &base, make_multi_torrent("Pack", &[("a.mkv", 5_000), ("b.mkv", 4_000)])).await;
     wait_ready(&c, &base).await;
+    // An ambiguous pack starts with nothing selected; pick both explicitly.
+    select(&c, &base, &ih, 0, true).await;
+    select(&c, &base, &ih, 1, true).await;
+    assert!(files(&c, &base, &ih).await.iter().all(|f| f["selected"] == true));
 
-    let resp = c
-        .post(format!("{base}/cache/select"))
-        .json(&serde_json::json!({ "infoHash": ih, "fileIdx": 1, "selected": false }))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    assert!(status.is_success(), "deselect failed: {status} {body}");
+    select(&c, &base, &ih, 1, false).await;
     let listed = files(&c, &base, &ih).await;
     assert_eq!(listed[0]["selected"], true);
     assert_eq!(listed[1]["selected"], false);
 
     // ...and back: this is the "download the rest of the torrent" path.
-    let resp = c
-        .post(format!("{base}/cache/select"))
-        .json(&serde_json::json!({ "infoHash": ih, "fileIdx": 1, "selected": true }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
+    select(&c, &base, &ih, 1, true).await;
     assert!(files(&c, &base, &ih).await.iter().all(|f| f["selected"] == true));
 }
 
