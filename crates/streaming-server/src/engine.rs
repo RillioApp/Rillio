@@ -312,6 +312,20 @@ pub struct Engine {
     /// (see [`CacheMeta`]). Persisted to [`META_FILE`] so a title identified
     /// once stays identified across restarts.
     meta: Arc<Mutex<HashMap<String, CacheMeta>>>,
+    /// Serializes every download-selection change. A selection change is a
+    /// read-modify-write of librqbit's `only_files` (read the list, add or drop
+    /// a file, write the whole list back), and two unserialized ones (two first
+    /// plays of different episodes, a play beside a Cache page toggle) each
+    /// write back a list missing the other's file. Held from the read through
+    /// librqbit's write; the only way to change a selection is through
+    /// [`Engine::update_selection`], which takes it.
+    ///
+    /// One lock per engine, not per torrent: the critical section is a
+    /// synchronous librqbit update plus librqbit's persistence write, and that
+    /// write already takes a session-wide lock on `session.json`, so selection
+    /// changes on different torrents were serialized anyway. A per-infohash map
+    /// would add entries to clean up on every remove for no real concurrency.
+    selection: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Filename of the persisted pin set, under the cache root.
@@ -753,6 +767,7 @@ impl Engine {
             watched: Arc::new(Mutex::new(watched)),
             meta: Arc::new(Mutex::new(meta)),
             added: Arc::new(Mutex::new(added)),
+            selection: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -981,56 +996,101 @@ impl Engine {
     /// caller must not serve a stream that silently keeps pulling the pack.
     pub async fn ensure_selected(&self, handle: &Handle, file_idx: usize) -> anyhow::Result<()> {
         let ih = Self::info_hash_hex(handle);
-        let next: Vec<usize> = match handle.only_files() {
-            Some(only) if only.contains(&file_idx) => return Ok(()),
-            Some(mut only) => {
-                only.push(file_idx);
-                only.sort_unstable();
-                tracing::info!("selection {ih}: adding file {file_idx} -> {only:?}");
-                only
-            }
-            None => {
-                let files = Self::files(handle);
-                let progress = handle.stats().file_progress;
-                let mut keep: Vec<usize> = files
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, f)| f.length > 0 && progress.get(*i) == Some(&f.length))
-                    .map(|(i, _)| i)
-                    .collect();
-                if !keep.contains(&file_idx) {
-                    keep.push(file_idx);
-                    keep.sort_unstable();
+        self.update_selection(handle, |current| {
+            Ok(match current {
+                Some(only) if only.contains(&file_idx) => None,
+                Some(mut only) => {
+                    only.push(file_idx);
+                    only.sort_unstable();
+                    tracing::info!("selection {ih}: adding file {file_idx} -> {only:?}");
+                    Some(only)
                 }
-                tracing::warn!(
-                    "selection {ih}: legacy all-files selection ({} files) narrowed on play of \
-                     file {file_idx} to {keep:?} (the played file + files already complete on \
-                     disk); no bytes on disk are touched",
-                    files.len()
-                );
-                keep
-            }
-        };
-        self.session
-            .update_only_files(handle, &next.into_iter().collect())
-            .await
-            .with_context(|| format!("selecting file {file_idx} of {ih} failed"))
+                None => {
+                    let files = Self::files(handle);
+                    let progress = handle.stats().file_progress;
+                    let mut keep: Vec<usize> = files
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, f)| f.length > 0 && progress.get(*i) == Some(&f.length))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !keep.contains(&file_idx) {
+                        keep.push(file_idx);
+                        keep.sort_unstable();
+                    }
+                    tracing::warn!(
+                        "selection {ih}: legacy all-files selection ({} files) narrowed on play \
+                         of file {file_idx} to {keep:?} (the played file + files already \
+                         complete on disk); no bytes on disk are touched",
+                        files.len()
+                    );
+                    Some(keep)
+                }
+            })
+        })
+        .await
+        .with_context(|| format!("selecting file {file_idx} of {ih} failed"))
     }
 
-    /// Set the exact download selection (the Cache page's per-file toggles).
+    /// Add one file to the download selection or drop it (the Cache page's
+    /// per-file toggles). Unlike [`Engine::ensure_selected`] this can also
+    /// REMOVE a file, so it is the path for "stop downloading that extra".
     ///
-    /// Unlike [`Engine::select_file`] this can also REMOVE files, so it is the
-    /// path for "stop downloading that extra". Refuses an empty selection:
-    /// librqbit treats "no files" as a torrent that can never finish, and the
-    /// UI's delete button is the honest way to want nothing.
-    pub async fn set_selected_files(&self, handle: &Handle, files: &[usize]) -> anyhow::Result<()> {
-        if files.is_empty() {
-            anyhow::bail!("a torrent must keep at least one selected file; delete it instead");
+    /// Refuses to drop the last selected file: librqbit treats "no files" as a
+    /// torrent that can never finish, and the UI's delete button is the honest
+    /// way to want nothing. A legacy all-files selection (`None`) is read as
+    /// every file, so a toggle on it writes an explicit list.
+    pub async fn set_file_selected(
+        &self,
+        handle: &Handle,
+        file_idx: usize,
+        selected: bool,
+    ) -> anyhow::Result<()> {
+        let count = Self::files(handle).len();
+        if file_idx >= count {
+            anyhow::bail!("file index {file_idx} is out of range ({count} files)");
         }
-        self.session
-            .update_only_files(handle, &files.iter().copied().collect())
-            .await
-            .context("updating the file selection failed")
+        self.update_selection(handle, |current| {
+            let mut next: Vec<usize> = match current {
+                Some(only) => only.into_iter().filter(|&i| i < count).collect(),
+                None => (0..count).collect(),
+            };
+            if selected {
+                if next.contains(&file_idx) {
+                    return Ok(None);
+                }
+                next.push(file_idx);
+                next.sort_unstable();
+            } else {
+                if !next.contains(&file_idx) {
+                    return Ok(None);
+                }
+                next.retain(|&i| i != file_idx);
+                if next.is_empty() {
+                    anyhow::bail!("a torrent must keep at least one selected file; delete it instead");
+                }
+            }
+            Ok(Some(next))
+        })
+        .await
+        .context("updating the file selection failed")
+    }
+
+    /// The one place a download selection changes. `change` gets the current
+    /// selection (`None` = librqbit's "every file") and returns the new one,
+    /// or `None` for "leave it as it is" (no librqbit call, no persistence
+    /// write). The read and the write happen under [`Engine::selection`], so a
+    /// concurrent change can never be overwritten by a list read before it.
+    async fn update_selection(
+        &self,
+        handle: &Handle,
+        change: impl FnOnce(Option<Vec<usize>>) -> anyhow::Result<Option<Vec<usize>>>,
+    ) -> anyhow::Result<()> {
+        let _serialized = self.selection.lock().await;
+        let Some(next) = change(handle.only_files())? else {
+            return Ok(());
+        };
+        self.session.update_only_files(handle, &next.into_iter().collect()).await
     }
 
     /// The current BitTorrent profile (for `GET /settings` and the stats echo).

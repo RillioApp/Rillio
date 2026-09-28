@@ -351,23 +351,13 @@ pub(crate) async fn select(State(engine): State<Engine>, Json(body): Json<Select
     let Some(handle) = engine.get(&info_hash) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let count = Engine::files(&handle).len();
-    if body.file_idx >= count {
+    if body.file_idx >= Engine::files(&handle).len() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let mut selected: Vec<usize> = match handle.only_files() {
-        Some(only) => only.into_iter().filter(|&i| i < count).collect(),
-        None => (0..count).collect(),
-    };
-    if body.selected {
-        if !selected.contains(&body.file_idx) {
-            selected.push(body.file_idx);
-            selected.sort_unstable();
-        }
-    } else {
-        selected.retain(|&i| i != body.file_idx);
-    }
-    match engine.set_selected_files(&handle, &selected).await {
+    // The read-modify-write of the selection happens inside the engine, under
+    // its selection lock, so a concurrent play cannot lose this toggle (or
+    // this toggle the play's file).
+    match engine.set_file_selected(&handle, body.file_idx, body.selected).await {
         Ok(()) => {
             engine.touch(&info_hash);
             Json(serde_json::json!({ "success": true })).into_response()
