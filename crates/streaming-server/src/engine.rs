@@ -31,6 +31,10 @@ pub type Handle = Arc<ManagedTorrent>;
 /// wait 500s the stream open mid-validation. (Removing that delay entirely is a
 /// follow-up: a lazy response body that returns headers immediately and blocks
 /// only the body until the torrent goes live.)
+///
+/// The same bound caps the step before it, resolving a magnet's metadata
+/// from the swarm ([`Engine::resolve_metadata`]), which librqbit would
+/// otherwise wait on forever.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Default public trackers injected into every torrent, mirroring the blob
@@ -140,8 +144,9 @@ fn magnet_with_default_trackers(magnet: &str) -> String {
 fn add_torrent_options(only_files: Vec<usize>) -> librqbit::AddTorrentOptions {
     librqbit::AddTorrentOptions {
         only_files: Some(only_files),
-        // Honoured on the .torrent-bytes path only (add_blob); the magnet path
-        // ignores this, which is why magnets get theirs via the URI instead.
+        // Honoured on the .torrent-bytes path only. Every managed add is one
+        // (see Engine::add_source), but a magnet's metadata resolution before
+        // it ignores this, which is why magnets also carry them in the URI.
         trackers: Some(DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect()),
         // Reuse existing cache files instead of failing on them. With
         // allow_overwrite=false librqbit's fs storage opens files with
@@ -167,7 +172,7 @@ pub enum Pick<'a> {
     /// The caller already knows the files (a numeric stream index, a preload's
     /// `fileIdx`). Handed straight to librqbit as `only_files`, which validates
     /// the indices against the real file list and refuses the add if one is out
-    /// of range; costs nothing extra over a plain add.
+    /// of range; no decision over the file list is needed.
     Files(Vec<usize>),
     /// Decided from the file list, which a magnet only has once its metadata
     /// arrives. See [`Engine::add_source`] for how that stays add-time. `Ok(vec![])`
@@ -1231,15 +1236,18 @@ impl Engine {
     /// file is ever preallocated (librqbit's initial check sizes only the
     /// selected files).
     ///
-    /// [`Pick::Decide`] needs the file list before the add, which a magnet
-    /// only has once its metadata is fetched from peers. librqbit resolves a
-    /// magnet's metadata INSIDE `add_torrent`, before the torrent exists, with
-    /// no hook in between; its supported way to see the files first is
-    /// `list_only`, which resolves and returns the metadata (as a complete
-    /// `.torrent` carrying the magnet's trackers) without creating anything.
-    /// We decide from that list, then add those `.torrent` bytes with the
-    /// selection set, handing the peers met during resolution back as
-    /// `initial_peers` so the real add does not start its swarm cold.
+    /// Every add is two steps. First the metadata is resolved on its own
+    /// ([`Engine::resolve_metadata`], librqbit's `list_only`: the metadata
+    /// comes back as a complete `.torrent` carrying the magnet's trackers and
+    /// nothing is created), bounded by [`Engine::resolve_timeout`]. Then those
+    /// `.torrent` bytes are added with the selection set, handing the peers
+    /// met during resolution back as `initial_peers` so the real add does not
+    /// start its swarm cold. [`Pick::Decide`] needs the file list in between;
+    /// [`Pick::Files`] goes the same way so that the one step that waits on the
+    /// swarm is always the bounded one that creates nothing. (A single-step
+    /// magnet add resolves INSIDE `add_torrent`, and abandoning it at a
+    /// deadline could land between librqbit registering the torrent and
+    /// starting it, leaving a torrent that exists and never runs.)
     ///
     /// Rejected alternatives: add-then-narrow and add-paused-then-select both
     /// create the torrent with every file selected first, and librqbit's
@@ -1248,27 +1256,17 @@ impl Engine {
     /// selection lands; add-then-narrow additionally races the swarm for the
     /// unwanted pieces.
     async fn add_source(&self, add: AddTorrent<'_>, pick: Pick<'_>) -> anyhow::Result<Handle> {
-        let (add, opts) = match pick {
-            Pick::Files(files) => (add, add_torrent_options(files)),
+        let listed = self.resolve_metadata(add).await?;
+        let info_hash = listed.info_hash.as_string();
+        // A concurrent add of the same torrent may have landed while we
+        // resolved: its selection stands, and re-adding would only come back
+        // as AlreadyManaged anyway.
+        if let Some(handle) = self.get(&info_hash) {
+            return Ok(handle);
+        }
+        let selection = match pick {
+            Pick::Files(files) => files,
             Pick::Decide(decide) => {
-                let listed = match self
-                    .session
-                    .add_torrent(
-                        add,
-                        Some(librqbit::AddTorrentOptions { list_only: true, ..Default::default() }),
-                    )
-                    .await
-                    .context("resolving the torrent's file list")?
-                {
-                    librqbit::AddTorrentResponse::ListOnly(listed) => listed,
-                    _ => anyhow::bail!("bug: a list_only add created a torrent"),
-                };
-                // A concurrent add of the same torrent may have landed while
-                // we resolved: its selection stands, and re-adding would only
-                // come back as AlreadyManaged anyway.
-                if let Some(handle) = self.get(&listed.info_hash.as_string()) {
-                    return Ok(handle);
-                }
                 let mut offset = 0u64;
                 let files: Vec<types::File> = listed
                     .info
@@ -1281,23 +1279,56 @@ impl Engine {
                     })
                     .collect::<anyhow::Result<_>>()?;
                 let selection = decide(&files)?;
-                tracing::info!(
-                    "add {}: selecting {selection:?} of {} files",
-                    listed.info_hash.as_string(),
-                    files.len()
-                );
-                let mut opts = add_torrent_options(selection);
-                if !listed.seen_peers.is_empty() {
-                    opts.initial_peers = Some(listed.seen_peers);
-                }
-                (AddTorrent::TorrentFileBytes(listed.torrent_bytes), opts)
+                tracing::info!("add {info_hash}: selecting {selection:?} of {} files", files.len());
+                selection
             }
         };
-        let resp = self.session.add_torrent(add, Some(opts)).await?;
+        let mut opts = add_torrent_options(selection);
+        if !listed.seen_peers.is_empty() {
+            opts.initial_peers = Some(listed.seen_peers);
+        }
+        // Metadata in hand, so this add never waits on the swarm: it only
+        // registers, persists and starts the torrent.
+        let resp = self
+            .session
+            .add_torrent(AddTorrent::TorrentFileBytes(listed.torrent_bytes), Some(opts))
+            .await?;
         let handle = resp.into_handle().context("add_torrent returned list-only")?;
         self.reject_if_unconfined(&handle).await?;
         self.stamp_added_if_new(&Self::info_hash_hex(&handle));
         Ok(handle)
+    }
+
+    /// Resolve a source's metadata without creating a torrent (librqbit's
+    /// `list_only`), bounded by [`Engine::resolve_timeout`].
+    ///
+    /// librqbit waits for a magnet's metadata with no deadline (its
+    /// `resolve_magnet` polls the DHT/tracker peer stream until a peer
+    /// delivers), so a magnet nobody can serve used to hang its request
+    /// forever. Giving up here is clean by construction: a `list_only` add
+    /// never registers anything in the session, and dropping it drops the
+    /// DHT search (its peer stream aborts its task on drop), the tracker
+    /// announces and the metadata connections (all owned by the future, none
+    /// spawned). A `.torrent` blob carries its metadata and resolves at once.
+    async fn resolve_metadata(
+        &self,
+        add: AddTorrent<'_>,
+    ) -> anyhow::Result<librqbit::ListOnlyResponse> {
+        let list_only = librqbit::AddTorrentOptions { list_only: true, ..Default::default() };
+        let resolved =
+            tokio::time::timeout(self.resolve_timeout, self.session.add_torrent(add, Some(list_only)))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "no peer delivered the torrent's metadata within {:?}; nothing was added",
+                        self.resolve_timeout
+                    )
+                })?
+                .context("resolving the torrent's metadata")?;
+        match resolved {
+            librqbit::AddTorrentResponse::ListOnly(listed) => Ok(listed),
+            _ => anyhow::bail!("bug: a list_only add created a torrent"),
+        }
     }
 
     /// Tear the torrent back down (and its files) if it escapes the cache.
@@ -1344,9 +1375,9 @@ impl Engine {
     /// stream route, the rillio:// byte plane, and `/cache/download`.
     ///
     /// A new torrent is added with ONLY that file selected. A known index goes
-    /// to librqbit directly ([`Pick::Files`], the common `/{ih}/7` case, no
-    /// extra round trip); one that needs the file list is resolved first
-    /// ([`Pick::Decide`]), and if it names no file the add is refused outright,
+    /// to librqbit directly ([`Pick::Files`], the common `/{ih}/7` case); one
+    /// that needs the file list is decided from it ([`Pick::Decide`]), and if
+    /// it names no file the add is refused outright,
     /// nothing is added and nothing downloads.
     ///
     /// Crucially, if the torrent is already managed it returns the LIVE handle
