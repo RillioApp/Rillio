@@ -8,10 +8,10 @@
 //! neither the user nor us anything. Every error the shell shows or logs for a
 //! network or update failure goes through [`error_chain`].
 //!
-//! The screen leads with a plain sentence instead of the chain ([`classify`],
-//! [`summary`], carried by [`UpdateFailure`]), and keeps the chain behind
-//! "Details". Android has no in-app updater: only the platform refusal is
-//! built there.
+//! The screen never shows the chain: it says what happened and what to check
+//! ([`classify`], [`wording`], carried by [`UpdateFailure`]), and "Copy error"
+//! puts the whole technical report on the clipboard. Android has no in-app
+//! updater: only the platform refusal is built there.
 #![cfg_attr(target_os = "android", allow(dead_code))]
 
 /// `err` followed by every `source()` below it, joined with ": ", e.g.
@@ -160,46 +160,152 @@ fn classify_io(io: &std::io::Error) -> Option<FailureKind> {
     }
 }
 
-/// The sentence the screen leads with. Plain and true: a kind the chain did
-/// not prove gets the generic line for its stage.
-pub fn summary(kind: FailureKind, stage: Stage) -> &'static str {
+/// What the screen says for a failure: what happened, and what to check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wording {
+    pub summary: &'static str,
+    pub hint: &'static str,
+    /// True where the failure provably changed nothing: a check or download
+    /// that failed never reached the installer. The screen then adds
+    /// [`NOTHING_INSTALLED`]. (Not "nothing on your device changed": the
+    /// splash copy and progress file in %TEMP% are changes.)
+    pub nothing_installed: bool,
+}
+
+pub const NOTHING_INSTALLED: &str = "Nothing was installed.";
+
+/// THE table of what the screen says, per kind and step. Plain and true: a
+/// kind the chain did not prove gets the generic line for its step; a check
+/// never says "downloading"; an installer failure never gets a network line.
+pub fn wording(kind: FailureKind, stage: Stage) -> Wording {
+    let network = |summary, hint| Wording { summary, hint, nothing_installed: true };
+    let checking = matches!(stage, Stage::Check | Stage::InstallCheck);
     match stage {
-        Stage::Install => "The update couldn't be installed.",
+        Stage::Install => Wording {
+            summary: "The update downloaded but couldn't be installed.",
+            hint: "Try again, or download the latest version from rillio.app.",
+            nothing_installed: false,
+        },
         Stage::Check | Stage::InstallCheck | Stage::Download => match kind {
-            FailureKind::Reset => "The connection to GitHub was interrupted.",
-            FailureKind::Dns => "Couldn't find GitHub. Check your internet connection.",
-            FailureKind::Refused => "GitHub refused the connection.",
-            FailureKind::Tls => "A secure connection to GitHub couldn't be made.",
-            FailureKind::Timeout if stage == Stage::Download => "The download timed out.",
-            FailureKind::Timeout => "The update check timed out.",
-            FailureKind::Other if stage == Stage::Download => "The download didn't finish.",
-            FailureKind::Other => "The update check didn't finish.",
+            FailureKind::Reset if checking => network(
+                "The connection dropped while checking for the update.",
+                "Check your internet connection or VPN, then try again.",
+            ),
+            FailureKind::Reset => network(
+                "The connection dropped while downloading the update.",
+                "Check your internet connection or VPN, then try again.",
+            ),
+            FailureKind::Dns => network(
+                "Rillio couldn't reach the update server.",
+                "Make sure you're online, then try again.",
+            ),
+            FailureKind::Refused => network(
+                "The update server refused the connection.",
+                "A firewall or VPN may be blocking it. Try again, or turn the VPN off for a moment.",
+            ),
+            FailureKind::Timeout => network(
+                "The update server took too long to answer.",
+                "Your connection may be slow. Try again in a moment.",
+            ),
+            FailureKind::Tls => network(
+                "Rillio couldn't make a secure connection to the update server.",
+                "Check your internet connection. Antivirus or VPN software that inspects traffic can cause this.",
+            ),
+            FailureKind::Other if checking => network(
+                "The update check didn't finish.",
+                "Try again. If it keeps failing, copy the error and send it to us.",
+            ),
+            FailureKind::Other => network(
+                "The download didn't finish.",
+                "Try again. If it keeps failing, copy the error and send it to us.",
+            ),
         },
     }
 }
 
 /// One update failure as both the update window and the web layer get it:
-/// the plain sentence, the kind behind it, and the full chain for "Details".
+/// what happened and what to check (from [`wording`]), the kind behind it,
+/// the full chain, and the text "Copy error" puts on the clipboard.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct UpdateFailure {
     pub stage: Stage,
     pub kind: FailureKind,
+    /// What happened, plus [`NOTHING_INSTALLED`] where that is true.
     pub summary: String,
+    /// What to check.
+    pub hint: String,
     /// The full cause chain (see [`error_chain`]).
     pub message: String,
+    /// Everything "Copy error" copies: app version, time, step, kind, chain.
+    pub report: String,
 }
 
 impl UpdateFailure {
-    pub fn from_error(stage: Stage, err: &(dyn std::error::Error + 'static)) -> Self {
-        let kind = classify(err);
-        UpdateFailure { stage, kind, summary: summary(kind, stage).into(), message: error_chain(err) }
+    pub fn from_error(stage: Stage, err: &(dyn std::error::Error + 'static), version: &str) -> Self {
+        Self::classified(stage, classify(err), error_chain(err), version)
     }
 
-    /// A failure that is not an error value (nothing to install, no updater
-    /// on this platform, an installer that never finished).
-    pub fn plain(stage: Stage, summary: &str, message: impl Into<String>) -> Self {
-        UpdateFailure { stage, kind: FailureKind::Other, summary: summary.into(), message: message.into() }
+    /// A failure the table words (the kind is known, the message is ours).
+    pub fn classified(stage: Stage, kind: FailureKind, message: impl Into<String>, version: &str) -> Self {
+        let w = wording(kind, stage);
+        let summary = if w.nothing_installed {
+            format!("{} {NOTHING_INSTALLED}", w.summary)
+        } else {
+            w.summary.to_string()
+        };
+        Self::build(stage, kind, summary, w.hint.into(), message.into(), version)
     }
+
+    /// A failure outside the table (nothing to install, no updater on this
+    /// platform, Rillio not answering a retry).
+    pub fn plain(stage: Stage, summary: &str, hint: &str, message: impl Into<String>, version: &str) -> Self {
+        Self::build(stage, FailureKind::Other, summary.into(), hint.into(), message.into(), version)
+    }
+
+    fn build(stage: Stage, kind: FailureKind, summary: String, hint: String, message: String, version: &str) -> Self {
+        let report = report(version, now_ms(), stage, kind, &message);
+        UpdateFailure { stage, kind, summary, hint, message, report }
+    }
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The "Copy error" text: everything we need from a pasted report, nothing
+/// the user has to explain.
+pub fn report(version: &str, at_ms: u64, stage: Stage, kind: FailureKind, message: &str) -> String {
+    let kind = serde_json::to_value(kind).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+    format!(
+        "Rillio {version} update error\nTime: {}\nStep: {}\nKind: {kind}\nError: {message}",
+        utc_timestamp(at_ms),
+        stage.label()
+    )
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` from epoch milliseconds (civil-from-days, so no
+/// date crate for one line of text).
+pub fn utc_timestamp(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -284,7 +390,7 @@ mod tests {
         assert_eq!(error_chain(&err), "tls handshake eof: connection reset by peer");
     }
 
-    use super::{classify, summary, FailureKind, Stage, UpdateFailure};
+    use super::{classify, report, utc_timestamp, wording, FailureKind, Stage, UpdateFailure};
 
     fn wrapped(cause: impl std::error::Error + Send + Sync + 'static) -> Wrapper {
         Wrapper { what: "error sending request for url (https://example.test/x.exe)", cause: Box::new(cause) }
@@ -332,7 +438,7 @@ mod tests {
         let early = Wrapper { what: "connection closed before message completed", cause: Box::new(std::fmt::Error) };
         assert_eq!(classify(&wrapped(early)), FailureKind::Other);
         assert_eq!(classify(&std::io::Error::other("disk full")), FailureKind::Other);
-        assert_eq!(summary(FailureKind::Other, Stage::Download), "The download didn't finish.");
+        assert_eq!(wording(FailureKind::Other, Stage::Download).summary, "The download didn't finish.");
     }
 
     #[test]
@@ -341,30 +447,55 @@ mod tests {
         assert_eq!(classify(&wrapped(outer_timeout)), FailureKind::Reset);
     }
 
+    fn says(kind: FailureKind, stage: Stage) -> (&'static str, &'static str, bool) {
+        let w = wording(kind, stage);
+        (w.summary, w.hint, w.nothing_installed)
+    }
+
     #[test]
-    fn summaries_are_the_agreed_sentences() {
+    fn the_agreed_sentences() {
         let d = Stage::Download;
-        assert_eq!(summary(FailureKind::Reset, d), "The connection to GitHub was interrupted.");
-        assert_eq!(summary(FailureKind::Dns, d), "Couldn't find GitHub. Check your internet connection.");
-        assert_eq!(summary(FailureKind::Refused, d), "GitHub refused the connection.");
-        assert_eq!(summary(FailureKind::Timeout, d), "The download timed out.");
-        assert_eq!(summary(FailureKind::Tls, d), "A secure connection to GitHub couldn't be made.");
-        assert_eq!(summary(FailureKind::Other, d), "The download didn't finish.");
-        // A check never downloaded anything, so it never says "download".
-        assert_eq!(summary(FailureKind::Timeout, Stage::Check), "The update check timed out.");
-        assert_eq!(summary(FailureKind::Other, Stage::InstallCheck), "The update check didn't finish.");
-        // The installer is not the network: no network sentence, whatever the kind.
-        assert_eq!(summary(FailureKind::Reset, Stage::Install), "The update couldn't be installed.");
+        assert_eq!(says(FailureKind::Reset, d), ("The connection dropped while downloading the update.", "Check your internet connection or VPN, then try again.", true));
+        assert_eq!(says(FailureKind::Dns, d), ("Rillio couldn't reach the update server.", "Make sure you're online, then try again.", true));
+        assert_eq!(says(FailureKind::Refused, d), ("The update server refused the connection.", "A firewall or VPN may be blocking it. Try again, or turn the VPN off for a moment.", true));
+        assert_eq!(says(FailureKind::Timeout, d), ("The update server took too long to answer.", "Your connection may be slow. Try again in a moment.", true));
+        assert_eq!(says(FailureKind::Tls, d), ("Rillio couldn't make a secure connection to the update server.", "Check your internet connection. Antivirus or VPN software that inspects traffic can cause this.", true));
+        assert_eq!(says(FailureKind::Other, d), ("The download didn't finish.", "Try again. If it keeps failing, copy the error and send it to us.", true));
+        // A check never downloaded anything, so it never says "downloading".
+        assert_eq!(says(FailureKind::Reset, Stage::Check).0, "The connection dropped while checking for the update.");
+        assert_eq!(says(FailureKind::Other, Stage::InstallCheck).0, "The update check didn't finish.");
+        assert_eq!(says(FailureKind::Dns, Stage::Check).0, "Rillio couldn't reach the update server.");
+        // The installer is not the network: its own lines whatever the kind,
+        // and no "nothing was installed" (the installer may have started).
+        for kind in [FailureKind::Reset, FailureKind::Other, FailureKind::Tls] {
+            assert_eq!(says(kind, Stage::Install), ("The update downloaded but couldn't be installed.", "Try again, or download the latest version from rillio.app.", false));
+        }
     }
 
     #[test]
     fn the_failure_serializes_for_the_page_and_the_web() {
-        let failure = UpdateFailure::from_error(Stage::InstallCheck, &os(10054));
+        let failure = UpdateFailure::from_error(Stage::Download, &os(10054), "0.1.45");
         let json = serde_json::to_value(&failure).unwrap();
-        assert_eq!(json["stage"], "install-check");
+        assert_eq!(json["stage"], "download");
         assert_eq!(json["kind"], "reset");
-        assert_eq!(json["summary"], "The connection to GitHub was interrupted.");
+        assert_eq!(json["summary"], "The connection dropped while downloading the update. Nothing was installed.");
+        assert_eq!(json["hint"], "Check your internet connection or VPN, then try again.");
         assert!(json["message"].as_str().unwrap().starts_with("error sending request for url (https://example.test/x.exe): "));
+        let report = json["report"].as_str().unwrap();
+        assert!(report.starts_with("Rillio 0.1.45 update error\nTime: 20"), "{report}");
+        assert!(report.contains("\nStep: download\nKind: reset\nError: error sending request for url"), "{report}");
+        assert!(report.ends_with("(os error 10054)"), "{report}");
+        // An install failure does not claim nothing changed.
+        let install = UpdateFailure::classified(Stage::Install, FailureKind::Other, "x", "0.1.45");
+        assert_eq!(install.summary, "The update downloaded but couldn't be installed.");
+    }
+
+    #[test]
+    fn utc_timestamps() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(951_782_400_000), "2000-02-29T00:00:00Z");
+        assert_eq!(utc_timestamp(1_790_674_937_521), "2026-09-29T09:42:17Z");
+        assert_eq!(report("0.1.45", 0, Stage::Install, FailureKind::Tls, "boom"), "Rillio 0.1.45 update error\nTime: 1970-01-01T00:00:00Z\nStep: install\nKind: tls\nError: boom");
     }
 
     /// Real network failures through reqwest, wrapped the way the updater

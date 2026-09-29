@@ -377,7 +377,12 @@ pub fn run() {
                                 canonical.display()
                             ),
                         );
-                        let _ = std::process::Command::new(&canonical).spawn();
+                        // Args ride along: a launch that carries a request
+                        // (an update window's --retry-update, a deep link)
+                        // must not lose it to the handover.
+                        let _ = std::process::Command::new(&canonical)
+                            .args(std::env::args_os().skip(1))
+                            .spawn();
                         std::process::exit(0);
                     }
                 }
@@ -396,9 +401,22 @@ pub fn run() {
     }
     // Normal launch: remove any update progress file. During an update this is
     // the "new version is up" signal the update window waits for; any other
-    // leftover is stale.
+    // leftover is stale. Two exceptions, both for an update window that is
+    // still waiting on its user: an "error" frame stays (a failed install
+    // restarts this app right after writing it, and deleting it could reach
+    // the window before the failure did, reading as success), and a launch
+    // carrying a retry request leaves the file to the flow it starts.
     #[cfg(desktop)]
-    let _ = std::fs::remove_file(update_window::progress_path());
+    if update_window::retry_arg(std::env::args()).is_none() {
+        let path = update_window::progress_path();
+        let failed = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<update_window::UpdateProgress>(&raw).ok())
+            .is_some_and(|frame| frame.phase == "error");
+        if !failed {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     // ...and the staged updater copy that ran the splash (see update_window).
     #[cfg(desktop)]
     update_window::cleanup_updater_copy();
@@ -421,7 +439,13 @@ pub fn run() {
         // On a second launch, focus the running window instead of starting a
         // second shell that would fail to bind :11470 and clobber the WebView2
         // profile the first one is using.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // An update window's "Try again" (see update_window): run the
+            // install flow again; the flow decides what the main window does.
+            if let Some(attempt) = update_window::retry_arg(&args) {
+                request_update_retry(app.clone(), attempt);
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -436,6 +460,7 @@ pub fn run() {
     builder
         .manage(MpvState::default())
         .manage(UpdateInFlight::default())
+        .manage(update_window::UpdateRun::default())
         .manage(shell::ShellState::default())
         .manage(thumbs::ThumbsState::default())
         .manage(transcribe::TranscribeState::default())
@@ -516,6 +541,12 @@ pub fn run() {
                 build_mobile_window(app)?;
             }
             spawn_update_check(app.handle().clone());
+            // Launched by an update window's "Try again" while Rillio was not
+            // running: this process is the one to run the flow again.
+            #[cfg(desktop)]
+            if let Some(attempt) = update_window::retry_arg(std::env::args()) {
+                request_update_retry(app.handle().clone(), attempt);
+            }
             setup_deep_links(app);
             Ok(())
         })
@@ -924,9 +955,10 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, error
     }
 }
 
-/// Record an update failure in full and return what to show for it: a plain
-/// sentence for its kind, and the chain for "Details" (error_chain::
-/// UpdateFailure, the one shape both the update window and the web get).
+/// Record an update failure in full and return what to show for it: what
+/// happened and what to check for its kind, and the report "Copy error"
+/// copies (error_chain::UpdateFailure, the one shape both the update window
+/// and the web get).
 ///
 /// The log carries the whole cause chain (see error_chain): the top-level Display
 /// of the updater's reqwest error is just "error sending request for url
@@ -942,7 +974,7 @@ fn update_failure(
     stage: error_chain::Stage,
     err: &(dyn std::error::Error + 'static),
 ) -> error_chain::UpdateFailure {
-    let failure = error_chain::UpdateFailure::from_error(stage, err);
+    let failure = error_chain::UpdateFailure::from_error(stage, err, &app.package_info().version.to_string());
     let (label, chain) = (stage.label(), &failure.message);
     tracing::error!("update: {label} failed ({:?}): {chain}", failure.kind);
     boot_journal_append(
@@ -952,9 +984,87 @@ fn update_failure(
     failure
 }
 
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::UpdateFailure> {
+    // Stays in the invoke_handler list on every target (the generate_handler
+    // macro can't cfg an entry), but the body is desktop-only: Android takes
+    // updates from the app store, so the web toast is never wired there.
+    #[cfg(not(desktop))]
+    {
+        return Err(error_chain::UpdateFailure::plain(
+            error_chain::Stage::Install,
+            "In-app updates aren't available on this device.",
+            "Updates come from the app store here.",
+            "in-app updates are unavailable on this platform",
+            &app.package_info().version.to_string(),
+        ));
+    }
+    #[cfg(desktop)]
+    {
+        let attempt = error_chain::now_ms();
+        if !app.state::<update_window::UpdateRun>().begin(attempt) {
+            return Err(error_chain::UpdateFailure::plain(
+                error_chain::Stage::InstallCheck,
+                "The update is already running.",
+                "Its window shows how far it got.",
+                "install_update called while an install flow was running",
+                &app.package_info().version.to_string(),
+            ));
+        }
+        run_install(app, true).await
+    }
+}
+
+/// A window's "Try again" reached this process (see update_window's module
+/// docs): as the single-instance handoff of `--retry-update <attempt>`, or as
+/// this process's own launch args. Runs the install flow again WITHOUT a new
+/// window (the asking window follows the attempt), or, if one is already
+/// running, re-labels it so the window hears back at once.
+#[cfg(desktop)]
+fn request_update_retry(app: tauri::AppHandle, attempt: u64) {
+    use update_window::RetryDecision;
+    let decision = app
+        .state::<update_window::UpdateRun>()
+        .request(attempt, update_window::write_progress);
+    boot_journal_append(
+        &app.config().identifier,
+        &format!("update-retry-request attempt={attempt} decision={decision:?}"),
+    );
+    if decision == RetryDecision::Start {
+        tauri::async_runtime::spawn(async move {
+            // The failure is already on the window and in the journal.
+            let _ = run_install(app, false).await;
+        });
+    }
+}
+
+/// Write one frame of the current attempt to the update window's progress
+/// file.
+#[cfg(desktop)]
+fn update_frame(app: &tauri::AppHandle, frame: update_window::UpdateProgress) {
+    app.state::<update_window::UpdateRun>()
+        .frame(frame, update_window::write_progress);
+}
+
+/// The install flow a failure ends: record it, show it in the update window,
+/// give the user the main window back, and free the flow for a retry.
+#[cfg(desktop)]
+fn fail_install(app: &tauri::AppHandle, failure: error_chain::UpdateFailure) -> error_chain::UpdateFailure {
+    update_frame(app, update_window::UpdateProgress::failed(failure.clone()));
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    app.state::<update_window::UpdateRun>().end();
+    failure
+}
+
 /// Download, verify (minisign) and install the pending update, then relaunch.
-/// Invoked from the web UI's update toast and from Settings. Re-checks so it
-/// never installs a stale handle.
+/// Started from the web UI's update toast and Settings (`install_update`,
+/// which also spawns the update window) and from a window's "Try again"
+/// (`request_update_retry`, whose window already exists). Re-checks so it
+/// never installs a stale handle. The caller has claimed the flow
+/// (UpdateRun::begin / request); every exit before the handoff releases it.
 ///
 /// INCIDENT (2026-07-13, the 0.1.16 -> 0.1.17 auto-update WIPED a user's
 /// profile/library/settings): tauri-plugin-updater's install step launches the
@@ -972,52 +1082,48 @@ fn update_failure(
 /// shutdown -> storage service flushes and exits) and WAIT until the browser
 /// releases the Local Storage lock, and only then hand off to the installer.
 /// The webview must never be alive when the process exits for an update.
-#[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::UpdateFailure> {
-    // Stays in the invoke_handler list on every target (the generate_handler
-    // macro can't cfg an entry), but the body is desktop-only: Android takes
-    // updates from the app store, so the web toast is never wired there.
-    #[cfg(not(desktop))]
-    {
-        let _ = app;
-        return Err(error_chain::UpdateFailure::plain(
-            error_chain::Stage::Install,
-            "In-app updates aren't available on this device.",
-            "in-app updates are unavailable on this platform",
-        ));
-    }
-    #[cfg(desktop)]
-    {
+#[cfg(desktop)]
+async fn run_install(app: tauri::AppHandle, spawn_window: bool) -> Result<(), error_chain::UpdateFailure> {
     use error_chain::Stage;
     use tauri_plugin_updater::UpdaterExt;
+    use update_window::UpdateProgress;
 
-    let update = app
-        .updater()
-        .map_err(|e| update_failure(&app, Stage::InstallCheck, &e))?
-        .check()
-        .await
-        .map_err(|e| update_failure(&app, Stage::InstallCheck, &e))?
-        .ok_or_else(|| {
-            error_chain::UpdateFailure::plain(
+    let version = app.package_info().version.to_string();
+    // A retry's window is waiting for its attempt: answer before the network
+    // check, so the answer does not wait on the network.
+    if !spawn_window {
+        update_frame(&app, UpdateProgress::phase("checking"));
+    }
+    let checked = match app.updater() {
+        Ok(updater) => updater.check().await.map_err(|e| update_failure(&app, Stage::InstallCheck, &e)),
+        Err(e) => Err(update_failure(&app, Stage::InstallCheck, &e)),
+    };
+    let update = match checked {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            let failure = error_chain::UpdateFailure::plain(
                 Stage::InstallCheck,
                 "There's no update to install.",
+                "Rillio is already up to date.",
                 "no update available",
-            )
-        })?;
+                &version,
+            );
+            return Err(fail_install(&app, failure));
+        }
+        Err(failure) => return Err(fail_install(&app, failure)),
+    };
 
     // The custom update window (docs/update-window): a detached process that
     // shows the liquid progress page through download AND install (this process
     // exits at install handoff, so an in-process window could not). The main
     // window hides immediately - the small window IS the update experience.
     // Presentation only: if the splash fails to spawn, the update still
-    // proceeds (headless) and ends in the relaunch either way.
-    update_window::write_progress(&update_window::UpdateProgress {
-        phase: "downloading".into(),
-        downloaded: 0,
-        total: 0,
-        failure: None,
-    });
-    update_window::spawn_update_window();
+    // proceeds (headless) and ends in the relaunch either way. A retry's
+    // window already exists.
+    update_frame(&app, UpdateProgress::phase("downloading"));
+    if spawn_window {
+        update_window::spawn_update_window();
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -1028,18 +1134,17 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::Update
     // `content_len` is the total size when known.
     let mut downloaded: u64 = 0;
     let mut last_file_write = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let progress_app = app.clone();
     let download_result = update
         .download(
             move |chunk_len, content_len| {
                 downloaded += chunk_len as u64;
                 if last_file_write.elapsed() >= std::time::Duration::from_millis(100) {
                     last_file_write = std::time::Instant::now();
-                    update_window::write_progress(&update_window::UpdateProgress {
-                        phase: "downloading".into(),
-                        downloaded,
-                        total: content_len.unwrap_or(0),
-                        failure: None,
-                    });
+                    update_frame(
+                        &progress_app,
+                        UpdateProgress { downloaded, total: content_len.unwrap_or(0), ..UpdateProgress::phase("downloading") },
+                    );
                 }
             },
             || {},
@@ -1047,30 +1152,12 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::Update
         .await;
     let bytes = match download_result {
         Ok(bytes) => bytes,
-        Err(e) => {
-            // Failed download: tell the update window (it shows the error and
-            // exits), bring the main window back, and surface the error to the
-            // web UI's toast as before.
-            let failure = update_failure(&app, Stage::Download, &e);
-            update_window::write_progress(&update_window::UpdateProgress {
-                phase: "error".into(),
-                downloaded: 0,
-                total: 0,
-                failure: Some(failure.clone()),
-            });
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-            return Err(failure);
-        }
+        // Failed download: the update window shows it and waits for the user
+        // (Try again / Close), the main window comes back, and the web UI's
+        // toast or Settings gets the same failure.
+        Err(e) => return Err(fail_install(&app, update_failure(&app, Stage::Download, &e))),
     };
-    update_window::write_progress(&update_window::UpdateProgress {
-        phase: "installing".into(),
-        downloaded: 0,
-        total: 0,
-        failure: None,
-    });
+    update_frame(&app, UpdateProgress::phase("installing"));
 
     // From here on the webview goes away, so this command's JS response will
     // never be delivered - that's fine, the next thing the user sees is the
@@ -1097,7 +1184,6 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::Update
 
     // Safety snapshot of the profile's user data (Local Storage + IndexedDB)
     // before the installer touches anything - see snapshot_profile_storage.
-    let version = app.package_info().version.to_string();
     match snapshot_profile_storage(&app.config().identifier, &version) {
         Ok(dest) => tracing::info!("update: storage snapshot at {}", dest.display()),
         Err(e) => tracing::error!("update: STORAGE SNAPSHOT FAILED ({e}); proceeding with the update without one"),
@@ -1115,21 +1201,16 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::Update
     // update window is the only thing on screen through the install.
     if let Err(e) = update.install(bytes) {
         // The webview is already gone: without a relaunch this process would be
-        // a headless zombie. Tell the update window, then restart the (still
-        // old) app; the update toast will re-offer the update on next launch
-        // (whose boot also deletes the progress file).
+        // a headless zombie. Tell the update window (it keeps the failure up
+        // and offers Try again, which reaches the relaunched app), then
+        // restart the (still old) app. Its boot leaves an "error" frame in
+        // place, so the window cannot mistake the restart for success.
         let failure = update_failure(&app, Stage::Install, &e);
         tracing::error!("update: relaunching the current version after the failed install");
-        update_window::write_progress(&update_window::UpdateProgress {
-            phase: "error".into(),
-            downloaded: 0,
-            total: 0,
-            failure: Some(failure),
-        });
+        update_frame(&app, UpdateProgress::failed(failure));
         app.restart();
     }
     Ok(())
-    }
 }
 
 /// Wait (up to 10s) for the WebView2 browser process to shut down and release
