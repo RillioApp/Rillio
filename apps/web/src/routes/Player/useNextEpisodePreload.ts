@@ -107,8 +107,26 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
         }
     };
 
+    // The episode actually on screen, and whether this player is still there,
+    // for the offer's staleness key (see accept). Written in LAYOUT effects,
+    // which run synchronously inside the commit that changes the episode or
+    // unmounts the player, so no toast timer or event can observe the old
+    // value after that commit. (The passive effects below come after paint.)
+    const liveVideoId = React.useRef<string | null>(currentVideoId);
+    const mounted = React.useRef(false);
+    React.useLayoutEffect(() => {
+        liveVideoId.current = currentVideoId;
+    }, [currentVideoId]);
+    React.useLayoutEffect(() => {
+        mounted.current = true;
+        return () => {
+            mounted.current = false;
+        };
+    }, []);
+
     // An offer still waiting behind its toast when the episode changes or the
-    // player unmounts is DROPPED, not carried over: it was for the episode
+    // player unmounts is DROPPED, not carried over (the key checked in accept
+    // is what guarantees it never starts; this also takes its toast down): it was for the episode
     // after the one playing then, which is no longer "next" (and after an
     // auto-next it is the one now playing, which the player fetches anyway).
     // Dropped before its toast is removed, because that removal fires the
@@ -219,8 +237,12 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
         }
         setAnswered(true);
         setAccepted(true);
+        // Keyed to the episode playing now: its close starts the download only
+        // while that is still the episode on screen and the player is mounted.
+        const forVideoId = currentVideoId;
         offerRef.current = offerPreload({
             stream: nextStream,
+            isCurrent: () => mounted.current && liveVideoId.current === forVideoId,
             // useCacheDownload POSTs { infoHash, fileIdx } to /cache/download and
             // pins the torrent; it owns the started/failed toasts.
             start: (stream: Stream) => {
@@ -246,7 +268,7 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
                 toast.show({ type: 'success', title: 'Preload cancelled', timeout: 3000 });
             },
         });
-    }, [nextStream, downloadToCache, toast]);
+    }, [nextStream, currentVideoId, downloadToCache, toast]);
 
     // Cancel from the prompt: just hide whatever slot is currently showing,
     // nothing persisted. Closing the start window early never blocks the

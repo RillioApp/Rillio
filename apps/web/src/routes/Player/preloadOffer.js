@@ -19,7 +19,13 @@
 // download. showOffer({ onCancel, onClose }) shows the toast and returns its
 // id, or null when nothing was shown (a toast filter suppressed it).
 // onCancelled(): the toast's Cancel cancelled a waiting offer (optional).
-const offerPreload = ({ stream, start, showOffer, onCancelled }) => {
+// isCurrent(): whether the offer is still for the episode after the one
+// playing NOW (optional; the hook keys it to the episode it was made for).
+// Checked at the moment the close would start the download, so a close that
+// lands after the episode changed but before anyone called drop() (a passive
+// effect cleanup runs after paint; a toast timer can fire first) starts
+// nothing: staleness is decided by the key, not by who runs first.
+const offerPreload = ({ stream, start, showOffer, onCancelled, isCurrent }) => {
     let state = 'waiting';
     const offer = {
         get state() {
@@ -41,6 +47,10 @@ const offerPreload = ({ stream, start, showOffer, onCancelled }) => {
     };
     const closed = () => {
         if (state !== 'waiting') return;
+        if (typeof isCurrent === 'function' && !isCurrent()) {
+            state = 'dropped';
+            return;
+        }
         state = 'started';
         start(stream);
     };
