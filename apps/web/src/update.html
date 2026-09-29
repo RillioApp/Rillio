@@ -44,6 +44,18 @@
            (https://...): ...: connection reset (os error 10054)"): the URL is
            one unbreakable token wider than the window, so let it break. */
         #status.error { color: #ff6b6b; overflow-wrap: anywhere; line-height: 1.45; }
+        /* The window is a fixed 360x420 and clips, and the real cause sits at
+           the END of the chain: bound the error to 6 lines (6 x 18.1px) and let it scroll; that
+           keeps it clear of the note at the bottom.
+           It is also the one selectable, clickable thing on the page, so the
+           error can be copied and pasted into a bug report. It sits above the
+           drag region (later in the DOM), so dragging still works elsewhere. */
+        #status.error {
+            max-height: 109px; overflow-y: auto; overscroll-behavior: contain;
+            pointer-events: auto; cursor: text; user-select: text; -webkit-user-select: text;
+            scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+        }
+        #status.error::selection { background: rgba(255, 160, 51, 0.35); color: #fff; }
         #note { position: absolute; bottom: 18px; left: 0; right: 0; text-align: center; font-size: 11.5px; color: rgba(255, 255, 255, 0.32); }
         #drag { position: fixed; inset: 0; }
         .fg, #note { pointer-events: none; }
@@ -209,6 +221,7 @@
                 titleEl.textContent = 'Update failed';
                 statusEl.textContent = s.message || 'Something went wrong. Rillio will keep the current version.';
                 statusEl.className = 'error';
+                statusEl.scrollTop = 0;
                 fillEl.className = ''; fillEl.style.width = '0%';
                 return;
             }
@@ -254,7 +267,15 @@
         });
 
         // ---- #demo: self-driven simulated run (design preview + verification) ----
-        // #demo-error shows the failed state with a real-shaped cause chain.
+        // #demo-error shows the failed state with a real-shaped cause chain;
+        // #demo-error-long a synthetic ~1500-character one, to check that the
+        // bounded, scrolling error area reaches the cause at its end.
+        if (location.hash === '#demo-error-long') {
+            var layers = ['error sending request for url (https://github.com/RillioApp/Rillio/releases/download/v0.1.45/Rillio_0.1.45_x64-setup.exe)', 'client error (Connect)'];
+            for (var n = 1; layers.join(': ').length < 1400; n++) layers.push('proxy hop ' + n + ': the tunnel returned an error while negotiating the upstream connection');
+            layers.push('END OF CHAIN: An existing connection was forcibly closed by the remote host. (os error 10054)');
+            window.__updateState({ phase: 'error', message: layers.join(': ') });
+        }
         if (location.hash === '#demo-error') {
             window.__updateState({ phase: 'error', message: 'error sending request for url (https://github.com/RillioApp/Rillio/releases/download/v0.1.45/Rillio_0.1.45_x64-setup.exe): client error (SendRequest): connection error: An existing connection was forcibly closed by the remote host. (os error 10054)' });
         }

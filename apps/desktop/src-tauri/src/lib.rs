@@ -861,7 +861,15 @@ fn spawn_update_check(app: tauri::AppHandle) {
             Ok(updater) => updater,
             // A missing/invalid pubkey surfaces here as Err, not a panic.
             Err(e) => {
-                tracing::debug!("updater unavailable: {}", error_chain::error_chain(&e));
+                // A missing/invalid pubkey or updater config: no update will
+                // ever be offered, so it must not vanish into a debug line
+                // that a release build does not keep.
+                let chain = error_chain::error_chain(&e);
+                tracing::warn!("update: updater unavailable at launch: {chain}");
+                boot_journal_append(
+                    &app.config().identifier,
+                    &format!("update-failed stage=launch-init error={chain:?}"),
+                );
                 return;
             }
         };
