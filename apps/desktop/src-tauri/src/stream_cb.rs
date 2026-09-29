@@ -1182,8 +1182,20 @@ mod tests {
 
         let sources = EngineSources::new(engine.clone(), rt.handle().clone());
         let source = sources.open(&info_hash, 1).expect("open episode 2 through the bridge");
-        let selected = engine.get(&info_hash).expect("managed").only_files();
-        assert_eq!(selected, Some(vec![0, 1]), "the played file joins, nothing else does");
+        // librqbit keeps the selection as a HashSet and `only_files()` lists it
+        // in hash order (librqbit 8.1.1 `ManagedTorrent::update_only_files`
+        // collects the set into the Vec), so `[1, 0]` is as right as `[0, 1]`:
+        // compare the SET.
+        let selected: Option<std::collections::BTreeSet<usize>> = engine
+            .get(&info_hash)
+            .expect("managed")
+            .only_files()
+            .map(|only| only.into_iter().collect());
+        assert_eq!(
+            selected,
+            Some([0, 1].into()),
+            "the played file joins, nothing else does"
+        );
 
         drop(source);
         drop(rt);
