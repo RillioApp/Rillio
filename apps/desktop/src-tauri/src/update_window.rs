@@ -31,7 +31,7 @@
 //! screen instead of a spinner. The pure state machine is [`WindowMachine`].
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,9 @@ pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// No new frame for this long while downloading means the update stalled.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// A window that has read no valid frame this long after opening says so.
+pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The attempt id in a launch's args (`--retry-update <attempt>`).
 pub fn retry_arg<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> Option<u64> {
     let mut args = args.into_iter();
@@ -108,60 +111,148 @@ pub enum RetryDecision {
 
 /// The main process's side of the protocol: one install flow at a time, its
 /// attempt id, and the frame writer (every frame carries the attempt).
+///
+/// ONE lock over all of it (Codex round 4, finding 3): stamping a frame with
+/// the attempt and writing it to the file is a single step, and so is
+/// re-labelling the flow and rewriting its latest frame. With the attempt in
+/// an atomic and the write outside the lock, a frame stamped with the old
+/// attempt could reach the file after the adopted attempt's rewrite; the
+/// window, following the new attempt, dropped it (a lost "installing" read as
+/// a vanished download). The writes are one small file each, so holding the
+/// lock across them costs nothing that matters.
 #[derive(Default)]
 pub struct UpdateRun {
-    busy: AtomicBool,
-    attempt: AtomicU64,
-    last: Mutex<Option<UpdateProgress>>,
+    state: Mutex<RunState>,
+}
+
+#[derive(Default)]
+struct RunState {
+    busy: bool,
+    /// The attempt the running flow reports under.
+    attempt: u64,
+    /// The newest attempt this process has taken on (started or adopted),
+    /// or found already handled on disk ([`UpdateRun::seed_handled`]). A
+    /// request for it or anything older is a repeat, never a new run
+    /// (Codex round 4, findings 2 and 6).
+    latest: u64,
+    last: Option<UpdateProgress>,
 }
 
 impl UpdateRun {
     /// The flow is starting from the web UI (toast, Settings). False when one
     /// is already running: the caller reports that instead of starting two.
     pub fn begin(&self, attempt: u64) -> bool {
-        if self.busy.swap(true, Ordering::SeqCst) {
+        let mut s = self.state.lock().unwrap();
+        if s.busy {
             return false;
         }
-        self.attempt.store(attempt, Ordering::SeqCst);
-        *self.last.lock().unwrap() = None;
+        s.busy = true;
+        s.attempt = attempt;
+        s.latest = s.latest.max(attempt);
+        s.last = None;
         true
     }
 
     /// A window asked for a retry. `write` is where frames go (the progress
     /// file in production, a recorder in tests).
     pub fn request(&self, attempt: u64, write: impl FnOnce(&UpdateProgress)) -> RetryDecision {
-        if !self.busy.swap(true, Ordering::SeqCst) {
-            self.attempt.store(attempt, Ordering::SeqCst);
-            *self.last.lock().unwrap() = None;
-            return RetryDecision::Start;
-        }
-        if self.attempt.swap(attempt, Ordering::SeqCst) == attempt {
+        let mut s = self.state.lock().unwrap();
+        // Already handled: the same attempt delivered twice (running, or
+        // finished and failed), an older one arriving late, or one that
+        // failed before this process restarted.
+        if attempt <= s.latest {
             return RetryDecision::Duplicate;
         }
-        let mut last = self.last.lock().unwrap();
-        if let Some(frame) = last.as_mut() {
+        s.latest = attempt;
+        s.attempt = attempt;
+        if !s.busy {
+            s.busy = true;
+            s.last = None;
+            return RetryDecision::Start;
+        }
+        if let Some(frame) = s.last.as_mut() {
             frame.attempt = attempt;
             write(frame);
         }
         RetryDecision::Adopt
     }
 
-    /// Stamp a frame with the current attempt, remember it (for adoption) and
-    /// hand it to `write`.
+    /// Stamp a frame with the current attempt, write it, and remember it (for
+    /// adoption), all under the lock.
     pub fn frame(&self, mut frame: UpdateProgress, write: impl FnOnce(&UpdateProgress)) {
-        frame.attempt = self.attempt.load(Ordering::SeqCst);
+        let mut s = self.state.lock().unwrap();
+        frame.attempt = s.attempt;
         write(&frame);
-        *self.last.lock().unwrap() = Some(frame);
+        s.last = Some(frame);
     }
 
-    /// The flow failed and returned: the next request starts a new one.
+    /// The flow failed and returned: the next NEW request starts a new one.
     pub fn end(&self) {
-        self.busy.store(false, Ordering::SeqCst);
+        self.state.lock().unwrap().busy = false;
+    }
+
+    /// An attempt this process must treat as already handled: at a cold
+    /// launch with a retry request, the attempt of the frame already in the
+    /// progress file. A restart after a failed install re-runs with its old
+    /// launch args, and the failure it wrote says that attempt is done.
+    pub fn seed_handled(&self, attempt: u64) {
+        let mut s = self.state.lock().unwrap();
+        s.latest = s.latest.max(attempt);
     }
 
     #[cfg(test)]
     pub fn attempt(&self) -> u64 {
-        self.attempt.load(Ordering::SeqCst)
+        self.state.lock().unwrap().attempt
+    }
+}
+
+/// The attempt of the frame in the progress file, if there is a readable one.
+pub fn attempt_on_disk() -> Option<u64> {
+    std::fs::read_to_string(progress_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<UpdateProgress>(&raw).ok())
+        .map(|frame| frame.attempt)
+}
+
+/// Launch args minus a retry request (`--retry-update <attempt>`), for a
+/// restart: a restart that kept the request would run the failed install
+/// again with no user action, in a loop (Codex round 4, finding 2).
+pub fn without_retry_arg<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == RETRY_ARG {
+            args.next();
+            continue;
+        }
+        out.push(arg);
+    }
+    out
+}
+
+/// Run `work` unless it stops making progress: `progress` holds the epoch ms
+/// of the last sign of life (the download bumps it per chunk). `None` means
+/// nothing moved for `limit` and `work` was dropped, which cancels it (Codex
+/// round 4, finding 4: a stalled download used to hold the flow forever, so
+/// every "Try again" adopted the same dead run).
+pub async fn unless_stalled<F: std::future::Future>(
+    work: F,
+    progress: &AtomicU64,
+    limit: Duration,
+) -> Option<F::Output> {
+    let watch = async {
+        let step = (limit / 4).max(Duration::from_millis(10));
+        loop {
+            tokio::time::sleep(step).await;
+            let last = progress.load(Ordering::SeqCst);
+            if crate::error_chain::now_ms().saturating_sub(last) >= limit.as_millis() as u64 {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        out = work => Some(out),
+        _ = watch => None,
     }
 }
 
@@ -284,6 +375,8 @@ pub struct WindowMachine {
     last_change: Instant,
     installing_since: Option<Instant>,
     missing_since: Option<Instant>,
+    /// When the window opened: bounds the wait for its first valid frame.
+    opened: Instant,
     version: String,
 }
 
@@ -301,6 +394,7 @@ impl WindowMachine {
             last_change: now,
             installing_since: None,
             missing_since: None,
+            opened: now,
             version: version.into(),
         }
     }
@@ -398,6 +492,22 @@ impl WindowMachine {
                 self.fail(failure, "retry")
             }
             Mode::Following => {
+                // No valid frame at all yet (a malformed or foreign progress
+                // file, a writer that died before its first frame): bounded
+                // too, so the window never sits on "Preparing the update"
+                // with no way out (Codex round 4, finding 5).
+                if self.attempt.is_none() {
+                    if now.duration_since(self.opened) < FIRST_FRAME_TIMEOUT {
+                        return Vec::new();
+                    }
+                    let failure = UpdateFailure::classified(
+                        Stage::Download,
+                        FailureKind::Other,
+                        format!("No readable progress from Rillio within {}s of opening the update window.", FIRST_FRAME_TIMEOUT.as_secs()),
+                        &self.version,
+                    );
+                    return self.fail(failure, "download");
+                }
                 if let Some(t0) = self.installing_since {
                     // ★ The install did NOT complete. Success deletes the
                     // file (the relaunched new app clears it on boot), so
@@ -630,6 +740,7 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn frame(phase: &str, attempt: u64) -> String {
         serde_json::to_string(&UpdateProgress { attempt, ..UpdateProgress::phase(phase) }).unwrap()
@@ -799,6 +910,145 @@ mod tests {
         // After the flow fails, the next request starts a new one.
         run.end();
         assert_eq!(run.request(7_000, write), RetryDecision::Start);
+    }
+
+    /// Codex round-4 finding 6: a second delivery of an attempt that already
+    /// ran (and failed) must not start it again.
+    #[test]
+    fn a_repeat_of_a_finished_attempt_starts_nothing() {
+        let run = UpdateRun::default();
+        let (_, write) = recorder();
+        assert_eq!(run.request(5_000, write.clone()), RetryDecision::Start);
+        run.end(); // attempt 5000 failed
+        assert_eq!(run.request(5_000, write.clone()), RetryDecision::Duplicate);
+        // An OLDER attempt arriving late is no request either.
+        assert_eq!(run.request(4_000, write.clone()), RetryDecision::Duplicate);
+        // A new attempt still starts.
+        assert_eq!(run.request(6_000, write), RetryDecision::Start);
+    }
+
+    /// Codex round-4 finding 2: a process restarted after a failed install
+    /// keeps its launch args. Its retry request names an attempt whose
+    /// failure is already in the progress file: that must start nothing.
+    #[test]
+    fn a_retry_arg_whose_attempt_already_failed_starts_nothing() {
+        let run = UpdateRun::default();
+        let (frames, write) = recorder();
+        // What the file holds after the failed install: attempt 5000, error.
+        let on_disk = serde_json::from_str::<UpdateProgress>(&failed(5_000)).unwrap().attempt;
+        run.seed_handled(on_disk);
+        assert_eq!(run.request(5_000, write.clone()), RetryDecision::Duplicate);
+        assert!(frames.lock().unwrap().is_empty(), "nothing is written for a handled attempt");
+        // A fresh "Try again" (a newer attempt) still runs.
+        assert_eq!(run.request(5_001, write), RetryDecision::Start);
+    }
+
+    #[test]
+    fn a_restart_drops_the_retry_request_and_keeps_everything_else() {
+        let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(without_retry_arg(args(&["--retry-update", "5000"])), args(&[]));
+        assert_eq!(
+            without_retry_arg(args(&["rillio://open", "--retry-update", "5000", "--flag"])),
+            args(&["rillio://open", "--flag"])
+        );
+        assert_eq!(without_retry_arg(args(&["rillio://open"])), args(&["rillio://open"]));
+    }
+
+    /// Codex round-4 finding 4: a download that stops moving is cancelled
+    /// (dropped) instead of holding the flow forever; one that keeps moving
+    /// is left alone however long it takes.
+    #[test]
+    fn a_stalled_download_is_cancelled_and_a_moving_one_is_not() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let progress = AtomicU64::new(crate::error_chain::now_ms());
+            let dropped = std::sync::Arc::new(AtomicBool::new(false));
+            struct Flag(std::sync::Arc<AtomicBool>);
+            impl Drop for Flag {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let flag = Flag(dropped.clone());
+            let stalled = async move {
+                let _flag = flag;
+                std::future::pending::<()>().await
+            };
+            let t0 = Instant::now();
+            assert_eq!(unless_stalled(stalled, &progress, Duration::from_millis(200)).await, None);
+            assert!(t0.elapsed() < Duration::from_secs(2));
+            assert!(dropped.load(Ordering::SeqCst), "the stalled work was dropped (cancelled)");
+
+            // Moving: progress every 50ms for 600ms, three times the limit.
+            let progress = AtomicU64::new(crate::error_chain::now_ms());
+            let moving = async {
+                for _ in 0..12 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    progress.store(crate::error_chain::now_ms(), Ordering::SeqCst);
+                }
+                "done"
+            };
+            assert_eq!(unless_stalled(moving, &progress, Duration::from_millis(200)).await, Some("done"));
+        });
+    }
+
+    /// Codex round-4 finding 3: stamping a frame and writing it must be one
+    /// step against adoption. Once a frame of the adopted attempt reached the
+    /// file, no frame of the old attempt may follow it (the window, following
+    /// the new attempt, would drop it: a lost "installing" turns the success
+    /// signal into a "vanished" failure). The recorder sees writes in file
+    /// order because the writer runs inside the flow's critical section.
+    #[test]
+    fn no_old_attempt_frame_lands_after_an_adoption() {
+        for _ in 0..50 {
+            let run = std::sync::Arc::new(UpdateRun::default());
+            let frames = std::sync::Arc::new(Mutex::new(Vec::<UpdateProgress>::new()));
+            // A slow writer (a file write takes time) widens the gap between
+            // stamping a frame and the frame reaching the file.
+            let write = {
+                let frames = frames.clone();
+                move |f: &UpdateProgress| {
+                    std::thread::sleep(Duration::from_micros(300));
+                    frames.lock().unwrap().push(f.clone());
+                }
+            };
+            assert!(run.begin(100));
+            let flow = {
+                let (run, write) = (run.clone(), write.clone());
+                std::thread::spawn(move || {
+                    for n in 0..40u64 {
+                        run.frame(UpdateProgress { downloaded: n, ..UpdateProgress::phase("downloading") }, write.clone());
+                    }
+                })
+            };
+            std::thread::sleep(Duration::from_millis(3));
+            run.request(5_000, write);
+            flow.join().unwrap();
+            let attempts: Vec<u64> = frames.lock().unwrap().iter().map(|f| f.attempt).collect();
+            if let Some(first_new) = attempts.iter().position(|&a| a == 5_000) {
+                assert!(attempts[first_new..].iter().all(|&a| a == 5_000), "an old frame landed after the adoption: {attempts:?}");
+            }
+        }
+    }
+
+    /// Codex round-4 finding 5: a window that never gets a readable frame
+    /// must not sit on "Preparing the update" forever.
+    #[test]
+    fn no_readable_frame_at_all_becomes_a_failure() {
+        let t0 = Instant::now();
+        let mut m = WindowMachine::new("0.1.45", t0);
+        for s in 0..40 {
+            let now = t0 + Duration::from_secs(s);
+            assert!(m.observe(Some("{\"phase\":"), now).is_empty());
+            let effects = m.tick(now);
+            if now.duration_since(t0) >= FIRST_FRAME_TIMEOUT {
+                assert_eq!(shown_phases(&effects), vec!["error"], "at {s}s");
+                assert!(m.is_waiting_on_user());
+                return;
+            }
+            assert!(effects.is_empty(), "at {s}s: {effects:?}");
+        }
+        panic!("no failure within 40s");
     }
 
     #[test]
