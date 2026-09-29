@@ -20,7 +20,17 @@ tauri-build = { version = "2", features = [] }
 # The stream_cb cancellation / worker-guard tests stand up their own
 # multi-threaded runtime (the flavor production uses); the library itself only
 # needs a `runtime::Handle`, so this stays out of [dependencies].
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# The error_chain probes (src/error_chain.rs) make real failing requests and
+# wrap them in tauri_plugin_updater::Error::Reqwest, the exact type the update
+# commands format. The updater is on reqwest 0.13 (the shell's own downloads
+# use 0.12), so the probes name that one; same major version, so this is the
+# updater's crate instance, not a second copy. The updater turns on reqwest's
+# `rustls-no-provider`, so a client cannot be built until a rustls crypto
+# provider is installed; the probes install ring's, as the updater's own
+# check() does. tokio `net` is for the loopback sockets they stand up.
+reqwest-updater = { package = "reqwest", version = "0.13", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }

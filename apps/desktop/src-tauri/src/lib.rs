@@ -5,6 +5,8 @@
 //! web client reaches it at http://127.0.0.1:11470 exactly as before.
 
 mod autosync;
+#[cfg(not(target_os = "android"))]
+mod error_chain;
 pub mod mpv;
 pub mod platform;
 #[cfg(not(target_os = "android"))]
@@ -840,8 +842,10 @@ fn disable_tracking_prevention(window: &tauri::WebviewWindow) {
 /// `update-available` with the version so the web UI can surface a toast (see
 /// apps/web ServicesToaster); the user installs it from there via
 /// [`install_update`]. Runs on every startup, so the toast reappears until the
-/// update is taken. Fails quietly: no release yet / offline / an unconfigured
-/// signing key all just log at debug and leave the running app untouched.
+/// update is taken. Fails quietly on screen: no release yet / offline / an
+/// unconfigured signing key leave the running app untouched, but a failed
+/// check goes to the boot journal with its full cause chain, so a later
+/// "the update failed" arrives with what the network was doing at launch.
 /// Android build: updates come from the app store, not the in-app updater
 /// (gated out). No-op.
 #[cfg(not(desktop))]
@@ -857,7 +861,7 @@ fn spawn_update_check(app: tauri::AppHandle) {
             Ok(updater) => updater,
             // A missing/invalid pubkey surfaces here as Err, not a panic.
             Err(e) => {
-                tracing::debug!("updater unavailable: {e}");
+                tracing::debug!("updater unavailable: {}", error_chain::error_chain(&e));
                 return;
             }
         };
@@ -868,7 +872,14 @@ fn spawn_update_check(app: tauri::AppHandle) {
                 let _ = app.emit("update-available", update.version.clone());
             }
             Ok(None) => tracing::debug!("rillio is up to date"),
-            Err(e) => tracing::debug!("update check failed: {e}"),
+            Err(e) => {
+                let chain = error_chain::error_chain(&e);
+                tracing::warn!("update: launch check failed: {chain}");
+                boot_journal_append(
+                    &app.config().identifier,
+                    &format!("update-failed stage=launch-check error={chain:?}"),
+                );
+            }
         }
     });
 }
@@ -897,12 +908,33 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, Strin
 
         let update = app
             .updater()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| update_failure(&app, "check", &e))?
             .check()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| update_failure(&app, "check", &e))?;
         Ok(update.map(|update| update.version.clone()))
     }
+}
+
+/// Record an update failure in full and return the text to show for it.
+///
+/// Both carry the whole cause chain (see error_chain): the top-level Display
+/// of the updater's reqwest error is just "error sending request for url
+/// (...)", which is what the 0.1.44 -> 0.1.45 failure showed, with the reason
+/// (reset, DNS, TLS, timeout) cut off. And tracing alone is not a log FILE: a
+/// release build is a windows-subsystem process whose stdout, tracing's only
+/// sink, goes nowhere. The boot journal (`%LOCALAPPDATA%\<identifier>\
+/// boot-journal.log`) is the shell's one on-disk log, and already holds the
+/// `update-handoff` line, so the failure goes there too.
+#[cfg(desktop)]
+fn update_failure<E: std::error::Error + ?Sized>(app: &tauri::AppHandle, stage: &str, err: &E) -> String {
+    let chain = error_chain::error_chain(err);
+    tracing::error!("update: {stage} failed: {chain}");
+    boot_journal_append(
+        &app.config().identifier,
+        &format!("update-failed stage={stage} error={chain:?}"),
+    );
+    chain
 }
 
 /// Download, verify (minisign) and install the pending update, then relaunch.
@@ -941,10 +973,10 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
 
     let update = app
         .updater()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| update_failure(&app, "install-check", &e))?
         .check()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| update_failure(&app, "install-check", &e))?
         .ok_or_else(|| "no update available".to_string())?;
 
     // The custom update window (docs/update-window): a detached process that
@@ -993,17 +1025,18 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
             // Failed download: tell the update window (it shows the error and
             // exits), bring the main window back, and surface the error to the
             // web UI's toast as before.
+            let message = update_failure(&app, "download", &e);
             update_window::write_progress(&update_window::UpdateProgress {
                 phase: "error".into(),
                 downloaded: 0,
                 total: 0,
-                message: Some(e.to_string()),
+                message: Some(message.clone()),
             });
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-            return Err(e.to_string());
+            return Err(message);
         }
     };
     update_window::write_progress(&update_window::UpdateProgress {
@@ -1059,12 +1092,13 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
         // a headless zombie. Tell the update window, then restart the (still
         // old) app; the update toast will re-offer the update on next launch
         // (whose boot also deletes the progress file).
-        tracing::error!("update: install failed, relaunching the current version: {e}");
+        let message = update_failure(&app, "install", &e);
+        tracing::error!("update: relaunching the current version after the failed install");
         update_window::write_progress(&update_window::UpdateProgress {
             phase: "error".into(),
             downloaded: 0,
             total: 0,
-            message: Some(format!("Install failed: {e}")),
+            message: Some(format!("Install failed: {message}")),
         });
         app.restart();
     }

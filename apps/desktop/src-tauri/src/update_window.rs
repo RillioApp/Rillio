@@ -143,6 +143,7 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
                 }
             }
             let window = builder.build()?;
+            let identifier = app.config().identifier.clone();
 
             // Poll the progress file and drive the page. WebviewWindow is Send:
             // eval marshals onto the right thread internally.
@@ -165,12 +166,16 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
                                 installing_since = Some(Instant::now());
                             }
                             if progress.phase == "error" {
-                                // Show the failure briefly, then get out of the way
-                                // (the main app re-shows its own window on error).
+                                // Show the failure, then get out of the way (the
+                                // main app re-shows its own window on error). The
+                                // message is the full cause chain (the writer logs
+                                // it too, see update_failure in lib.rs), up to a
+                                // few lines, so it stays up long enough to read:
+                                // 8s, the same as the failed-install path below.
                                 if raw != last_payload {
                                     let _ = window.eval(&format!("window.__updateState({raw})"));
                                 }
-                                std::thread::sleep(Duration::from_secs(4));
+                                std::thread::sleep(Duration::from_secs(8));
                                 std::process::exit(0);
                             }
                             if raw != last_payload {
@@ -191,6 +196,12 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
                             if let Some(t0) = installing_since {
                                 if t0.elapsed() > Duration::from_secs(120) {
                                     tracing::error!("update-window: install did not complete; reporting failure");
+                                    // tracing's stdout goes nowhere in a release
+                                    // build; the boot journal is the log file.
+                                    crate::boot_journal_append(
+                                        &identifier,
+                                        "update-failed stage=installer error=\"the installer did not finish within 120s (NSIS quiet mode aborts silently)\"",
+                                    );
                                     let payload = serde_json::json!({
                                         "phase": "error",
                                         "message": "The update could not be installed. Rillio will reopen on the current version; you can download the latest installer from rillio.app.",
@@ -223,6 +234,6 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
         })
         .run(ctx);
     if let Err(e) = result {
-        tracing::error!("update-window: failed to run: {e}");
+        tracing::error!("update-window: failed to run: {}", crate::error_chain::error_chain(&e));
     }
 }
