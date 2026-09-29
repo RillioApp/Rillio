@@ -456,11 +456,13 @@ pub fn run() {
         // the single-instance `deep-link` feature can forward a warm-launch URL
         // into this plugin's on_open_url. See setup_deep_links.
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_updater::Builder::new().build());
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // The install flow's one-at-a-time state and retry protocol (see
+        // update_window). Desktop-only, like the updater it drives.
+        .manage(update_window::UpdateRun::default());
     builder
         .manage(MpvState::default())
         .manage(UpdateInFlight::default())
-        .manage(update_window::UpdateRun::default())
         .manage(shell::ShellState::default())
         .manage(thumbs::ThumbsState::default())
         .manage(transcribe::TranscribeState::default())
@@ -542,9 +544,15 @@ pub fn run() {
             }
             spawn_update_check(app.handle().clone());
             // Launched by an update window's "Try again" while Rillio was not
-            // running: this process is the one to run the flow again.
+            // running: this process is the one to run the flow again. Unless
+            // that attempt is already done: the progress file holds the frame
+            // of the newest attempt that ran, and a process restarted after a
+            // failed install still carries the request that started it.
             #[cfg(desktop)]
             if let Some(attempt) = update_window::retry_arg(std::env::args()) {
+                if let Some(handled) = update_window::attempt_on_disk() {
+                    app.state::<update_window::UpdateRun>().seed_handled(handled);
+                }
                 request_update_retry(app.handle().clone(), attempt);
             }
             setup_deep_links(app);
@@ -884,10 +892,9 @@ fn spawn_update_check(_app: tauri::AppHandle) {}
 #[cfg(desktop)]
 fn spawn_update_check(app: tauri::AppHandle) {
     use tauri::Emitter;
-    use tauri_plugin_updater::UpdaterExt;
 
     tauri::async_runtime::spawn(async move {
-        let updater = match app.updater() {
+        let updater = match configured_updater(&app) {
             Ok(updater) => updater,
             // A missing/invalid pubkey surfaces here as Err, not a panic.
             Err(e) => {
@@ -943,10 +950,8 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, error
     #[cfg(desktop)]
     {
         use error_chain::Stage;
-        use tauri_plugin_updater::UpdaterExt;
 
-        let update = app
-            .updater()
+        let update = configured_updater(&app)
             .map_err(|e| update_failure(&app, Stage::Check, &e))?
             .check()
             .await
@@ -1085,7 +1090,6 @@ fn fail_install(app: &tauri::AppHandle, failure: error_chain::UpdateFailure) -> 
 #[cfg(desktop)]
 async fn run_install(app: tauri::AppHandle, spawn_window: bool) -> Result<(), error_chain::UpdateFailure> {
     use error_chain::Stage;
-    use tauri_plugin_updater::UpdaterExt;
     use update_window::UpdateProgress;
 
     let version = app.package_info().version.to_string();
@@ -1094,7 +1098,7 @@ async fn run_install(app: tauri::AppHandle, spawn_window: bool) -> Result<(), er
     if !spawn_window {
         update_frame(&app, UpdateProgress::phase("checking"));
     }
-    let checked = match app.updater() {
+    let checked = match configured_updater(&app) {
         Ok(updater) => updater.check().await.map_err(|e| update_failure(&app, Stage::InstallCheck, &e)),
         Err(e) => Err(update_failure(&app, Stage::InstallCheck, &e)),
     };
@@ -1132,30 +1136,51 @@ async fn run_install(app: tauri::AppHandle, spawn_window: bool) -> Result<(), er
     // the file poller runs at 150ms). The update window is the ONLY progress
     // surface - the main window is hidden and the web UI's overlay is gone.
     // `content_len` is the total size when known.
+    //
+    // A download that stops moving ends here, in THIS process: the socket's
+    // own read timeout (configured_updater) normally fails it first, and the
+    // stall watch below is the backstop that cancels the future whatever it
+    // is stuck on. Either way the flow ends, releases UpdateRun and writes
+    // the failure, so "Try again" starts a fresh attempt instead of adopting
+    // a dead one (Codex round 4, finding 4).
     let mut downloaded: u64 = 0;
     let mut last_file_write = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let progress_app = app.clone();
-    let download_result = update
-        .download(
-            move |chunk_len, content_len| {
-                downloaded += chunk_len as u64;
-                if last_file_write.elapsed() >= std::time::Duration::from_millis(100) {
-                    last_file_write = std::time::Instant::now();
-                    update_frame(
-                        &progress_app,
-                        UpdateProgress { downloaded, total: content_len.unwrap_or(0), ..UpdateProgress::phase("downloading") },
-                    );
-                }
-            },
-            || {},
-        )
-        .await;
-    let bytes = match download_result {
-        Ok(bytes) => bytes,
+    let last_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(error_chain::now_ms()));
+    let chunk_progress = last_progress.clone();
+    let download = update.download(
+        move |chunk_len, content_len| {
+            chunk_progress.store(error_chain::now_ms(), std::sync::atomic::Ordering::SeqCst);
+            downloaded += chunk_len as u64;
+            if last_file_write.elapsed() >= std::time::Duration::from_millis(100) {
+                last_file_write = std::time::Instant::now();
+                update_frame(
+                    &progress_app,
+                    UpdateProgress { downloaded, total: content_len.unwrap_or(0), ..UpdateProgress::phase("downloading") },
+                );
+            }
+        },
+        || {},
+    );
+    let bytes = match update_window::unless_stalled(download, &last_progress, UPDATE_DOWNLOAD_STALL).await {
+        Some(Ok(bytes)) => bytes,
         // Failed download: the update window shows it and waits for the user
         // (Try again / Close), the main window comes back, and the web UI's
         // toast or Settings gets the same failure.
-        Err(e) => return Err(fail_install(&app, update_failure(&app, Stage::Download, &e))),
+        Some(Err(e)) => return Err(fail_install(&app, update_failure(&app, Stage::Download, &e))),
+        None => {
+            let failure = error_chain::UpdateFailure::classified(
+                Stage::Download,
+                error_chain::FailureKind::Timeout,
+                format!(
+                    "No download progress for {}s; the download was cancelled.",
+                    UPDATE_DOWNLOAD_STALL.as_secs()
+                ),
+                &version,
+            );
+            journal_update_failure(&app, &failure);
+            return Err(fail_install(&app, failure));
+        }
     };
     update_frame(&app, UpdateProgress::phase("installing"));
 
@@ -1208,9 +1233,80 @@ async fn run_install(app: tauri::AppHandle, spawn_window: bool) -> Result<(), er
         let failure = update_failure(&app, Stage::Install, &e);
         tracing::error!("update: relaunching the current version after the failed install");
         update_frame(&app, UpdateProgress::failed(failure));
-        app.restart();
+        restart_without_retry(&app);
+        // The main thread exits the process; this task has nothing left to do.
+        std::future::pending::<()>().await;
     }
     Ok(())
+}
+
+/// How long the updater's HTTP client waits to connect, and between two reads
+/// of a response (check and download). Without these a dead socket hangs the
+/// flow forever; with them it fails as a timeout on its own.
+#[cfg(desktop)]
+const UPDATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(desktop)]
+const UPDATE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// The download's stall backstop (update_window::unless_stalled): longer than
+/// the read timeout, which normally fires first, and far shorter than the
+/// update window's own 10-minute stall verdict, so the MAIN process always
+/// ends a stalled flow before the window gives up on it.
+#[cfg(desktop)]
+const UPDATE_DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The updater with connect and read timeouts on its HTTP client (the plugin
+/// sets none).
+#[cfg(desktop)]
+fn configured_updater(app: &tauri::AppHandle) -> tauri_plugin_updater::Result<tauri_plugin_updater::Updater> {
+    use tauri_plugin_updater::UpdaterExt;
+    app.updater_builder()
+        .configure_client(|client| client.connect_timeout(UPDATE_CONNECT_TIMEOUT).read_timeout(UPDATE_READ_TIMEOUT))
+        .build()
+}
+
+/// Journal a failure that is not an error value (update_failure journals the
+/// rest), with the same line shape.
+#[cfg(desktop)]
+fn journal_update_failure(app: &tauri::AppHandle, failure: &error_chain::UpdateFailure) {
+    let (label, chain) = (failure.stage.label(), &failure.message);
+    tracing::error!("update: {label} failed ({:?}): {chain}", failure.kind);
+    boot_journal_append(
+        &app.config().identifier,
+        &format!("update-failed stage={label} error={chain:?}"),
+    );
+}
+
+/// Relaunch the current version after a failed install, WITHOUT a retry
+/// request in the args. Tauri's `restart()` re-spawns with the original
+/// args, so a process cold-launched with `--retry-update <a>` came back with
+/// it and installed again with no user action, in a loop (Codex round 4,
+/// finding 2; the progress-file seed in setup is the second guard). Done on
+/// the main thread in the order Tauri's own restart uses: release the
+/// single-instance lock (its Exit handler would), clean up, spawn, exit.
+#[cfg(desktop)]
+fn restart_without_retry(app: &tauri::AppHandle) {
+    fn relaunch() -> ! {
+        let args = update_window::without_retry_arg(std::env::args_os().skip(1));
+        match std::env::current_exe() {
+            Ok(exe) => {
+                if let Err(e) = std::process::Command::new(&exe).args(args).spawn() {
+                    tracing::error!("update: could not relaunch {}: {e}", exe.display());
+                }
+            }
+            Err(e) => tracing::error!("update: could not find this exe to relaunch: {e}"),
+        }
+        std::process::exit(0);
+    }
+    let handle = app.clone();
+    let scheduled = app.run_on_main_thread(move || {
+        tauri_plugin_single_instance::destroy(&handle);
+        handle.cleanup_before_exit();
+        relaunch();
+    });
+    if let Err(e) = scheduled {
+        tracing::error!("update: main thread unavailable for the restart ({e}); relaunching from here");
+        relaunch();
+    }
 }
 
 /// Wait (up to 10s) for the WebView2 browser process to shut down and release
