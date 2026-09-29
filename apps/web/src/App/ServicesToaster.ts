@@ -4,6 +4,7 @@ import React from 'react';
 import { useCore } from 'rillio/core';
 import { useToast, useFileDrop } from 'rillio/common';
 import { getTauri } from 'rillio/common/Platform/shell/isShell';
+import { toUpdateFailure } from 'rillio/common/Platform/shell/updateFailure';
 
 const ServicesToaster = () => {
     const core = useCore();
@@ -95,8 +96,11 @@ const ServicesToaster = () => {
                     // The shell owns the whole install UX: it hides this window and
                     // shows the detached update splash (update_window.rs), so the web
                     // side renders nothing. On failure the shell re-shows the window.
+                    // The shell rejects with an UpdateFailure: the toast gets its
+                    // plain sentence; the chain is behind the update window's
+                    // "Details" and in the boot journal.
                     TAURI.core.invoke('install_update').catch((e: unknown) => {
-                        toast.show({ type: 'error', title: 'Update failed', message: String(e), timeout: 5000 });
+                        toast.show({ type: 'error', title: 'Update failed', message: toUpdateFailure(e).summary, timeout: 5000 });
                     });
                 },
             });

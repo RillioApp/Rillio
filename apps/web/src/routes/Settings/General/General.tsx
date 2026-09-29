@@ -8,6 +8,7 @@ import { Section, Option, Link, SettingsSwitch } from '../components';
 import User from './User';
 import useDataExport from './useDataExport';
 import useUpdateCheck from './useUpdateCheck';
+import UpdateFailureDetails from './UpdateFailureDetails';
 
 // CJS require, matching how the rest of the app consumes usePlayUrl (it is an
 // `export =` module).
@@ -159,22 +160,22 @@ const General = forwardRef<HTMLDivElement, Props>(({ profile }: Props, ref) => {
                                 {
                                     update.status.phase === 'available' ? `Rillio ${update.status.version} is available` :
                                         update.status.phase === 'up-to-date' ? `Rillio ${appVersion} is up to date` :
-                                            update.status.phase === 'failed' ?
-                                                <>
-                                                    <span className="text-danger">
-                                                        {update.status.action === 'install' ? 'Could not install the update' : 'Could not check for updates'}
-                                                    </span>
-                                                    {/* The cause, not just the headline: the shell sends the
-                                                        full chain (reset, DNS, TLS, timeout). Its URL is one
-                                                        long token, so it has to be allowed to break. */}
-                                                    <div className="mt-1 break-words text-xs">{update.status.message}</div>
-                                                </>
-                                                :
-                                                `Version ${appVersion}`
+                                            `Version ${appVersion}`
                                 }
                             </div>
                         </div>
                     </Option>
+                    {
+                        // Under the row, full width: the row's text column is too
+                        // narrow for a sentence, let alone the chain.
+                        update.status.phase === 'failed' ?
+                            <UpdateFailureDetails
+                                title={update.status.action === 'install' ? 'Couldn\'t install the update' : 'Couldn\'t check for updates'}
+                                failure={update.status.failure}
+                            />
+                            :
+                            null
+                    }
                 </Section>
                 :
                 null

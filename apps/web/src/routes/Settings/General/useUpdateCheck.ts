@@ -10,6 +10,7 @@
 
 import { useCallback, useState } from 'react';
 import { getTauri } from 'rillio/common/Platform/shell/isShell';
+import { toUpdateFailure, type UpdateFailure } from 'rillio/common/Platform/shell/updateFailure';
 
 type Status =
     | { phase: 'idle' }
@@ -18,8 +19,8 @@ type Status =
     | { phase: 'available', version: string }
     | { phase: 'installing' }
     // `action` says WHICH step failed: an install failure used to read "Could
-    // not check for updates". `message` is the shell's full cause chain.
-    | { phase: 'failed', action: 'check' | 'install', message: string };
+    // not check for updates". `failure` is the shell's sentence + full chain.
+    | { phase: 'failed', action: 'check' | 'install', failure: UpdateFailure };
 
 const useUpdateCheck = () => {
     const [status, setStatus] = useState<Status>({ phase: 'idle' });
@@ -42,7 +43,7 @@ const useUpdateCheck = () => {
             // leaves them on an old build believing it is current.
             .catch((error: unknown) => {
                 console.error('useUpdateCheck: the update check failed', error);
-                setStatus({ phase: 'failed', action: 'check', message: String(error) });
+                setStatus({ phase: 'failed', action: 'check', failure: toUpdateFailure(error) });
             });
     }, []);
 
@@ -55,7 +56,7 @@ const useUpdateCheck = () => {
         // error state below is what the user comes back to.
         TAURI.core.invoke('install_update').catch((error: unknown) => {
             console.error('useUpdateCheck: installing the update failed', error);
-            setStatus({ phase: 'failed', action: 'install', message: String(error) });
+            setStatus({ phase: 'failed', action: 'install', failure: toUpdateFailure(error) });
         });
     }, []);
 

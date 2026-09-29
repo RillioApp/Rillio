@@ -40,23 +40,66 @@
         #fill.indeterminate { width: 42%; animation: slide 1.15s ease-in-out infinite; }
         @keyframes slide { 0% { margin-left: -42%; } 100% { margin-left: 100%; } }
         #status { margin-top: 12px; font-size: 12.5px; color: rgba(255, 255, 255, 0.55); font-variant-numeric: tabular-nums; min-height: 16px; text-align: center; }
-        /* The error is the full cause chain ("error sending request for url
-           (https://...): ...: connection reset (os error 10054)"): the URL is
-           one unbreakable token wider than the window, so let it break. */
-        #status.error { color: #ff6b6b; overflow-wrap: anywhere; line-height: 1.45; }
-        /* The window is a fixed 360x420 and clips, and the real cause sits at
-           the END of the chain: bound the error to 6 lines (6 x 18.1px) and let it scroll; that
-           keeps it clear of the note at the bottom.
-           It is also the one selectable, clickable thing on the page, so the
-           error can be copied and pasted into a bug report. It sits above the
-           drag region (later in the DOM), so dragging still works elsewhere. */
-        #status.error {
-            max-height: 109px; overflow-y: auto; overscroll-behavior: contain;
-            pointer-events: auto; cursor: text; user-select: text; -webkit-user-select: text;
-            scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+        #note { position: absolute; bottom: 18px; left: 24px; right: 24px; text-align: center; font-size: 11.5px; color: rgba(255, 255, 255, 0.32); }
+
+        /* ---- Failed state (body.failed) ----
+           Leads with one plain sentence (the shell classifies the failure and
+           sends it, see error_chain.rs); the full cause chain waits behind a
+           quiet "Details". Flat and tonal: no outlines, no red. The one status
+           cue is a small desaturated amber dot. The progress row goes away: a
+           stopped bar reads as "still going". */
+        .failed #pct, .failed #track { display: none; }
+        .failed #status { margin-top: 10px; line-height: 1.45; color: rgba(255, 255, 255, 0.62); }
+        .failed #status::before {
+            content: ''; display: inline-block; width: 6px; height: 6px; margin: 0 8px 1px 0;
+            border-radius: 999px; background: #C9A26E; vertical-align: middle;
         }
-        #status.error::selection { background: rgba(255, 160, 51, 0.35); color: #fff; }
-        #note { position: absolute; bottom: 18px; left: 0; right: 0; text-align: center; font-size: 11.5px; color: rgba(255, 255, 255, 0.32); }
+        /* Opening Details must keep the logo and title on the card: the mark
+           steps down so the panel fits the fixed 360x420 window. */
+        #logo, #logo-fallback { transition: width .2s ease, height .2s ease; }
+        .failed.open #logo, .failed.open #logo-fallback { width: 58px; height: 60px; }
+        .failed.open #title { margin-top: 12px; }
+        #details-toggle {
+            display: none; margin-top: 8px; padding: 4px 8px 4px 10px; border: 0; border-radius: 999px;
+            background: transparent; color: rgba(255, 255, 255, 0.45); font: inherit; font-size: 12px;
+            align-items: center; gap: 4px; cursor: pointer; pointer-events: auto;
+            transition: background-color .15s ease, filter .15s ease;
+        }
+        .failed #details-toggle { display: inline-flex; }
+        #details-toggle:hover { background: rgba(255, 255, 255, 0.05); filter: brightness(1.1); }
+        #details-toggle svg { width: 12px; height: 12px; transition: transform .2s ease; }
+        .open #details-toggle svg { transform: rotate(180deg); }
+        button:focus-visible { outline: 2px solid #FFA033; outline-offset: -2px; }
+        /* The tonal panel: one step lighter than the card, no border. The chain
+           is selectable (it gets pasted into bug reports) and bounded to seven
+           lines, scrolling for the rest: the cause sits at its END. Seven,
+           because the real connection-reset chain is seven lines here and
+           should read without scrolling. */
+        #details {
+            display: none; width: 100%; margin-top: 8px; box-sizing: border-box;
+            border-radius: 10px; background: rgba(255, 255, 255, 0.05);
+            align-items: flex-start; pointer-events: auto;
+        }
+        .failed.open #details { display: flex; }
+        #details-text {
+            flex: 1; min-width: 0; margin: 0; box-sizing: border-box; padding: 10px 4px 10px 12px;
+            max-height: calc(7 * 16.5px + 20px); overflow-y: auto; overscroll-behavior: contain;
+            font: 11px/16.5px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+            color: rgba(255, 255, 255, 0.62); text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
+            cursor: text; user-select: text; -webkit-user-select: text;
+            scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+        }
+        #details-text::selection { background: rgba(255, 160, 51, 0.3); color: #fff; }
+        #copy {
+            flex: none; display: inline-flex; align-items: center; justify-content: center;
+            width: 26px; height: 26px; margin: 6px 6px 0 0; padding: 0; border: 0; border-radius: 999px;
+            background: transparent; color: rgba(255, 255, 255, 0.55); cursor: pointer;
+            transition: background-color .15s ease, filter .15s ease;
+        }
+        #copy:hover { background: rgba(255, 255, 255, 0.06); filter: brightness(1.1); }
+        #copy svg { width: 14px; height: 14px; }
+        #copy .done, #copy.copied .idle { display: none; }
+        #copy.copied .done { display: block; }
         #drag { position: fixed; inset: 0; }
         .fg, #note { pointer-events: none; }
     </style>
@@ -73,6 +116,17 @@
             <div id="pct"></div>
             <div id="track"><div id="fill" class="indeterminate"></div></div>
             <div id="status">Preparing the update</div>
+            <button id="details-toggle" type="button" aria-expanded="false" aria-controls="details">
+                Details
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div id="details">
+                <pre id="details-text"></pre>
+                <button id="copy" type="button" aria-label="Copy details" title="Copy details">
+                    <svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                    <svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+                </button>
+            </div>
         </div>
         <div id="note">Rillio will start by itself when this is done.</div>
     </div>
@@ -214,15 +268,68 @@
             if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
             return Math.max(0, Math.round(b / 1024)) + ' KB';
         }
+        // ---- Failed state: summary, Details disclosure, copy ----
+        var toggleEl = document.getElementById('details-toggle'), detailsTextEl = document.getElementById('details-text'),
+            copyEl = document.getElementById('copy'), noteEl = document.getElementById('note');
+        function setDetailsOpen(open) {
+            document.body.classList.toggle('open', open);
+            toggleEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+            if (open) detailsTextEl.scrollTop = 0;
+        }
+        toggleEl.addEventListener('click', function () { setDetailsOpen(!document.body.classList.contains('open')); });
+        var copiedTimer = null;
+        function showCopied() {
+            copyEl.classList.add('copied');
+            copyEl.setAttribute('aria-label', 'Copied');
+            clearTimeout(copiedTimer);
+            copiedTimer = setTimeout(function () {
+                copyEl.classList.remove('copied');
+                copyEl.setAttribute('aria-label', 'Copy details');
+            }, 1500);
+        }
+        // Clipboard API first; where it is refused, select the text and try the
+        // legacy copy. If that fails too, the text stays selected for Ctrl+C,
+        // and no checkmark claims a copy that did not happen.
+        function selectDetails() {
+            var range = document.createRange();
+            range.selectNodeContents(detailsTextEl);
+            var sel = window.getSelection();
+            sel.removeAllRanges(); sel.addRange(range);
+            var ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+            if (ok) { sel.removeAllRanges(); showCopied(); }
+        }
+        copyEl.addEventListener('click', function () {
+            var text = detailsTextEl.textContent;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(showCopied, selectDetails);
+            } else {
+                selectDetails();
+            }
+        });
+        // `failure` is error_chain::UpdateFailure from the shell: {stage, kind,
+        // summary, message}. The sentence comes from the shell's one table;
+        // the page only lays it out. The footer tells the truth for the path
+        // (update_window.rs shows this for 8s, then exits): a failed download
+        // leaves the current version running (its window is already back); a
+        // failed install relaunches the current version.
+        window.__showFailure = function (failure) {
+            var f = failure || {};
+            document.body.classList.add('failed');
+            setDetailsOpen(false);
+            titleEl.textContent = 'Update failed';
+            statusEl.textContent = f.summary || "The update didn't finish.";
+            detailsTextEl.textContent = f.message || '';
+            toggleEl.style.display = f.message ? '' : 'none';
+            noteEl.textContent = f.stage === 'install' ?
+                'Rillio will reopen in a few seconds.' :
+                'Nothing changed. This window closes in a few seconds.';
+        };
         var lastSample = null, speed = 0;
         window.__updateState = function (s) {
             if (!s) return;
             if (s.phase === 'error') {
-                titleEl.textContent = 'Update failed';
-                statusEl.textContent = s.message || 'Something went wrong. Rillio will keep the current version.';
-                statusEl.className = 'error';
-                statusEl.scrollTop = 0;
-                fillEl.className = ''; fillEl.style.width = '0%';
+                window.__showFailure(s.failure);
                 return;
             }
             if (s.phase === 'installing') {
@@ -267,17 +374,30 @@
         });
 
         // ---- #demo: self-driven simulated run (design preview + verification) ----
-        // #demo-error shows the failed state with a real-shaped cause chain;
-        // #demo-error-long a synthetic ~1500-character one, to check that the
-        // bounded, scrolling error area reaches the cause at its end.
+        // Failed-state previews: #demo-error (a connection reset), one per kind
+        // (#demo-error-dns, -refused, -timeout, -tls, -other, -install), and
+        // #demo-error-long, a synthetic ~1500-character chain for the bounded
+        // scroll. FIXTURES: the chains are the shell probes' real output
+        // (error_chain.rs), the sentences copies of its summary() table.
+        var DEMO_URL = 'error sending request for url (https://github.com/RillioApp/Rillio/releases/download/v0.1.45/Rillio_0.1.45_x64-setup.exe)';
+        var DEMOS = {
+            '#demo-error': ['download', 'The connection to GitHub was interrupted.', DEMO_URL + ': client error (SendRequest): connection error: An existing connection was forcibly closed by the remote host. (os error 10054)'],
+            '#demo-error-dns': ['download', "Couldn't find GitHub. Check your internet connection.", DEMO_URL + ': client error (Connect): dns error: No such host is known. (os error 11001)'],
+            '#demo-error-refused': ['download', 'GitHub refused the connection.', DEMO_URL + ': client error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os error 10061)'],
+            '#demo-error-timeout': ['download', 'The download timed out.', DEMO_URL + ': operation timed out'],
+            '#demo-error-tls': ['download', "A secure connection to GitHub couldn't be made.", DEMO_URL + ': client error (Connect): received corrupt message of type InvalidContentType'],
+            '#demo-error-other': ['download', "The download didn't finish.", DEMO_URL + ': connection closed before message completed'],
+            '#demo-error-install': ['install', "The update couldn't be installed.", 'The installer did not finish within 120 seconds. The latest installer is on rillio.app.'],
+        };
         if (location.hash === '#demo-error-long') {
-            var layers = ['error sending request for url (https://github.com/RillioApp/Rillio/releases/download/v0.1.45/Rillio_0.1.45_x64-setup.exe)', 'client error (Connect)'];
+            var layers = [DEMO_URL, 'client error (Connect)'];
             for (var n = 1; layers.join(': ').length < 1400; n++) layers.push('proxy hop ' + n + ': the tunnel returned an error while negotiating the upstream connection');
             layers.push('END OF CHAIN: An existing connection was forcibly closed by the remote host. (os error 10054)');
-            window.__updateState({ phase: 'error', message: layers.join(': ') });
+            DEMOS['#demo-error-long'] = ['download', 'The connection to GitHub was interrupted.', layers.join(': ')];
         }
-        if (location.hash === '#demo-error') {
-            window.__updateState({ phase: 'error', message: 'error sending request for url (https://github.com/RillioApp/Rillio/releases/download/v0.1.45/Rillio_0.1.45_x64-setup.exe): client error (SendRequest): connection error: An existing connection was forcibly closed by the remote host. (os error 10054)' });
+        if (DEMOS[location.hash]) {
+            var d = DEMOS[location.hash];
+            window.__updateState({ phase: 'error', failure: { stage: d[0], summary: d[1], message: d[2] } });
         }
         if (location.hash === '#demo') {
             (function () {
