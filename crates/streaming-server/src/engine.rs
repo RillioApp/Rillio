@@ -1011,6 +1011,14 @@ impl Engine {
     /// still hash-checking ("can't update initializing torrent"), and the
     /// caller must not serve a stream that silently keeps pulling the pack.
     pub async fn ensure_selected(&self, handle: &Handle, file_idx: usize) -> anyhow::Result<()> {
+        // Lock-free fast path for the common case, every mpv connection to a
+        // file already downloading. Safe without the lock: this function only
+        // ever GROWS a selection, so "already in it" needs no write; a
+        // concurrent deselect racing it is the same as that deselect landing
+        // just after. Anything else re-checks under the lock below.
+        if handle.only_files().is_some_and(|only| only.contains(&file_idx)) {
+            return Ok(());
+        }
         let ih = Self::info_hash_hex(handle);
         self.update_selection(handle, |current| {
             Ok(match current {
@@ -1052,10 +1060,12 @@ impl Engine {
     /// per-file toggles). Unlike [`Engine::ensure_selected`] this can also
     /// REMOVE a file, so it is the path for "stop downloading that extra".
     ///
-    /// Refuses to drop the last selected file: librqbit treats "no files" as a
-    /// torrent that can never finish, and the UI's delete button is the honest
-    /// way to want nothing. A legacy all-files selection (`None`) is read as
-    /// every file, so a toggle on it writes an explicit list.
+    /// Dropping the last selected file is allowed: nothing selected is a real
+    /// state, the one a browsed season pack is added in (see [`Pick::Decide`]),
+    /// so the Cache page must be able to reach it too. The torrent stays
+    /// cached, downloading nothing, and its file browser can pick files again.
+    /// A legacy all-files selection (`None`) is read as every file, so a toggle
+    /// on it writes an explicit list.
     pub async fn set_file_selected(
         &self,
         handle: &Handle,
@@ -1082,9 +1092,6 @@ impl Engine {
                     return Ok(None);
                 }
                 next.retain(|&i| i != file_idx);
-                if next.is_empty() {
-                    anyhow::bail!("a torrent must keep at least one selected file; delete it instead");
-                }
             }
             Ok(Some(next))
         })
@@ -1097,6 +1104,14 @@ impl Engine {
     /// or `None` for "leave it as it is" (no librqbit call, no persistence
     /// write). The read and the write happen under [`Engine::selection`], so a
     /// concurrent change can never be overwritten by a list read before it.
+    ///
+    /// The lock is held across librqbit's `session.json` write too: its
+    /// `Session::update_only_files` applies the selection and then awaits the
+    /// persistence update in one call, and the write is not exposed on its own.
+    /// That write already serializes session-wide inside librqbit, so holding
+    /// ours across it adds no real contention, and the no-change case (the
+    /// common one, see the fast path in [`Engine::ensure_selected`]) never
+    /// reaches it.
     async fn update_selection(
         &self,
         handle: &Handle,

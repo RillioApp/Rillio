@@ -362,8 +362,9 @@ pub(crate) async fn select(State(engine): State<Engine>, Json(body): Json<Select
             engine.touch(&info_hash);
             Json(serde_json::json!({ "success": true })).into_response()
         }
-        // Deselecting the last file is a request the engine refuses, not a
-        // server fault: 409, same as a refused pause.
+        // librqbit refuses a selection change while the torrent hash-checks
+        // ("can't update initializing torrent"): the request was fine, the
+        // torrent's state would not allow it. 409, same as a refused pause.
         Err(e) => {
             tracing::warn!("cache/select {info_hash} idx={}: {e:#}", body.file_idx);
             (
