@@ -2098,13 +2098,22 @@ mod tests {
 
     /// A real streaming-server router over a throwaway cache dir, plus the
     /// runtime to drive it. Nothing binds a socket: that is the point.
-    fn test_router() -> (tokio::runtime::Runtime, rillio_streaming_server::axum::Router) {
+    ///
+    /// The dir is per TEST (`tag`), not just per process: the tests run in
+    /// parallel threads of one process, and a shared dir let one test's
+    /// `remove_dir_all` pull the session store out from under another's
+    /// `Engine::new` ("error initializing JsonSessionPersistenceStore ...
+    /// os error 183").
+    fn test_router(
+        tag: &str,
+    ) -> (tokio::runtime::Runtime, rillio_streaming_server::axum::Router) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("build runtime");
-        let dir = std::env::temp_dir().join(format!("rillio-ipc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join(format!("rillio-ipc-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create cache dir");
         let config = rillio_streaming_server::Config::local(dir);
@@ -2119,7 +2128,7 @@ mod tests {
     /// handlers, same middleware, same status codes as the socket path.
     #[test]
     fn ipc_dispatch_answers_the_control_plane() {
-        let (rt, router) = test_router();
+        let (rt, router) = test_router("control-plane");
         let resp = rt
             .block_on(dispatch_server_request(
                 router.clone(),
@@ -2164,7 +2173,7 @@ mod tests {
     /// over IPC exactly as it does over HTTP.
     #[test]
     fn ipc_dispatch_keeps_mutations_post_only() {
-        let (rt, router) = test_router();
+        let (rt, router) = test_router("post-only");
         for path in ["/cache/delete", "/cache/pin", "/removeAll"] {
             let resp = rt
                 .block_on(dispatch_server_request(
@@ -2183,7 +2192,7 @@ mod tests {
     /// are refused BEFORE the router sees them.
     #[test]
     fn ipc_dispatch_refuses_what_the_boundary_forbids() {
-        let (rt, router) = test_router();
+        let (rt, router) = test_router("boundary");
         for method in ["DELETE", "PUT", "HEAD", "OPTIONS", "PATCH", "TRACE"] {
             let err = rt
                 .block_on(dispatch_server_request(
