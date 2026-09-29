@@ -97,10 +97,11 @@ const ServicesToaster = () => {
                     // shows the detached update splash (update_window.rs), so the web
                     // side renders nothing. On failure the shell re-shows the window.
                     // The shell rejects with an UpdateFailure: the toast gets its
-                    // plain sentence; the chain is behind the update window's
-                    // "Details" and in the boot journal.
+                    // plain sentence (the update window offers Try again and Copy
+                    // error). An 'alert' toast, not 'error': a failed download is
+                    // a warning to act on, and nothing about it is red.
                     TAURI.core.invoke('install_update').catch((e: unknown) => {
-                        toast.show({ type: 'error', title: 'Update failed', message: toUpdateFailure(e).summary, timeout: 5000 });
+                        toast.show({ type: 'alert', title: 'Couldn\'t update Rillio', message: toUpdateFailure(e).summary, timeout: 5000 });
                     });
                 },
             });

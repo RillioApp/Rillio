@@ -8,7 +8,7 @@ import { Section, Option, Link, SettingsSwitch } from '../components';
 import User from './User';
 import useDataExport from './useDataExport';
 import useUpdateCheck from './useUpdateCheck';
-import UpdateFailureDetails from './UpdateFailureDetails';
+import UpdateFailureNotice from './UpdateFailureNotice';
 
 // CJS require, matching how the rest of the app consumes usePlayUrl (it is an
 // `export =` module).
@@ -167,11 +167,13 @@ const General = forwardRef<HTMLDivElement, Props>(({ profile }: Props, ref) => {
                     </Option>
                     {
                         // Under the row, full width: the row's text column is too
-                        // narrow for a sentence, let alone the chain.
+                        // narrow for a sentence. Try again reruns the step that
+                        // failed.
                         update.status.phase === 'failed' ?
-                            <UpdateFailureDetails
-                                title={update.status.action === 'install' ? 'Couldn\'t install the update' : 'Couldn\'t check for updates'}
+                            <UpdateFailureNotice
+                                title={update.status.action === 'install' ? 'Couldn\'t update Rillio' : 'Couldn\'t check for updates'}
                                 failure={update.status.failure}
+                                onRetry={update.status.action === 'install' ? update.install : update.check}
                             />
                             :
                             null
