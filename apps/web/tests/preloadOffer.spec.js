@@ -65,6 +65,22 @@ describe('next-episode preload offer', () => {
         expect(start).toHaveBeenCalledTimes(1);
     });
 
+    it('the toast\'s Cancel tells the caller once, and only when it cancelled', () => {
+        const toast = fakeToast();
+        const onCancelled = jest.fn();
+        offerPreload({ stream: STREAM, start: jest.fn(), showOffer: toast.show, onCancelled });
+        toast.pressCancel();
+        toast.onCancel();
+        expect(onCancelled).toHaveBeenCalledTimes(1);
+
+        const late = fakeToast();
+        const lateCancelled = jest.fn();
+        offerPreload({ stream: STREAM, start: jest.fn(), showOffer: late.show, onCancelled: lateCancelled });
+        late.close();
+        late.onCancel();
+        expect(lateCancelled).not.toHaveBeenCalled();
+    });
+
     it('a cancel before the close reports that it cancelled', () => {
         const toast = fakeToast();
         const offer = offerPreload({ stream: STREAM, start: jest.fn(), showOffer: toast.show });

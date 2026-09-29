@@ -127,16 +127,35 @@ const toastApi = {
             )
             : (item.title ?? '');
 
+        // onClose fires exactly once, however the toast goes (its action, auto-
+        // close, a dismiss or clear, a swipe), and once it has fired the action
+        // is dead. Sonner keeps a closing toast in the DOM, still clickable,
+        // for its exit animation, so without this an action could run AFTER
+        // the close its caller acted on (the next-episode preload starts its
+        // download on close, and its action is Cancel).
+        let closed = false;
+        const close = () => {
+            if (closed) return;
+            closed = true;
+            invoke('close', item, item.onClose);
+        };
         handle.id = emitter(title, {
             description: item.message,
             duration,
             icon: iconFor(item),
             // An explicit action button must stay clickable above the overlay.
             action: item.action
-                ? { label: item.action.label, onClick: () => { item.action!.onSelect(); invoke('close', item, item.onClose); } }
+                ? {
+                    label: item.action.label,
+                    onClick: () => {
+                        if (closed) return;
+                        item.action!.onSelect();
+                        close();
+                    },
+                }
                 : undefined,
-            onDismiss: () => invoke('close', item, item.onClose),
-            onAutoClose: () => invoke('close', item, item.onClose),
+            onDismiss: close,
+            onAutoClose: close,
         });
         return handle.id;
     },

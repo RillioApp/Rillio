@@ -2,18 +2,19 @@
 
 import React from 'react';
 import useCacheDownload from 'rillio/common/useCacheDownload';
-import useProfile from 'rillio/common/useProfile';
 import useToast from 'rillio/common/Toast/useToast';
-import { notifyCacheChanged } from 'rillio/common/cacheEvents';
-import { serverFetch } from 'rillio/common/serverFetch';
 import { getPreloadPromptEnabled } from 'rillio/common/nextEpisodePreloadPrefs';
+
+// The offer behind the toast (jest-covered in tests/preloadOffer.spec.js).
+const { offerPreload, isActive } = require('./preloadOffer');
 
 // Offers to preload the NEXT episode's torrent into the local cache while the
 // current one plays, so the binge transition starts instantly. The prompt shows
 // twice at most: once at episode start (through initial loading plus the first
 // 30s of playback, whichever lasts longer) and once 10 minutes before the end.
-// Accepting hides the prompt for the rest of the episode, schedules the
-// download behind a short grace timer and shows a toast with a Cancel button
+// Accepting hides the prompt for the rest of the episode and shows a toast
+// with a Cancel button; the download starts only once that toast has CLOSED
+// (see preloadOffer.js), so a cancel never has anything on the server to undo
 // (cancelling aborts for this episode only). Cancel on the prompt itself just
 // hides the currently showing slot, nothing persisted: the T-minus-10min
 // reminder can still appear later in the same episode, and the next episode
@@ -24,11 +25,9 @@ import { getPreloadPromptEnabled } from 'rillio/common/nextEpisodePreloadPrefs';
 // The start prompt stays up through initial loading plus this long into
 // playback, whichever lasts longer.
 const START_PROMPT_PLAYBACK_MS = 30000;
-// Accepting schedules the download behind this grace delay; cancelling from
-// the toast within it means the download never starts, no cache churn at all.
-const ACCEPT_GRACE_MS = 3000;
-// The cancel toast outlives the grace window so a late click can still
-// best-effort pause an already-started download.
+// How long the offer toast (and its Cancel) stays up before the download
+// starts. Sonner holds it longer while the pointer is over it; the download
+// waits for the actual close either way.
 const CANCEL_TOAST_TIMEOUT_MS = 6000;
 // The reminder prompt appears this close to the end of the episode.
 const END_PROMPT_REMAINING_MS = 10 * 60 * 1000;
@@ -39,15 +38,6 @@ const PAUSED_START_TTL_MS = 30 * 60 * 1000;
 type PendingPausedStart = {
     videoId: string;
     expiresAt: number;
-};
-
-type AcceptedDownload = {
-    infoHash: string | null;
-    started: boolean;
-    // Was this torrent already in the cache before we touched it? Cancel deletes
-    // what the preload CREATED, so it must never delete a copy the user already
-    // had. Defaults true: until the check answers, cancel takes the safe path.
-    preExisting: boolean;
 };
 
 type UseNextEpisodePreloadArgs = {
@@ -75,7 +65,6 @@ const readPendingPausedStart = (): PendingPausedStart | null => {
 
 const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => {
     const toast = useToast();
-    const profile = useProfile();
     const downloadToCache = useCacheDownload();
 
     const currentVideoId = player.selected?.streamRequest?.path?.id ?? null;
@@ -101,10 +90,9 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
     // the cancelled prompt would reappear on the next tick, inEndWindow stays
     // true for the remaining minutes. Episode-scoped, reset on a new episode.
     const [endWindowDismissed, setEndWindowDismissed] = React.useState(false);
-    // The scheduled download: the grace timer plus what it needs to start (and
-    // what a late cancel needs to stop). null = nothing accepted/pending.
-    const acceptTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-    const acceptedDownload = React.useRef<AcceptedDownload | null>(null);
+    // The accepted preload: waiting behind its toast, started, cancelled or
+    // dropped (see preloadOffer.js). null = nothing accepted this episode.
+    const offerRef = React.useRef<any>(null);
     const [startWindowOpen, setStartWindowOpen] = React.useState(true);
     const startHideTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     // Guards the paused-start against a stale loaded=true from the PREVIOUS
@@ -119,11 +107,19 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
         }
     };
 
-    const clearAcceptTimer = () => {
-        if (acceptTimer.current !== null) {
-            clearTimeout(acceptTimer.current);
-            acceptTimer.current = null;
-        }
+    // An offer still waiting behind its toast when the episode changes or the
+    // player unmounts is DROPPED, not carried over: it was for the episode
+    // after the one playing then, which is no longer "next" (and after an
+    // auto-next it is the one now playing, which the player fetches anyway).
+    // Dropped before its toast is removed, because that removal fires the
+    // close that would otherwise start it. A preload that already started is
+    // left alone: it is an ordinary pinned download by then.
+    const dropOffer = () => {
+        const offer = offerRef.current;
+        offerRef.current = null;
+        if (offer === null || offer.state !== 'waiting') return;
+        offer.drop();
+        if (offer.toastId !== null) toast.remove(offer.toastId);
     };
 
     // A new episode gets a fresh prompt evaluation.
@@ -133,14 +129,13 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
         setEndWindowDismissed(false);
         setStartWindowOpen(true);
         sawUnloaded.current = false;
-        acceptedDownload.current = null;
+        dropOffer();
         clearStartHideTimer();
-        clearAcceptTimer();
     }, [currentVideoId]);
 
     React.useEffect(() => () => {
         clearStartHideTimer();
-        clearAcceptTimer();
+        dropOffer();
     }, []);
 
     // The start window closes 30s after playback becomes possible (loaded), so
@@ -210,129 +205,48 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
     const promptVisible = eligible && !answered &&
         (startWindowOpen || (inEndWindow && !endWindowDismissed));
 
-    // Cancel from the toast. Before the grace timer fires: just clear it, the
-    // download never starts. After: undo it on the server. Either way disarm the
-    // accepted state and the paused-start handoff; no re-prompt this episode
-    // (answered stays true).
-    //
-    // Undo means DELETE, not pause. Pausing left the entry (and its full-size
-    // preallocated file - 9 GB for a 4K episode) sitting in the cache forever,
-    // and worse, librqbit refuses to pause a torrent that is still hash-checking,
-    // which is exactly where a cancel lands seconds after the download starts: it
-    // did nothing at all. Delete stops the torrent AND reclaims the file.
-    //
-    // The exception is a torrent the user ALREADY had cached, which the preload
-    // merely unpaused/pinned: deleting that would destroy their copy over a
-    // toast click. Undo only our own change there.
-    const cancelPreload = React.useCallback(() => {
-        // Disarming is synchronous either way; the confirmation is not. The undo
-        // is a server round-trip that can be REFUSED (librqbit will not pause a
-        // torrent still hash-checking - it answers 409), so "Preload cancelled"
-        // must be tied to the outcome. Showing it unconditionally, as this used
-        // to, paired a green "cancelled" with the red "could not cancel" for one
-        // click while the download in fact kept running.
-        const cancelled = () => toast.show({ type: 'success', title: 'Preload cancelled', timeout: 3000 });
-        const started = acceptedDownload.current !== null && acceptedDownload.current.started;
-        const serverUrl = profile.settings.streamingServerUrl;
-        const undo = started ? { ...acceptedDownload.current! } : null;
-
-        acceptedDownload.current = null;
-        setAccepted(false);
-        pendingPausedStart = null;
-
-        if (acceptTimer.current !== null) {
-            // Before the grace timer fires nothing started, so the cancel is clean
-            // and instant.
-            clearAcceptTimer();
-            cancelled();
-            return;
-        }
-        if (undo === null || typeof serverUrl !== 'string') {
-            cancelled();
-            return;
-        }
-        const path = undo.preExisting ? 'cache/pause' : 'cache/delete';
-        const body = undo.preExisting ? { infoHash: undo.infoHash, paused: true } : { infoHash: undo.infoHash };
-        serverFetch(new URL(path, serverUrl), {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-        })
-            .then((resp) => {
-                if (!resp.ok) {
-                    throw new Error(`${path} responded ${resp.status}`);
-                }
-                // Undone: confirm, and drop the top-nav dot now rather than on its
-                // next lazy tick.
-                notifyCacheChanged();
-                cancelled();
-            })
-            .catch((error) => {
-                // The undo was refused/unreachable - do NOT claim it was cancelled.
-                console.error(`useNextEpisodePreload: ${path} failed`, error);
-                toast.show({
-                    type: 'error',
-                    title: 'Could not cancel the preload',
-                    message: 'It may still be downloading; the Cache page can stop it.',
-                    timeout: 4000,
-                });
-            });
-    }, [profile.settings.streamingServerUrl, toast]);
-
     // Accept hides the prompt immediately (answered silences both prompt
-    // slots), arms the accepted state, schedules the actual download behind a
-    // short grace delay and offers a toast with a Cancel button in its place.
+    // slots), arms the accepted state and offers a toast with a Cancel button.
+    // The download starts when that toast CLOSES without Cancel (auto-close, a
+    // dismiss, a swipe, another caller clearing toasts): from then on Cancel
+    // can no longer be pressed (the toast adapter kills its action once the
+    // toast closes). So Cancel only ever withdraws an offer nothing has acted
+    // on yet: local, synchronous, no request, and "Preload cancelled" is always
+    // true. A second accept while one waits or runs is ignored.
     const accept = React.useCallback(() => {
+        if (isActive(offerRef.current)) {
+            return;
+        }
         setAnswered(true);
         setAccepted(true);
-        const stream = nextStream;
-        const infoHash = stream !== null ? stream.infoHash ?? null : null;
-        // preExisting starts TRUE so a cancel racing this check pauses rather than
-        // deletes: the wrong guess must never be the destructive one.
-        acceptedDownload.current = { infoHash, started: false, preExisting: true };
-        // Does the user already have this cached? Cancel deletes what the preload
-        // created and must not touch anything older, so settle that BEFORE we add
-        // it ourselves - the grace delay below is exactly the room this needs.
-        const serverUrl = profile.settings.streamingServerUrl;
-        if (typeof serverUrl === 'string' && infoHash !== null) {
-            serverFetch(new URL('cache/list', serverUrl))
-                .then((resp) => {
-                    if (!resp.ok) throw new Error(`cache/list responded ${resp.status}`);
-                    return resp.json();
-                })
-                .then((list: { infoHash: string }[]) => {
-                    if (acceptedDownload.current === null || acceptedDownload.current.infoHash !== infoHash) return;
-                    acceptedDownload.current.preExisting = Array.isArray(list) &&
-                        list.some((entry) => entry.infoHash === infoHash);
-                })
-                // Unknown: keep the safe default rather than risk deleting a copy
-                // that might not be ours.
-                .catch((error) => console.error('useNextEpisodePreload: cache/list failed', error));
-        }
-        clearAcceptTimer();
-        acceptTimer.current = setTimeout(() => {
-            acceptTimer.current = null;
+        offerRef.current = offerPreload({
+            stream: nextStream,
             // useCacheDownload POSTs { infoHash, fileIdx } to /cache/download and
             // pins the torrent; it owns the started/failed toasts.
-            const started = downloadToCache(stream);
-            if (!started) {
-                // Should be unreachable: the prompt only shows for a torrent stream.
-                // useCacheDownload raises its own error toast, so this stays a log.
-                console.error('useNextEpisodePreload: accepted but the next stream is not downloadable', stream);
-                return;
-            }
-            if (acceptedDownload.current !== null) {
-                acceptedDownload.current.started = true;
-            }
-        }, ACCEPT_GRACE_MS);
-        toast.show({
-            type: 'success',
-            title: 'Preloading next episode',
-            message: 'Starting in a moment.',
-            timeout: CANCEL_TOAST_TIMEOUT_MS,
-            action: { label: 'Cancel', onSelect: cancelPreload },
+            start: (stream: Stream) => {
+                if (!downloadToCache(stream)) {
+                    // Should be unreachable: the prompt only shows for a torrent
+                    // stream. useCacheDownload raises its own error toast.
+                    console.error('useNextEpisodePreload: accepted but the next stream is not downloadable', stream);
+                }
+            },
+            showOffer: ({ onCancel, onClose }: { onCancel: () => void; onClose: () => void }) => toast.show({
+                type: 'success',
+                title: 'Preloading next episode',
+                message: 'Starting in a few seconds.',
+                timeout: CANCEL_TOAST_TIMEOUT_MS,
+                action: { label: 'Cancel', onSelect: onCancel },
+                onClose,
+            }),
+            // Nothing was sent, so there is nothing to undo: disarm and say so.
+            // No re-prompt this episode (answered stays true).
+            onCancelled: () => {
+                setAccepted(false);
+                pendingPausedStart = null;
+                toast.show({ type: 'success', title: 'Preload cancelled', timeout: 3000 });
+            },
         });
-    }, [nextStream, downloadToCache, cancelPreload, profile.settings.streamingServerUrl, toast]);
+    }, [nextStream, downloadToCache, toast]);
 
     // Cancel from the prompt: just hide whatever slot is currently showing,
     // nothing persisted. Closing the start window early never blocks the
@@ -348,8 +262,13 @@ const useNextEpisodePreload = ({ player, video }: UseNextEpisodePreloadArgs) => 
     }, [inEndWindow]);
 
     // Called by Player.onEnded right before navigating to the next episode when
-    // the preload was accepted, so THAT load starts paused.
+    // the preload was accepted, so THAT load starts paused. Only a preload that
+    // actually started: one still waiting behind its toast is dropped by the
+    // episode change, so nothing is "ready" to announce.
     const armPausedStart = React.useCallback(() => {
+        if (offerRef.current === null || offerRef.current.state !== 'started') {
+            return;
+        }
         if (player.nextVideo !== null && typeof player.nextVideo.id === 'string') {
             pendingPausedStart = {
                 videoId: player.nextVideo.id,
