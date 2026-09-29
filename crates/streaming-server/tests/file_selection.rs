@@ -433,6 +433,32 @@ async fn concurrent_plays_of_different_files_all_stay_selected() {
     );
 }
 
+/// A torrent with nothing selected (a browsed pack, or one whose last file the
+/// Cache page dropped) is cached, downloading nothing: never "complete", never
+/// an error, and its per-file stats still describe the file.
+#[tokio::test]
+async fn an_empty_selection_is_neither_complete_nor_an_error() {
+    let s = spawn("empty-selection-stats").await;
+    let ih = s.create(&season_pack()).await;
+    s.wait_ready(&ih).await;
+    assert_eq!(s.selected(&ih).await, vec![false, false, false]);
+
+    let entry = s.entry(&ih).await;
+    assert_eq!(entry["total"], 0, "{entry}");
+    assert_eq!(entry["downloaded"], 0, "{entry}");
+    assert_eq!(entry["fileCount"], 0, "{entry}");
+    assert!(entry.get("fileIdx").is_none(), "no file to play: {entry}");
+    assert!(entry.get("error").is_none(), "{entry}");
+    assert_ne!(entry["state"], "error", "{entry}");
+
+    let stats: Value =
+        s.c.get(format!("{}/{ih}/1/stats.json", s.base)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(stats["streamLen"], (2 * PIECE) as u64, "{stats}");
+    assert_eq!(stats["streamProgress"], 0.0, "{stats}");
+    assert_ne!(stats["engineState"], "error", "{stats}");
+    assert!(stats["engineError"].is_null(), "{stats}");
+}
+
 /// An index that does not exist fails the stream and leaves the selection
 /// alone (it must not fall back to selecting anything).
 #[tokio::test]

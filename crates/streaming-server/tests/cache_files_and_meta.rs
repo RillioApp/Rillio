@@ -147,27 +147,23 @@ async fn a_file_can_be_dropped_from_and_added_back_to_the_selection() {
     assert!(files(&c, &base, &ih).await.iter().all(|f| f["selected"] == true));
 }
 
+/// Nothing selected is a real state (a browsed season pack is added that way),
+/// so dropping the last file is allowed: the torrent stays cached, downloading
+/// nothing, and its file browser can pick files again.
 #[tokio::test]
-async fn deselecting_the_last_file_is_refused() {
+async fn deselecting_the_last_file_leaves_the_torrent_downloading_nothing() {
     let (base, c, _dir) = spawn("lastfile").await;
     let ih = add(&c, &base, make_multi_torrent("Solo", &[("only.mkv", 5_000)])).await;
     wait_ready(&c, &base).await;
+    select(&c, &base, &ih, 0, true).await;
+    assert_eq!(files(&c, &base, &ih).await[0]["selected"], true);
 
-    let resp = c
-        .post(format!("{base}/cache/select"))
-        .json(&serde_json::json!({ "infoHash": ih, "fileIdx": 0, "selected": false }))
-        .send()
-        .await
-        .unwrap();
-    // 409, not a silent success: a torrent downloading nothing is not a state
-    // the UI should be able to reach by accident (delete is the honest path).
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(status, reqwest::StatusCode::CONFLICT);
-    // ...and for THAT reason, not because the torrent happened to be busy: this
-    // assertion is what keeps the test from passing on librqbit's unrelated
-    // "can't update initializing torrent" refusal.
-    assert!(body.contains("at least one selected file"), "unexpected refusal: {body}");
+    select(&c, &base, &ih, 0, false).await;
+    assert_eq!(files(&c, &base, &ih).await[0]["selected"], false);
+    assert_eq!(only_entry(&c, &base).await["total"], 0, "nothing selected, nothing to download");
+
+    // ...and back.
+    select(&c, &base, &ih, 0, true).await;
     assert_eq!(files(&c, &base, &ih).await[0]["selected"], true);
 }
 
