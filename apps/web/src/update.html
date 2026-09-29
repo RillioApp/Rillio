@@ -40,7 +40,10 @@
         #fill.indeterminate { width: 42%; animation: slide 1.15s ease-in-out infinite; }
         @keyframes slide { 0% { margin-left: -42%; } 100% { margin-left: 100%; } }
         #status { margin-top: 12px; font-size: 12.5px; color: rgba(255, 255, 255, 0.55); font-variant-numeric: tabular-nums; min-height: 16px; text-align: center; }
-        #status.error { color: #ff6b6b; }
+        /* The error is the full cause chain ("error sending request for url
+           (https://...): ...: connection reset (os error 10054)"): the URL is
+           one unbreakable token wider than the window, so let it break. */
+        #status.error { color: #ff6b6b; overflow-wrap: anywhere; line-height: 1.45; }
         #note { position: absolute; bottom: 18px; left: 0; right: 0; text-align: center; font-size: 11.5px; color: rgba(255, 255, 255, 0.32); }
         #drag { position: fixed; inset: 0; }
         .fg, #note { pointer-events: none; }
@@ -251,6 +254,10 @@
         });
 
         // ---- #demo: self-driven simulated run (design preview + verification) ----
+        // #demo-error shows the failed state with a real-shaped cause chain.
+        if (location.hash === '#demo-error') {
+            window.__updateState({ phase: 'error', message: 'error sending request for url (https://github.com/RillioApp/Rillio/releases/download/v0.1.45/Rillio_0.1.45_x64-setup.exe): client error (SendRequest): connection error: An existing connection was forcibly closed by the remote host. (os error 10054)' });
+        }
         if (location.hash === '#demo') {
             (function () {
                 var total = 48 * 1048576, downloaded = 0, sp = 2.4e6;

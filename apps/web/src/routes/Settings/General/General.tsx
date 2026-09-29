@@ -159,7 +159,17 @@ const General = forwardRef<HTMLDivElement, Props>(({ profile }: Props, ref) => {
                                 {
                                     update.status.phase === 'available' ? `Rillio ${update.status.version} is available` :
                                         update.status.phase === 'up-to-date' ? `Rillio ${appVersion} is up to date` :
-                                            update.status.phase === 'failed' ? <span className="text-danger">Could not check for updates</span> :
+                                            update.status.phase === 'failed' ?
+                                                <>
+                                                    <span className="text-danger">
+                                                        {update.status.action === 'install' ? 'Could not install the update' : 'Could not check for updates'}
+                                                    </span>
+                                                    {/* The cause, not just the headline: the shell sends the
+                                                        full chain (reset, DNS, TLS, timeout). Its URL is one
+                                                        long token, so it has to be allowed to break. */}
+                                                    <div className="mt-1 break-words text-xs">{update.status.message}</div>
+                                                </>
+                                                :
                                                 `Version ${appVersion}`
                                 }
                             </div>
