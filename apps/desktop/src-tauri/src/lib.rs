@@ -5,7 +5,6 @@
 //! web client reaches it at http://127.0.0.1:11470 exactly as before.
 
 mod autosync;
-#[cfg(not(target_os = "android"))]
 mod error_chain;
 pub mod mpv;
 pub mod platform;
@@ -902,7 +901,7 @@ fn spawn_update_check(app: tauri::AppHandle) {
 /// that the check itself failed (offline, no release yet), otherwise "nothing
 /// happened" reads as "up to date".
 #[tauri::command]
-async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, error_chain::UpdateFailure> {
     // Same shape as install_update: one entry in the handler list, desktop-only
     // body (Android takes updates from the app store).
     #[cfg(not(desktop))]
@@ -912,21 +911,24 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, Strin
     }
     #[cfg(desktop)]
     {
+        use error_chain::Stage;
         use tauri_plugin_updater::UpdaterExt;
 
         let update = app
             .updater()
-            .map_err(|e| update_failure(&app, "check", &e))?
+            .map_err(|e| update_failure(&app, Stage::Check, &e))?
             .check()
             .await
-            .map_err(|e| update_failure(&app, "check", &e))?;
+            .map_err(|e| update_failure(&app, Stage::Check, &e))?;
         Ok(update.map(|update| update.version.clone()))
     }
 }
 
-/// Record an update failure in full and return the text to show for it.
+/// Record an update failure in full and return what to show for it: a plain
+/// sentence for its kind, and the chain for "Details" (error_chain::
+/// UpdateFailure, the one shape both the update window and the web get).
 ///
-/// Both carry the whole cause chain (see error_chain): the top-level Display
+/// The log carries the whole cause chain (see error_chain): the top-level Display
 /// of the updater's reqwest error is just "error sending request for url
 /// (...)", which is what the 0.1.44 -> 0.1.45 failure showed, with the reason
 /// (reset, DNS, TLS, timeout) cut off. And tracing alone is not a log FILE: a
@@ -935,14 +937,19 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, Strin
 /// boot-journal.log`) is the shell's one on-disk log, and already holds the
 /// `update-handoff` line, so the failure goes there too.
 #[cfg(desktop)]
-fn update_failure<E: std::error::Error + ?Sized>(app: &tauri::AppHandle, stage: &str, err: &E) -> String {
-    let chain = error_chain::error_chain(err);
-    tracing::error!("update: {stage} failed: {chain}");
+fn update_failure(
+    app: &tauri::AppHandle,
+    stage: error_chain::Stage,
+    err: &(dyn std::error::Error + 'static),
+) -> error_chain::UpdateFailure {
+    let failure = error_chain::UpdateFailure::from_error(stage, err);
+    let (label, chain) = (stage.label(), &failure.message);
+    tracing::error!("update: {label} failed ({:?}): {chain}", failure.kind);
     boot_journal_append(
         &app.config().identifier,
-        &format!("update-failed stage={stage} error={chain:?}"),
+        &format!("update-failed stage={label} error={chain:?}"),
     );
-    chain
+    failure
 }
 
 /// Download, verify (minisign) and install the pending update, then relaunch.
@@ -966,26 +973,37 @@ fn update_failure<E: std::error::Error + ?Sized>(app: &tauri::AppHandle, stage: 
 /// releases the Local Storage lock, and only then hand off to the installer.
 /// The webview must never be alive when the process exits for an update.
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::UpdateFailure> {
     // Stays in the invoke_handler list on every target (the generate_handler
     // macro can't cfg an entry), but the body is desktop-only: Android takes
     // updates from the app store, so the web toast is never wired there.
     #[cfg(not(desktop))]
     {
         let _ = app;
-        return Err("in-app updates are unavailable on this platform".into());
+        return Err(error_chain::UpdateFailure::plain(
+            error_chain::Stage::Install,
+            "In-app updates aren't available on this device.",
+            "in-app updates are unavailable on this platform",
+        ));
     }
     #[cfg(desktop)]
     {
+    use error_chain::Stage;
     use tauri_plugin_updater::UpdaterExt;
 
     let update = app
         .updater()
-        .map_err(|e| update_failure(&app, "install-check", &e))?
+        .map_err(|e| update_failure(&app, Stage::InstallCheck, &e))?
         .check()
         .await
-        .map_err(|e| update_failure(&app, "install-check", &e))?
-        .ok_or_else(|| "no update available".to_string())?;
+        .map_err(|e| update_failure(&app, Stage::InstallCheck, &e))?
+        .ok_or_else(|| {
+            error_chain::UpdateFailure::plain(
+                Stage::InstallCheck,
+                "There's no update to install.",
+                "no update available",
+            )
+        })?;
 
     // The custom update window (docs/update-window): a detached process that
     // shows the liquid progress page through download AND install (this process
@@ -997,7 +1015,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
         phase: "downloading".into(),
         downloaded: 0,
         total: 0,
-        message: None,
+        failure: None,
     });
     update_window::spawn_update_window();
     if let Some(window) = app.get_webview_window("main") {
@@ -1020,7 +1038,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
                         phase: "downloading".into(),
                         downloaded,
                         total: content_len.unwrap_or(0),
-                        message: None,
+                        failure: None,
                     });
                 }
             },
@@ -1033,25 +1051,25 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
             // Failed download: tell the update window (it shows the error and
             // exits), bring the main window back, and surface the error to the
             // web UI's toast as before.
-            let message = update_failure(&app, "download", &e);
+            let failure = update_failure(&app, Stage::Download, &e);
             update_window::write_progress(&update_window::UpdateProgress {
                 phase: "error".into(),
                 downloaded: 0,
                 total: 0,
-                message: Some(message.clone()),
+                failure: Some(failure.clone()),
             });
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-            return Err(message);
+            return Err(failure);
         }
     };
     update_window::write_progress(&update_window::UpdateProgress {
         phase: "installing".into(),
         downloaded: 0,
         total: 0,
-        message: None,
+        failure: None,
     });
 
     // From here on the webview goes away, so this command's JS response will
@@ -1100,13 +1118,13 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
         // a headless zombie. Tell the update window, then restart the (still
         // old) app; the update toast will re-offer the update on next launch
         // (whose boot also deletes the progress file).
-        let message = update_failure(&app, "install", &e);
+        let failure = update_failure(&app, Stage::Install, &e);
         tracing::error!("update: relaunching the current version after the failed install");
         update_window::write_progress(&update_window::UpdateProgress {
             phase: "error".into(),
             downloaded: 0,
             total: 0,
-            message: Some(format!("Install failed: {message}")),
+            failure: Some(failure),
         });
         app.restart();
     }

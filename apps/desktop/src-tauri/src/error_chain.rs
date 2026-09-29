@@ -7,6 +7,12 @@
 //! failure (2026-09-29) reached the screen as exactly that top line, which told
 //! neither the user nor us anything. Every error the shell shows or logs for a
 //! network or update failure goes through [`error_chain`].
+//!
+//! The screen leads with a plain sentence instead of the chain ([`classify`],
+//! [`summary`], carried by [`UpdateFailure`]), and keeps the chain behind
+//! "Details". Android has no in-app updater: only the platform refusal is
+//! built there.
+#![cfg_attr(target_os = "android", allow(dead_code))]
 
 /// `err` followed by every `source()` below it, joined with ": ", e.g.
 /// "error sending request for url (https://...): client error (Connect): tcp
@@ -34,6 +40,166 @@ pub fn error_chain<E: std::error::Error + ?Sized>(err: &E) -> String {
         source = cause.source();
     }
     out
+}
+
+/// What went wrong, as far as the chain PROVES it. The screen leads with a
+/// plain sentence for this (see [`summary`]); the chain stays one click away.
+///
+/// Classified here, on typed errors, rather than by matching text in the page:
+/// the shell can see `io::ErrorKind`, raw Windows socket codes and rustls'
+/// error type, the page only sees prose. Unknown is [`FailureKind::Other`],
+/// never a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureKind {
+    Reset,
+    Dns,
+    Refused,
+    Timeout,
+    Tls,
+    Other,
+}
+
+/// Which step of an update failed. Serialized (kebab-case) as the journal's
+/// `stage=` label and sent to the page, which words its footer from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stage {
+    /// Settings -> "Check for updates".
+    Check,
+    /// The re-check `install_update` runs before downloading.
+    InstallCheck,
+    Download,
+    /// Handing the downloaded installer to the OS, or the installer itself.
+    Install,
+}
+
+impl Stage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Check => "check",
+            Stage::InstallCheck => "install-check",
+            Stage::Download => "download",
+            Stage::Install => "install",
+        }
+    }
+}
+
+/// The classification table: the innermost layer that says something wins,
+/// because the innermost layer is the cause.
+pub fn classify(err: &(dyn std::error::Error + 'static)) -> FailureKind {
+    let mut found = None;
+    let mut layer = Some(err);
+    let mut depth = 0;
+    while let Some(cause) = layer {
+        depth += 1;
+        if depth > 32 {
+            break;
+        }
+        if let Some(kind) = classify_layer(cause) {
+            found = Some(kind);
+        }
+        layer = cause.source();
+    }
+    found.unwrap_or(FailureKind::Other)
+}
+
+/// One layer, by type. Only facts the error itself carries:
+/// - `io::Error`: the raw Windows socket code first (WSAECONNRESET 10054,
+///   WSAECONNABORTED 10053, WSAHOST_NOT_FOUND 11001 and its getaddrinfo
+///   siblings 11002-11004, WSAECONNREFUSED 10061, WSAETIMEDOUT 10060), then
+///   the portable `ErrorKind`. An io::Error that wraps a rustls error (how
+///   tokio-rustls reports a failed handshake) is TLS. The inner error is
+///   checked through `get_ref`, because io::Error's `source()` skips it.
+/// - `rustls::Error` on its own layer: TLS.
+/// - reqwest's own timeout is a private type (`reqwest::error::TimedOut`),
+///   the one layer that can only be recognised by its exact text.
+fn classify_layer(err: &(dyn std::error::Error + 'static)) -> Option<FailureKind> {
+    #[cfg(not(target_os = "android"))]
+    if err.downcast_ref::<rustls::Error>().is_some() {
+        return Some(FailureKind::Tls);
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        // io::Errors nest (the updater's TLS failure arrives as
+        // io(Other, io(InvalidData, rustls::Error)), probe `tls_failure`), and
+        // io::Error's `source()` skips the wrapped error, so descend through
+        // `get_ref` by hand.
+        let mut stack = vec![io];
+        while let Some(inner) = stack.last().and_then(|io| io.get_ref()) {
+            #[cfg(not(target_os = "android"))]
+            if inner.downcast_ref::<rustls::Error>().is_some() {
+                return Some(FailureKind::Tls);
+            }
+            match inner.downcast_ref::<std::io::Error>() {
+                Some(nested) if stack.len() < 8 => stack.push(nested),
+                _ => break,
+            }
+        }
+        // Innermost first: it is the cause.
+        return stack.iter().rev().find_map(|io| classify_io(io));
+    }
+    if err.to_string() == "operation timed out" {
+        return Some(FailureKind::Timeout);
+    }
+    None
+}
+
+fn classify_io(io: &std::io::Error) -> Option<FailureKind> {
+    match io.raw_os_error() {
+        Some(10054) | Some(10053) => return Some(FailureKind::Reset),
+        Some(11001..=11004) => return Some(FailureKind::Dns),
+        Some(10061) => return Some(FailureKind::Refused),
+        Some(10060) => return Some(FailureKind::Timeout),
+        _ => {}
+    }
+    match io.kind() {
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => Some(FailureKind::Reset),
+        std::io::ErrorKind::ConnectionRefused => Some(FailureKind::Refused),
+        std::io::ErrorKind::TimedOut => Some(FailureKind::Timeout),
+        _ => None,
+    }
+}
+
+/// The sentence the screen leads with. Plain and true: a kind the chain did
+/// not prove gets the generic line for its stage.
+pub fn summary(kind: FailureKind, stage: Stage) -> &'static str {
+    match stage {
+        Stage::Install => "The update couldn't be installed.",
+        Stage::Check | Stage::InstallCheck | Stage::Download => match kind {
+            FailureKind::Reset => "The connection to GitHub was interrupted.",
+            FailureKind::Dns => "Couldn't find GitHub. Check your internet connection.",
+            FailureKind::Refused => "GitHub refused the connection.",
+            FailureKind::Tls => "A secure connection to GitHub couldn't be made.",
+            FailureKind::Timeout if stage == Stage::Download => "The download timed out.",
+            FailureKind::Timeout => "The update check timed out.",
+            FailureKind::Other if stage == Stage::Download => "The download didn't finish.",
+            FailureKind::Other => "The update check didn't finish.",
+        },
+    }
+}
+
+/// One update failure as both the update window and the web layer get it:
+/// the plain sentence, the kind behind it, and the full chain for "Details".
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct UpdateFailure {
+    pub stage: Stage,
+    pub kind: FailureKind,
+    pub summary: String,
+    /// The full cause chain (see [`error_chain`]).
+    pub message: String,
+}
+
+impl UpdateFailure {
+    pub fn from_error(stage: Stage, err: &(dyn std::error::Error + 'static)) -> Self {
+        let kind = classify(err);
+        UpdateFailure { stage, kind, summary: summary(kind, stage).into(), message: error_chain(err) }
+    }
+
+    /// A failure that is not an error value (nothing to install, no updater
+    /// on this platform, an installer that never finished).
+    pub fn plain(stage: Stage, summary: &str, message: impl Into<String>) -> Self {
+        UpdateFailure { stage, kind: FailureKind::Other, summary: summary.into(), message: message.into() }
+    }
 }
 
 #[cfg(test)]
@@ -118,15 +284,102 @@ mod tests {
         assert_eq!(error_chain(&err), "tls handshake eof: connection reset by peer");
     }
 
+    use super::{classify, summary, FailureKind, Stage, UpdateFailure};
+
+    fn wrapped(cause: impl std::error::Error + Send + Sync + 'static) -> Wrapper {
+        Wrapper { what: "error sending request for url (https://example.test/x.exe)", cause: Box::new(cause) }
+    }
+    fn os(code: i32) -> Wrapper {
+        wrapped(std::io::Error::from_raw_os_error(code))
+    }
+    fn io_kind(kind: std::io::ErrorKind) -> Wrapper {
+        wrapped(std::io::Error::new(kind, "x"))
+    }
+
+    #[test]
+    fn classifies_each_kind() {
+        use std::io::ErrorKind as K;
+        assert_eq!(classify(&os(10054)), FailureKind::Reset);
+        assert_eq!(classify(&os(10053)), FailureKind::Reset);
+        assert_eq!(classify(&io_kind(K::ConnectionReset)), FailureKind::Reset);
+        assert_eq!(classify(&io_kind(K::ConnectionAborted)), FailureKind::Reset);
+        assert_eq!(classify(&os(11001)), FailureKind::Dns);
+        assert_eq!(classify(&os(11004)), FailureKind::Dns);
+        assert_eq!(classify(&os(10061)), FailureKind::Refused);
+        assert_eq!(classify(&io_kind(K::ConnectionRefused)), FailureKind::Refused);
+        assert_eq!(classify(&os(10060)), FailureKind::Timeout);
+        assert_eq!(classify(&io_kind(K::TimedOut)), FailureKind::Timeout);
+        // reqwest's private TimedOut, recognised by its exact text.
+        let timed_out = Wrapper { what: "operation timed out", cause: Box::new(std::fmt::Error) };
+        assert_eq!(classify(&wrapped(timed_out)), FailureKind::Timeout);
+        // tokio-rustls reports a failed handshake as io::Error(InvalidData, rustls::Error).
+        let tls = std::io::Error::new(K::InvalidData, rustls::Error::General("bad record".into()));
+        assert_eq!(classify(&wrapped(tls)), FailureKind::Tls);
+        // ...and hyper-util wraps that in another io::Error (seen in the
+        // tls_failure probe): io(Other, io(InvalidData, rustls::Error)).
+        let inner = std::io::Error::new(K::InvalidData, rustls::Error::General("bad record".into()));
+        assert_eq!(classify(&wrapped(std::io::Error::new(K::Other, inner))), FailureKind::Tls);
+        let nested_reset = std::io::Error::new(K::Other, std::io::Error::from_raw_os_error(10054));
+        assert_eq!(classify(&wrapped(nested_reset)), FailureKind::Reset);
+        assert_eq!(classify(&wrapped(rustls::Error::General("bad cert".into()))), FailureKind::Tls);
+    }
+
+    #[test]
+    fn unknown_is_other_never_a_guess() {
+        assert_eq!(classify(&io_kind(std::io::ErrorKind::Other)), FailureKind::Other);
+        assert_eq!(classify(&io_kind(std::io::ErrorKind::InvalidData)), FailureKind::Other);
+        // hyper's "server closed early" names no socket error: not a reset.
+        let early = Wrapper { what: "connection closed before message completed", cause: Box::new(std::fmt::Error) };
+        assert_eq!(classify(&wrapped(early)), FailureKind::Other);
+        assert_eq!(classify(&std::io::Error::other("disk full")), FailureKind::Other);
+        assert_eq!(summary(FailureKind::Other, Stage::Download), "The download didn't finish.");
+    }
+
+    #[test]
+    fn the_innermost_cause_wins() {
+        let outer_timeout = Wrapper { what: "operation timed out", cause: Box::new(std::io::Error::from_raw_os_error(10054)) };
+        assert_eq!(classify(&wrapped(outer_timeout)), FailureKind::Reset);
+    }
+
+    #[test]
+    fn summaries_are_the_agreed_sentences() {
+        let d = Stage::Download;
+        assert_eq!(summary(FailureKind::Reset, d), "The connection to GitHub was interrupted.");
+        assert_eq!(summary(FailureKind::Dns, d), "Couldn't find GitHub. Check your internet connection.");
+        assert_eq!(summary(FailureKind::Refused, d), "GitHub refused the connection.");
+        assert_eq!(summary(FailureKind::Timeout, d), "The download timed out.");
+        assert_eq!(summary(FailureKind::Tls, d), "A secure connection to GitHub couldn't be made.");
+        assert_eq!(summary(FailureKind::Other, d), "The download didn't finish.");
+        // A check never downloaded anything, so it never says "download".
+        assert_eq!(summary(FailureKind::Timeout, Stage::Check), "The update check timed out.");
+        assert_eq!(summary(FailureKind::Other, Stage::InstallCheck), "The update check didn't finish.");
+        // The installer is not the network: no network sentence, whatever the kind.
+        assert_eq!(summary(FailureKind::Reset, Stage::Install), "The update couldn't be installed.");
+    }
+
+    #[test]
+    fn the_failure_serializes_for_the_page_and_the_web() {
+        let failure = UpdateFailure::from_error(Stage::InstallCheck, &os(10054));
+        let json = serde_json::to_value(&failure).unwrap();
+        assert_eq!(json["stage"], "install-check");
+        assert_eq!(json["kind"], "reset");
+        assert_eq!(json["summary"], "The connection to GitHub was interrupted.");
+        assert!(json["message"].as_str().unwrap().starts_with("error sending request for url (https://example.test/x.exe): "));
+    }
+
     /// Real network failures through reqwest, wrapped the way the updater
     /// plugin wraps them. Ignored by default (they touch the resolver and the
     /// loopback stack, which is flaky on the dev box); run with
     /// `cargo test error_chain -- --ignored --nocapture` to print the chains.
     #[cfg(not(target_os = "android"))]
     mod probes {
-        use super::super::error_chain;
+        use super::super::{classify, error_chain, FailureKind};
 
-        fn fetch(url: &str) -> String {
+        fn fetch(url: &str) -> (String, FailureKind) {
+            fetch_with(url, std::time::Duration::from_secs(20))
+        }
+
+        fn fetch_with(url: &str, timeout: std::time::Duration) -> (String, FailureKind) {
             // What tauri-plugin-updater's check() does before its first
             // request (its reqwest is built with `rustls-no-provider`).
             if rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -136,17 +389,19 @@ mod tests {
             rt.block_on(async {
                 // reqwest 0.13, the updater's (see Cargo.toml dev-dependencies).
                 let client = reqwest_updater::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
+                    .timeout(timeout)
                     .build()
                     .unwrap();
                 let result = async { client.get(url).send().await?.bytes().await }.await;
                 let err = tauri_plugin_updater::Error::Reqwest(result.expect_err("the request must fail"));
                 let top = err.to_string();
                 let chain = error_chain(&err);
+                let kind = classify(&err);
                 println!("top-level Display: {top}");
                 println!("error_chain:       {chain}");
+                println!("classify:          {kind:?}");
                 assert!(chain.len() > top.len(), "the chain must add the cause");
-                chain
+                (chain, kind)
             })
         }
 
@@ -155,8 +410,9 @@ mod tests {
         fn dns_failure() {
             // `.invalid` never resolves (RFC 2606). Plain http: resolution
             // fails before any TLS would start.
-            let chain = fetch("http://rillio-update-probe.invalid/Rillio_x64-setup.exe");
+            let (chain, kind) = fetch("http://rillio-update-probe.invalid/Rillio_x64-setup.exe");
             assert!(chain.contains("dns error"), "{chain}");
+            assert_eq!(kind, FailureKind::Dns);
         }
 
         #[test]
@@ -164,8 +420,50 @@ mod tests {
         fn connection_refused() {
             // Bind then drop: the port is free and nothing listens on it.
             let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-            let chain = fetch(&format!("http://127.0.0.1:{port}/Rillio_x64-setup.exe"));
+            let (chain, kind) = fetch(&format!("http://127.0.0.1:{port}/Rillio_x64-setup.exe"));
             assert!(chain.contains("os error"), "{chain}");
+            assert_eq!(kind, FailureKind::Refused);
+        }
+
+        #[test]
+        #[ignore]
+        fn timeout() {
+            // A server that accepts and never answers, against a client
+            // timeout (the updater sets none today; this pins reqwest's own
+            // TimedOut, the one layer recognised by its text).
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                drop(stream);
+            });
+            let (chain, kind) = fetch_with(
+                &format!("http://127.0.0.1:{port}/Rillio_x64-setup.exe"),
+                std::time::Duration::from_millis(1000),
+            );
+            server.join().unwrap();
+            assert_eq!(kind, FailureKind::Timeout, "{chain}");
+        }
+
+        #[test]
+        #[ignore]
+        fn tls_failure() {
+            // An https client meeting a server that answers the ClientHello
+            // with plain HTTP: rustls rejects the record.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut hello = [0u8; 512];
+                let _ = stream.read(&mut hello);
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let (chain, kind) = fetch(&format!("https://127.0.0.1:{port}/Rillio_x64-setup.exe"));
+            server.join().unwrap();
+            assert_eq!(kind, FailureKind::Tls, "{chain}");
         }
 
         #[test]
@@ -180,9 +478,13 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 drop(stream);
             });
-            let chain = fetch(&format!("http://127.0.0.1:{port}/Rillio_x64-setup.exe"));
+            let (chain, kind) = fetch(&format!("http://127.0.0.1:{port}/Rillio_x64-setup.exe"));
             server.join().unwrap();
             assert!(chain.contains("os error") || chain.contains("closed"), "{chain}");
+            // A FIN instead of a RST (timing) names no socket error: Other.
+            if chain.contains("10054") {
+                assert_eq!(kind, FailureKind::Reset);
+            }
         }
     }
 }

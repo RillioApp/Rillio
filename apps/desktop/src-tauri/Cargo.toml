@@ -72,6 +72,10 @@ webrtc-vad = "0.4"
 # (minisign) + install. The web UI surfaces the "update available" toast (via an
 # emitted event) and calls back into the `install_update` command.
 tauri-plugin-updater = "2"
+# Only to NAME rustls::Error when classifying an update failure as TLS
+# (src/error_chain.rs). The updater already links rustls 0.23; no features,
+# so this adds nothing to the build.
+rustls = { version = "0.23", default-features = false }
 # Single-instance guard: a second launch would fail to bind the streaming
 # server's :11470 and fight over the shared WebView2 profile, so instead we
 # focus the already-running window and let the second process exit. The

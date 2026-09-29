@@ -27,8 +27,10 @@ pub struct UpdateProgress {
     pub downloaded: u64,
     #[serde(default)]
     pub total: u64,
+    /// Set in the `error` phase: the plain sentence, its kind and the full
+    /// chain, the same object the web layer gets from the update commands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub failure: Option<crate::error_chain::UpdateFailure>,
 }
 
 /// The progress file both processes agree on. Temp dir, not the app config dir:
@@ -167,11 +169,13 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
                             }
                             if progress.phase == "error" {
                                 // Show the failure, then get out of the way (the
-                                // main app re-shows its own window on error). The
-                                // message is the full cause chain (the writer logs
-                                // it too, see update_failure in lib.rs), up to a
-                                // few lines, so it stays up long enough to read:
-                                // 8s, the same as the failed-install path below.
+                                // main app re-shows its own window on error, or
+                                // relaunches after a failed install). The page
+                                // leads with a plain sentence and keeps the chain
+                                // behind "Details" (the writer logs it too, see
+                                // update_failure in lib.rs); 8s, the same as the
+                                // failed-install path below. The page's footer
+                                // says so ("in a few seconds").
                                 if raw != last_payload {
                                     let _ = window.eval(&format!("window.__updateState({raw})"));
                                 }
@@ -202,11 +206,22 @@ pub fn run(ctx: tauri::Context<tauri::Wry>) {
                                         &identifier,
                                         "update-failed stage=installer error=\"the installer did not finish within 120s (NSIS quiet mode aborts silently)\"",
                                     );
-                                    let payload = serde_json::json!({
-                                        "phase": "error",
-                                        "message": "The update could not be installed. Rillio will reopen on the current version; you can download the latest installer from rillio.app.",
-                                    });
-                                    let _ = window.eval(&format!("window.__updateState({payload})"));
+                                    let payload = UpdateProgress {
+                                        phase: "error".into(),
+                                        downloaded: 0,
+                                        total: 0,
+                                        failure: Some(crate::error_chain::UpdateFailure::plain(
+                                            crate::error_chain::Stage::Install,
+                                            crate::error_chain::summary(
+                                                crate::error_chain::FailureKind::Other,
+                                                crate::error_chain::Stage::Install,
+                                            ),
+                                            "The installer did not finish within 120 seconds. The latest installer is on rillio.app.",
+                                        )),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&payload) {
+                                        let _ = window.eval(&format!("window.__updateState({json})"));
+                                    }
                                     std::thread::sleep(Duration::from_secs(8));
                                     if let Some(app_exe) = app_exe.as_ref() {
                                         let _ = std::process::Command::new(app_exe).spawn();
