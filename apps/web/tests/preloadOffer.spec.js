@@ -101,6 +101,31 @@ describe('next-episode preload offer', () => {
         expect(offer.state).toBe('dropped');
     });
 
+    // The episode changes (or the player unmounts) and the toast's close fires
+    // BEFORE anything got round to calling drop(): a passive effect cleanup runs
+    // after paint, and a sonner auto-close or dismiss can land in between. The
+    // offer is keyed to the episode it was made for, and the close checks that
+    // key at the moment it would start.
+    it('a close that arrives after the episode changed, before any drop, starts nothing', () => {
+        const toast = fakeToast();
+        const start = jest.fn();
+        let current = true;
+        const offer = offerPreload({ stream: STREAM, start, showOffer: toast.show, isCurrent: () => current });
+        current = false;
+        toast.close();
+        expect(start).not.toHaveBeenCalled();
+        expect(offer.state).toBe('dropped');
+        expect(isActive(offer)).toBe(false);
+    });
+
+    it('a close while the offer is still current starts it', () => {
+        const toast = fakeToast();
+        const start = jest.fn();
+        offerPreload({ stream: STREAM, start, showOffer: toast.show, isCurrent: () => true });
+        toast.close();
+        expect(start).toHaveBeenCalledTimes(1);
+    });
+
     // A toast filter suppressed the offer: there is no Cancel to press, so
     // nothing to wait for.
     it('an offer whose toast was never shown starts at once', () => {
