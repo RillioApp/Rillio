@@ -543,16 +543,18 @@ pub fn run() {
                 build_mobile_window(app)?;
             }
             spawn_update_check(app.handle().clone());
+            // Every launch: the attempt in the progress file (a kept failure,
+            // or a retry launch's frame) already ran, so a late delivery of
+            // it starts nothing. Before any delivery can arrive: forwarded
+            // args are handled on the event loop, which runs after setup.
+            #[cfg(desktop)]
+            app.state::<update_window::UpdateRun>()
+                .seed_from_progress(std::fs::read_to_string(update_window::progress_path()).ok().as_deref());
             // Launched by an update window's "Try again" while Rillio was not
-            // running: this process is the one to run the flow again. Unless
-            // that attempt is already done: the progress file holds the frame
-            // of the newest attempt that ran, and a process restarted after a
-            // failed install still carries the request that started it.
+            // running: this process is the one to run the flow again (unless
+            // the seed above says that attempt is done).
             #[cfg(desktop)]
             if let Some(attempt) = update_window::retry_arg(std::env::args()) {
-                if let Some(handled) = update_window::attempt_on_disk() {
-                    app.state::<update_window::UpdateRun>().seed_handled(handled);
-                }
                 request_update_retry(app.handle().clone(), attempt);
             }
             setup_deep_links(app);
@@ -1006,8 +1008,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), error_chain::Update
     }
     #[cfg(desktop)]
     {
-        let attempt = error_chain::now_ms();
-        if !app.state::<update_window::UpdateRun>().begin(attempt) {
+        if app.state::<update_window::UpdateRun>().begin().is_none() {
             return Err(error_chain::UpdateFailure::plain(
                 error_chain::Stage::InstallCheck,
                 "The update is already running.",
@@ -1055,12 +1056,14 @@ fn update_frame(app: &tauri::AppHandle, frame: update_window::UpdateProgress) {
 /// give the user the main window back, and free the flow for a retry.
 #[cfg(desktop)]
 fn fail_install(app: &tauri::AppHandle, failure: error_chain::UpdateFailure) -> error_chain::UpdateFailure {
-    update_frame(app, update_window::UpdateProgress::failed(failure.clone()));
+    // Publish and release in one step (UpdateRun::finish): a retry landing
+    // right after must start a new flow, not adopt this terminal frame.
+    app.state::<update_window::UpdateRun>()
+        .finish(update_window::UpdateProgress::failed(failure.clone()), update_window::write_progress);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
     }
-    app.state::<update_window::UpdateRun>().end();
     failure
 }
 
@@ -1146,11 +1149,11 @@ async fn run_install(app: tauri::AppHandle, spawn_window: bool) -> Result<(), er
     let mut downloaded: u64 = 0;
     let mut last_file_write = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let progress_app = app.clone();
-    let last_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(error_chain::now_ms()));
+    let last_progress = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let chunk_progress = last_progress.clone();
     let download = update.download(
         move |chunk_len, content_len| {
-            chunk_progress.store(error_chain::now_ms(), std::sync::atomic::Ordering::SeqCst);
+            *chunk_progress.lock().unwrap() = std::time::Instant::now();
             downloaded += chunk_len as u64;
             if last_file_write.elapsed() >= std::time::Duration::from_millis(100) {
                 last_file_write = std::time::Instant::now();
@@ -1280,14 +1283,27 @@ fn journal_update_failure(app: &tauri::AppHandle, failure: &error_chain::UpdateF
 /// request in the args. Tauri's `restart()` re-spawns with the original
 /// args, so a process cold-launched with `--retry-update <a>` came back with
 /// it and installed again with no user action, in a loop (Codex round 4,
-/// finding 2; the progress-file seed in setup is the second guard). Done on
-/// the main thread in the order Tauri's own restart uses: release the
-/// single-instance lock (its Exit handler would), clean up, spawn, exit.
+/// finding 2; the progress-file seed in setup is the second guard). Same
+/// executable and args source as Tauri's own restart (tauri 2.11.5
+/// process.rs: `current_binary(env)` and `env.args_os`), minus the request.
+///
+/// The single-instance lock is released BEFORE the spawn, or the new process
+/// finds the named mutex and the "-siw" window, forwards its args to this
+/// dying one and exits (tauri-plugin-single-instance 2.4.2 windows.rs:69-94).
+/// `destroy` (windows.rs:119-128) is synchronous: ReleaseMutex + CloseHandle
+/// of this process's only handle to the mutex, which deletes the named
+/// object, then DestroyWindow. Done on the main thread, where the mutex was
+/// created and the window lives, in the order Tauri's restart uses (the
+/// plugin's Exit handler, then cleanup, spawn, exit). If the main thread is
+/// unreachable, the fallback still calls `destroy` from here: CloseHandle
+/// works from any thread and is what frees the name (ReleaseMutex and
+/// DestroyWindow fail harmlessly off-thread, and a window without its mutex
+/// is never looked up), so the replacement still starts as the primary.
 #[cfg(desktop)]
 fn restart_without_retry(app: &tauri::AppHandle) {
-    fn relaunch() -> ! {
-        let args = update_window::without_retry_arg(std::env::args_os().skip(1));
-        match std::env::current_exe() {
+    fn relaunch(env: &tauri::Env) -> ! {
+        let args = update_window::without_retry_arg(env.args_os.iter().skip(1).cloned());
+        match tauri::process::current_binary(env) {
             Ok(exe) => {
                 if let Err(e) = std::process::Command::new(&exe).args(args).spawn() {
                     tracing::error!("update: could not relaunch {}: {e}", exe.display());
@@ -1301,11 +1317,12 @@ fn restart_without_retry(app: &tauri::AppHandle) {
     let scheduled = app.run_on_main_thread(move || {
         tauri_plugin_single_instance::destroy(&handle);
         handle.cleanup_before_exit();
-        relaunch();
+        relaunch(&handle.env());
     });
     if let Err(e) = scheduled {
-        tracing::error!("update: main thread unavailable for the restart ({e}); relaunching from here");
-        relaunch();
+        tracing::error!("update: main thread unavailable for the restart ({e}); releasing the lock and relaunching from here");
+        tauri_plugin_single_instance::destroy(app);
+        relaunch(&app.env());
     }
 }
 
