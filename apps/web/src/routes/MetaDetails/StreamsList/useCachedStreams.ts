@@ -45,6 +45,15 @@ export type AddonStreamLike = {
     infoHash?: unknown,
     fileIdx?: unknown,
     deepLinks?: { player?: unknown },
+    // The addon that listed this stream (its stream transport url).
+    addonTransportUrl?: unknown,
+};
+
+// The title on screen, for deep links to torrents with no sidecar of it.
+export type CachedStreamsPage = {
+    type: string | null,
+    name: string | null,
+    metaTransportUrl: string | null,
 };
 
 const { matchCachedEpisode, tiedEntries } = require('./cachedEpisodeMatch') as {
@@ -56,6 +65,7 @@ const { matchCachedEpisode, tiedEntries } = require('./cachedEpisodeMatch') as {
         season: number | null,
         episode: number | null,
         addonStreams: AddonStreamLike[],
+        page: CachedStreamsPage,
     }) => CachedStream[],
     tiedEntries: (entries: CacheListEntry[], metaId: string, addonStreams: AddonStreamLike[]) => CacheListEntry[],
 };
@@ -75,9 +85,11 @@ type Args = {
     // torrent for this episode ties that torrent to the title and names its
     // file.
     addonStreams: AddonStreamLike[],
+    page: CachedStreamsPage,
 };
 
-const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Args): CachedStream[] => {
+const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page }: Args): CachedStream[] => {
+    const { type: pageType, name: pageName, metaTransportUrl } = page;
     const profile = useProfile();
     const serverUrl = profile.settings.streamingServerUrl;
     const [matches, setMatches] = useState<CachedStream[]>([]);
@@ -130,6 +142,7 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
                     season,
                     episode,
                     addonStreams: addonStreamsNow,
+                    page: { type: pageType, name: pageName, metaTransportUrl },
                 }));
             })
             // No streaming server, or it is down: there is simply nothing cached
@@ -139,7 +152,7 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
                 if (isCurrent()) setMatches([]);
             });
         // evidenceKey stands in for addonStreams (read through the ref).
-    }, [serverUrl, metaId, videoId, season, episode, evidenceKey]);
+    }, [serverUrl, metaId, videoId, season, episode, evidenceKey, pageType, pageName, metaTransportUrl]);
 
     // Sequential: the next load starts POLL_MS after the previous one
     // finished, so a slow server's results still land (see pollSequential).

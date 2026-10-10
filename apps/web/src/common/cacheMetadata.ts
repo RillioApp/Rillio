@@ -53,25 +53,13 @@ export type CacheMeta = {
     fileIdx?: number | null,
 };
 
-/**
- * The full player deep link for an identified cached torrent, or null when we
- * only know the stream. `encodedStream` comes from core.transport.encodeStream.
- *
- * Mirrors the route's positional shape, so a missing streamTransportUrl still
- * has to occupy its slot - the meta addon stands in, which is what the core
- * itself does for a stream that came from a title's own addon.
- */
-export const playerDeepLink = (encodedStream: string, meta: CacheMeta | undefined): string => {
-    const stream = encodeURIComponent(encodedStream);
-    const metaUrl = meta?.metaTransportUrl;
-    if (meta === undefined || typeof metaUrl !== 'string' || metaUrl.length === 0) {
-        return `/player/${stream}`;
-    }
-    const streamUrl = meta.streamTransportUrl ?? metaUrl;
-    const videoId = meta.videoId ?? meta.metaId;
-    return `/player/${stream}/${encodeURIComponent(streamUrl)}/${encodeURIComponent(metaUrl)}` +
-        `/${encodeURIComponent(meta.type)}/${encodeURIComponent(meta.metaId)}/${encodeURIComponent(videoId)}`;
+// The full player deep link for an identified cached torrent (a bare
+// `/player/:stream` when only the stream is known). Lives in a CommonJS
+// sibling so the jest suite can assert the links built from it.
+const { playerDeepLink } = require('./playerDeepLink') as {
+    playerDeepLink: (encodedStream: string, meta: CacheMeta | undefined) => string,
 };
+export { playerDeepLink };
 
 export const saveCacheMeta = (serverUrl: string, infoHash: string, meta: CacheMeta | null): Promise<void> =>
     serverFetch(new URL('cache/meta', serverUrl), {

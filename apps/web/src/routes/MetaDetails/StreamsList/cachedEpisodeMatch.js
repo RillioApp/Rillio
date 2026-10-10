@@ -73,6 +73,33 @@ const hrefFor = (streams, fileIdx) => {
 // this page (it resolved THIS movie), then the sidecar only when it names this
 // title (a collection pack cached while playing another movie records THAT
 // movie's file), then the server's playable file for the selection.
+// The deep-link meta for an offer whose torrent has no sidecar of this title:
+// built from the page itself (this title, this episode, the addon that served
+// the page's meta, and the addon that listed the torrent), the same shape the
+// player's eager write records. Without the page's meta addon there is no full
+// link to build (the bare /player/:stream remains, as before).
+const pageMeta = (view, streams, fileIdx) => {
+    const { page, metaId, videoId, season, episode } = view;
+    if (!page || typeof page.metaTransportUrl !== 'string' || page.metaTransportUrl.length === 0) return undefined;
+    const lister = streams.find((stream) => typeof stream.addonTransportUrl === 'string');
+    const episodeView = typeof videoId === 'string' && videoId.length > 0 && videoId !== metaId;
+    return {
+        metaId,
+        type: page.type,
+        name: typeof page.name === 'string' ? page.name : '',
+        poster: null,
+        background: null,
+        logo: null,
+        year: null,
+        videoId: episodeView ? videoId : null,
+        season: episodeView && typeof season === 'number' ? season : null,
+        episode: episodeView && typeof episode === 'number' ? episode : null,
+        metaTransportUrl: page.metaTransportUrl,
+        streamTransportUrl: lister ? lister.addonTransportUrl : null,
+        fileIdx: typeof fileIdx === 'number' ? fileIdx : null,
+    };
+};
+
 const movieOffer = (entry, files, view) => {
     const { metaId, videoId, addonStreams } = view;
     const streams = streamsFor(addonStreams, entry.infoHash);
@@ -93,7 +120,7 @@ const movieOffer = (entry, files, view) => {
         downloaded: file ? file.downloaded : entry.downloaded,
         total: file ? file.length : entry.total,
         state: entry.state,
-        meta: ownMeta,
+        meta: ownMeta ?? pageMeta(view, streams, fileIdx),
         playHref: fileIdx === undefined ? null : hrefFor(streams, fileIdx),
     };
 };
@@ -125,7 +152,7 @@ const episodeOffer = (entry, files, view) => {
         state: entry.state,
         // Re-aimed at the viewed episode, so the player deep link opens this
         // episode (and its library progress), not the one first recorded.
-        meta: ownMeta === undefined ? undefined : {
+        meta: ownMeta === undefined ? pageMeta(view, streams, file.index) : {
             ...ownMeta,
             videoId,
             season: typeof season === 'number' ? season : null,
@@ -144,18 +171,21 @@ const episodeOffer = (entry, files, view) => {
  * offered; a movie falls back to the torrent's selection numbers).
  * metaId/videoId: what is on screen (videoId === metaId for a movie).
  * season/episode: the viewed episode's numbers, when known. addonStreams: the
- * addon streams on this page (for this episode).
+ * addon streams on this page (for this episode), each tagged with the
+ * `addonTransportUrl` of the addon that listed it. page: { type, name,
+ * metaTransportUrl } of the title on screen, for torrents with no sidecar of
+ * this title.
  *
  * Returns { infoHash, name, fileIdx, downloaded, total, state, meta, playHref }
  * per offer: fileIdx is the file to play, downloaded/total are that file's
  * (the torrent's selection for a movie), meta builds the player deep link,
  * and playHref, when set, is an addon's own deep link for exactly that file.
  */
-const matchCachedEpisode = ({ entries, filesByHash, metaId, videoId, season, episode, addonStreams }) => {
+const matchCachedEpisode = ({ entries, filesByHash, metaId, videoId, season, episode, addonStreams, page }) => {
     const streams = Array.isArray(addonStreams) ? addonStreams : [];
     const tied = tiedEntries(entries, metaId, streams);
     const episodeView = typeof videoId === 'string' && videoId.length > 0 && videoId !== metaId;
-    const view = { metaId, videoId, season, episode, addonStreams: streams };
+    const view = { metaId, videoId, season, episode, addonStreams: streams, page };
     if (!episodeView) {
         return tied.map((entry) => movieOffer(entry, filesByHash[entry.infoHash], view));
     }

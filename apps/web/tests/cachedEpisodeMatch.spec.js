@@ -4,6 +4,7 @@
 // first played from (and recorded as) another episode.
 
 const { matchCachedEpisode, tiedEntries, isViewedEpisode } = require('../src/routes/MetaDetails/StreamsList/cachedEpisodeMatch');
+const { playerDeepLink } = require('../src/common/playerDeepLink');
 
 const SHOW = 'tt7772588';
 const PACK = 'a'.repeat(40);
@@ -312,6 +313,63 @@ describe('movies behave as before', () => {
             episode: null,
             addonStreams: [],
         })).toEqual([]);
+    });
+});
+
+// An offer found by file name, for a torrent with no sidecar of this title
+// (tied by an addon stream that carries no fileIdx), must still open the
+// player as a catalog play would: title, episode, meta and stream addons, so
+// library progress, the next episode and artwork all work. The page knows all
+// of that; only a bare /player/:stream link would lose it.
+describe('a filename-matched offer keeps the episode context', () => {
+    const CINEMETA = 'https://v3-cinemeta.strem.io/manifest.json';
+    const TORRENTIO = 'https://torrentio.example/manifest.json';
+    const page = { type: 'series', name: 'For All Mankind', metaTransportUrl: CINEMETA };
+    // The addon lists the pack for this episode but without a fileIdx (it
+    // would play the largest file), so the episode's file is found by name.
+    const hashOnlyStream = { infoHash: PACK, addonTransportUrl: TORRENTIO, deepLinks: { player: '#/player/pack-largest' } };
+
+    test('the deep link is built from this page: title, episode, both addons, the resolved file', () => {
+        const [offer] = matchCachedEpisode({
+            entries: [packEntry({ meta: undefined })],
+            filesByHash: { [PACK]: packFiles() },
+            ...viewing(3, { addonStreams: [hashOnlyStream], page }),
+        });
+        expect(offer.fileIdx).toBe(2);
+        // The addon's own link would open the largest file, not E03.
+        expect(offer.playHref).toBeNull();
+        expect(offer.meta).toMatchObject({
+            metaId: SHOW,
+            type: 'series',
+            videoId: `${SHOW}:1:3`,
+            season: 1,
+            episode: 3,
+            fileIdx: 2,
+            metaTransportUrl: CINEMETA,
+            streamTransportUrl: TORRENTIO,
+        });
+        expect(playerDeepLink('ENC', offer.meta)).toBe(
+            `/player/ENC/${encodeURIComponent(TORRENTIO)}/${encodeURIComponent(CINEMETA)}` +
+            `/series/${SHOW}/${encodeURIComponent(`${SHOW}:1:3`)}`,
+        );
+    });
+
+    test('a movie tied only by an addon gets the same full link', () => {
+        const MOVIE = 'tt0000102';
+        const ih = 'f'.repeat(40);
+        const [offer] = matchCachedEpisode({
+            entries: [{ infoHash: ih, name: 'Movie.B.2004.mkv', downloaded: 9 * GB, total: 9 * GB, state: 'live', fileCount: 1, fileIdx: 0 }],
+            filesByHash: {},
+            metaId: MOVIE,
+            videoId: MOVIE,
+            season: null,
+            episode: null,
+            addonStreams: [{ infoHash: ih, addonTransportUrl: TORRENTIO }],
+            page: { type: 'movie', name: 'Movie B', metaTransportUrl: CINEMETA },
+        });
+        expect(playerDeepLink('ENC', offer.meta)).toBe(
+            `/player/ENC/${encodeURIComponent(TORRENTIO)}/${encodeURIComponent(CINEMETA)}/movie/${MOVIE}/${MOVIE}`,
+        );
     });
 });
 
