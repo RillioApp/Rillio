@@ -26,8 +26,9 @@
 // on disk or downloading: a file of the pack that was never selected is not
 // "on this device", and the addon list below already offers to stream it.
 //
-// Movies keep the per-torrent behavior (entry-level progress and playable
-// file). Pure and dependency-free so the jest suite can require it directly
+// Movies are one per torrent as before, but pick their file by the same
+// authority (a collection pack holds several movies) and show that file's
+// bytes when its listing is available. Pure and dependency-free so the jest suite can require it directly
 // (this repo's jest has no TS transform; same pattern as Player/preloadOffer);
 // useCachedStreams does the fetching around it.
 
@@ -65,20 +66,31 @@ const hrefFor = (streams, fileIdx) => {
     return stream ? stream.deepLinks.player : null;
 };
 
-const movieOffer = (entry, metaId, addonStreams) => {
+// A movie's file, by the same authority as an episode's: an addon stream on
+// this page (it resolved THIS movie), then the sidecar only when it names this
+// title (a collection pack cached while playing another movie records THAT
+// movie's file), then the server's playable file for the selection.
+const movieOffer = (entry, files, view) => {
+    const { metaId, videoId, addonStreams } = view;
     const streams = streamsFor(addonStreams, entry.infoHash);
+    const ownMeta = metaIsTitle(entry, metaId) &&
+        (entry.meta.videoId === null || entry.meta.videoId === undefined || entry.meta.videoId === videoId) ?
+        entry.meta : undefined;
     const fromStream = streams.find((stream) => typeof stream.fileIdx === 'number');
-    const fileIdx = typeof entry.fileIdx === 'number' ? entry.fileIdx :
-        fromStream ? fromStream.fileIdx :
-            entry.meta && typeof entry.meta.fileIdx === 'number' ? entry.meta.fileIdx : undefined;
+    const fileIdx = fromStream ? fromStream.fileIdx :
+        ownMeta !== undefined && typeof ownMeta.fileIdx === 'number' ? ownMeta.fileIdx :
+            typeof entry.fileIdx === 'number' ? entry.fileIdx : undefined;
+    // That file's own bytes when the listing has it; the selection's
+    // otherwise (a single-movie torrent, where they are the same thing).
+    const file = Array.isArray(files) && fileIdx !== undefined ? files.find((candidate) => candidate.index === fileIdx) : undefined;
     return {
         infoHash: entry.infoHash,
-        name: entry.name,
+        name: file ? basename(file.path) : entry.name,
         fileIdx,
-        downloaded: entry.downloaded,
-        total: entry.total,
+        downloaded: file ? file.downloaded : entry.downloaded,
+        total: file ? file.length : entry.total,
         state: entry.state,
-        meta: metaIsTitle(entry, metaId) ? entry.meta : undefined,
+        meta: ownMeta,
         playHref: fileIdx === undefined ? null : hrefFor(streams, fileIdx),
     };
 };
@@ -125,7 +137,8 @@ const episodeOffer = (entry, files, view) => {
  * The "On this device" offers for the title on screen.
  *
  * entries: /cache/list rows. filesByHash: { [infoHash]: /cache/files rows }
- * for the tied torrents (series only; a torrent missing here is not offered).
+ * for the tied torrents (on a series page a torrent missing here is not
+ * offered; a movie falls back to the torrent's selection numbers).
  * metaId/videoId: what is on screen (videoId === metaId for a movie).
  * season/episode: the viewed episode's numbers, when known. addonStreams: the
  * addon streams on this page (for this episode).
@@ -139,10 +152,10 @@ const matchCachedEpisode = ({ entries, filesByHash, metaId, videoId, season, epi
     const streams = Array.isArray(addonStreams) ? addonStreams : [];
     const tied = tiedEntries(entries, metaId, streams);
     const episodeView = typeof videoId === 'string' && videoId.length > 0 && videoId !== metaId;
-    if (!episodeView) {
-        return tied.map((entry) => movieOffer(entry, metaId, streams));
-    }
     const view = { metaId, videoId, season, episode, addonStreams: streams };
+    if (!episodeView) {
+        return tied.map((entry) => movieOffer(entry, filesByHash[entry.infoHash], view));
+    }
     return tied
         .map((entry) => {
             const files = filesByHash[entry.infoHash];

@@ -103,20 +103,19 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
                 if (!resp.ok) throw new Error(`${path} responded ${resp.status}`);
                 return resp.json() as Promise<T>;
             });
-        const episodeView = typeof videoId === 'string' && videoId.length > 0 && videoId !== metaId;
         fetchJson<CacheListEntry[]>('cache/list')
             .then(async (entries) => {
                 const addonStreamsNow = streamsRef.current;
                 const filesByHash: Record<string, TorrentFile[]> = {};
-                if (episodeView) {
-                    // Which file of each tied torrent is this episode is a
-                    // per-file question. A listing that fails leaves that
-                    // torrent out (logged), never guessed at.
-                    await Promise.all(tiedEntries(entries, metaId, addonStreamsNow).map((entry) =>
-                        fetchJson<TorrentFile[]>(`cache/files/${entry.infoHash}`)
-                            .then((files) => { filesByHash[entry.infoHash] = files; })
-                            .catch((error) => console.error('useCachedStreams: listing the files of', entry.infoHash, 'failed', error))));
-                }
+                // Which file of each tied torrent is this episode (or this
+                // movie, in a collection) is a per-file question, and the
+                // row shows that file's bytes. A listing that fails is
+                // logged; the matcher then leaves an episode out rather than
+                // guess.
+                await Promise.all(tiedEntries(entries, metaId, addonStreamsNow).map((entry) =>
+                    fetchJson<TorrentFile[]>(`cache/files/${entry.infoHash}`)
+                        .then((files) => { filesByHash[entry.infoHash] = files; })
+                        .catch((error) => console.error('useCachedStreams: listing the files of', entry.infoHash, 'failed', error))));
                 // A slower, older load (the previous episode's, say) must not
                 // overwrite a newer one.
                 if (token !== loadToken.current) return;

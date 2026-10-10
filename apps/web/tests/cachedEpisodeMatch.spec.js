@@ -297,3 +297,91 @@ describe('movies behave as before', () => {
         })).toEqual([]);
     });
 });
+
+// A torrent shared by several titles (a collection pack, a season pack) must
+// play the file THIS page is about. The sidecar's file belongs to whatever was
+// played when it was written; an addon stream on this page resolved this very
+// title/episode, so its fileIdx wins.
+describe('a shared torrent plays the file this page is about', () => {
+    const COLLECTION = 'd'.repeat(40);
+    const MOVIE_A = 'tt0000101';
+    const MOVIE_B = 'tt0000102';
+    const collectionFiles = () => [
+        { index: 0, path: 'Collection/Movie.A.2001.1080p.mkv', length: 8 * GB, downloaded: 8 * GB, selected: true, video: true },
+        { index: 1, path: 'Collection/Movie.B.2004.1080p.mkv', length: 9 * GB, downloaded: 3 * GB, selected: true, video: true },
+    ];
+    // Cached while playing movie A: the sidecar names A and its file 0, and
+    // the server's playable file for the selection is 0 too.
+    const collectionEntry = () => ({
+        infoHash: COLLECTION,
+        name: 'Movie.A.2001.1080p.mkv',
+        downloaded: 11 * GB,
+        total: 17 * GB,
+        state: 'live',
+        fileCount: 2,
+        fileIdx: 0,
+        meta: { metaId: MOVIE_A, type: 'movie', name: 'Movie A', poster: null, background: null, logo: null, year: '2001', videoId: null, fileIdx: 0 },
+    });
+    const streamFor = (fileIdx) => ({
+        infoHash: COLLECTION,
+        fileIdx,
+        addonTransportUrl: 'https://torrentio.example/manifest.json',
+        deepLinks: { player: `#/player/encoded-${fileIdx}/torrentio/cinemeta/movie/${MOVIE_B}/${MOVIE_B}` },
+    });
+
+    test('movie B\'s page plays file 1 (the addon\'s), never movie A\'s file 0', () => {
+        const [offer] = matchCachedEpisode({
+            entries: [collectionEntry()],
+            filesByHash: { [COLLECTION]: collectionFiles() },
+            metaId: MOVIE_B,
+            videoId: MOVIE_B,
+            season: null,
+            episode: null,
+            addonStreams: [streamFor(1)],
+        });
+        expect(offer.fileIdx).toBe(1);
+        // And it is sized as that file, not the collection's selection.
+        expect(offer.downloaded).toBe(3 * GB);
+        expect(offer.total).toBe(9 * GB);
+        // The sidecar describes movie A: it must not steer B's deep link.
+        expect(offer.meta === undefined || offer.meta.metaId === MOVIE_B).toBe(true);
+        expect(offer.playHref).toBe(streamFor(1).deepLinks.player);
+    });
+
+    test('movie A\'s own page still uses its recorded file', () => {
+        const [offer] = matchCachedEpisode({
+            entries: [collectionEntry()],
+            filesByHash: { [COLLECTION]: collectionFiles() },
+            metaId: MOVIE_A,
+            videoId: MOVIE_A,
+            season: null,
+            episode: null,
+            addonStreams: [],
+        });
+        expect(offer.fileIdx).toBe(0);
+        expect(offer.downloaded).toBe(8 * GB);
+        expect(offer.meta.metaId).toBe(MOVIE_A);
+    });
+
+    test('series: an addon on this page outranks the sidecar recorded for this very episode', () => {
+        // The sidecar says E03 is file 2; the addon serving this page says 3.
+        const [offer] = matchCachedEpisode({
+            entries: [packEntry({ meta: showMeta({ videoId: `${SHOW}:1:3`, episode: 3, fileIdx: 2 }) })],
+            filesByHash: { [PACK]: packFiles() },
+            ...viewing(3, { addonStreams: [{ infoHash: PACK, fileIdx: 3 }] }),
+        });
+        expect(offer.fileIdx).toBe(3);
+    });
+
+    test('series: a sidecar of ANOTHER title never picks the file', () => {
+        // Recorded while playing another show's E03 at file 2; this page's
+        // addon resolves this show's episode to file 4.
+        const [offer] = matchCachedEpisode({
+            entries: [packEntry({ meta: showMeta({ metaId: 'tt0000999', videoId: 'tt0000999:1:3', fileIdx: 2 }) })],
+            filesByHash: { [PACK]: packFiles().map((file) => ({ ...file, selected: true, downloaded: file.length })) },
+            ...viewing(3, { addonStreams: [{ infoHash: PACK, fileIdx: 4 }] }),
+        });
+        expect(offer.fileIdx).toBe(4);
+        expect(offer.meta === undefined || offer.meta.metaId === SHOW).toBe(true);
+    });
+});
