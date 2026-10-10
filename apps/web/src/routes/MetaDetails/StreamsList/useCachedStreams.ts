@@ -60,6 +60,10 @@ const { matchCachedEpisode, tiedEntries } = require('./cachedEpisodeMatch') as {
     tiedEntries: (entries: CacheListEntry[], metaId: string, addonStreams: AddonStreamLike[]) => CacheListEntry[],
 };
 
+const { pollSequential } = require('./pollSequential') as {
+    pollSequential: (load: (isCurrent: () => boolean) => Promise<void>, intervalMs: number) => () => void,
+};
+
 const POLL_MS = 3000;
 
 type Args = {
@@ -77,7 +81,6 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
     const profile = useProfile();
     const serverUrl = profile.settings.streamingServerUrl;
     const [matches, setMatches] = useState<CachedStream[]>([]);
-    const loadToken = useRef(0);
 
     // The core hands out a new streams array on every state update; restarting
     // the poll for each would hammer the server. Only the torrent identities
@@ -91,19 +94,19 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
         .sort()
         .join(','), [addonStreams]);
 
-    const load = useCallback(() => {
+    // isCurrent() turns false once this poll is stopped (unmount, or another
+    // title/episode): a load still in flight then drops its result.
+    const load = useCallback((isCurrent: () => boolean): Promise<void> => {
         if (typeof serverUrl !== 'string' || typeof metaId !== 'string' || metaId.length === 0) {
             setMatches([]);
-            return;
+            return Promise.resolve();
         }
-        loadToken.current += 1;
-        const token = loadToken.current;
         const fetchJson = <T>(path: string): Promise<T> => serverFetch(new URL(path, serverUrl))
             .then((resp) => {
                 if (!resp.ok) throw new Error(`${path} responded ${resp.status}`);
                 return resp.json() as Promise<T>;
             });
-        fetchJson<CacheListEntry[]>('cache/list')
+        return fetchJson<CacheListEntry[]>('cache/list')
             .then(async (entries) => {
                 const addonStreamsNow = streamsRef.current;
                 const filesByHash: Record<string, TorrentFile[]> = {};
@@ -116,9 +119,9 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
                     fetchJson<TorrentFile[]>(`cache/files/${entry.infoHash}`)
                         .then((files) => { filesByHash[entry.infoHash] = files; })
                         .catch((error) => console.error('useCachedStreams: listing the files of', entry.infoHash, 'failed', error))));
-                // A slower, older load (the previous episode's, say) must not
-                // overwrite a newer one.
-                if (token !== loadToken.current) return;
+                // A load of the previous title/episode, or one finishing after
+                // unmount, must not overwrite anything.
+                if (!isCurrent()) return;
                 setMatches(matchCachedEpisode({
                     entries,
                     filesByHash,
@@ -133,16 +136,14 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Ar
             // to show. Never surfaced to the user - the addon streams below are
             // unaffected.
             .catch(() => {
-                if (token === loadToken.current) setMatches([]);
+                if (isCurrent()) setMatches([]);
             });
         // evidenceKey stands in for addonStreams (read through the ref).
     }, [serverUrl, metaId, videoId, season, episode, evidenceKey]);
 
-    useEffect(() => {
-        load();
-        const interval = setInterval(load, POLL_MS);
-        return () => clearInterval(interval);
-    }, [load]);
+    // Sequential: the next load starts POLL_MS after the previous one
+    // finished, so a slow server's results still land (see pollSequential).
+    useEffect(() => pollSequential(load, POLL_MS), [load]);
 
     return matches;
 };
