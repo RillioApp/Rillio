@@ -22,7 +22,7 @@ describe('adjacentEpisodes', () => {
     ];
 
     it('returns the neighbours of an ordinary episode, with labels and deep links', () => {
-        const { previous, next } = adjacentEpisodes(videos, 'tt1:1:2');
+        const { previous, next } = adjacentEpisodes('series', videos, 'tt1:1:2');
         expect(previous).toEqual({
             id: 'tt1:1:1', season: 1, episode: 1, title: 'Episode 1', label: 'S1E1 Episode 1',
             link: '#/metadetails/series/tt1/tt1%3A1%3A1',
@@ -32,21 +32,21 @@ describe('adjacentEpisodes', () => {
     });
 
     it('has no previous at the first episode and no next at the last', () => {
-        expect(ids(adjacentEpisodes(videos, 'tt1:1:1'))).toEqual([null, 'tt1:1:2']);
-        expect(ids(adjacentEpisodes(videos, 'tt1:2:2'))).toEqual(['tt1:2:1', null]);
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:1:1'))).toEqual([null, 'tt1:1:2']);
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:2:2'))).toEqual(['tt1:2:1', null]);
     });
 
     it('crosses season boundaries both ways', () => {
-        expect(ids(adjacentEpisodes(videos, 'tt1:1:3'))).toEqual(['tt1:1:2', 'tt1:2:1']);
-        expect(ids(adjacentEpisodes(videos, 'tt1:2:1'))).toEqual(['tt1:1:3', 'tt1:2:2']);
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:1:3'))).toEqual(['tt1:1:2', 'tt1:2:1']);
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:2:1'))).toEqual(['tt1:1:3', 'tt1:2:2']);
     });
 
     it('skips specials from a regular episode, includes them from a special', () => {
         // S1E1 is the first regular episode: the specials before it are not offered.
-        expect(adjacentEpisodes(videos, 'tt1:1:1').previous).toBeNull();
-        expect(ids(adjacentEpisodes(videos, 'tt1:0:1'))).toEqual([null, 'tt1:0:2']);
+        expect(adjacentEpisodes('series', videos, 'tt1:1:1').previous).toBeNull();
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:0:1'))).toEqual([null, 'tt1:0:2']);
         // The last special leads into the first regular episode.
-        expect(ids(adjacentEpisodes(videos, 'tt1:0:2'))).toEqual(['tt1:0:1', 'tt1:1:1']);
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:0:2'))).toEqual(['tt1:0:1', 'tt1:1:1']);
     });
 
     it('leaves out videos with missing or unusable numbers without crashing', () => {
@@ -60,10 +60,10 @@ describe('adjacentEpisodes', () => {
             { season: 1, episode: 2 },
             ep(1, 3),
         ];
-        expect(ids(adjacentEpisodes(messy, 'tt1:1:1'))).toEqual([null, 'tt1:1:3']);
-        expect(ids(adjacentEpisodes(messy, 'tt1:1:3'))).toEqual(['tt1:1:1', null]);
+        expect(ids(adjacentEpisodes('series', messy, 'tt1:1:1'))).toEqual([null, 'tt1:1:3']);
+        expect(ids(adjacentEpisodes('series', messy, 'tt1:1:3'))).toEqual(['tt1:1:1', null]);
         // The current video itself has no number: nothing to step through.
-        expect(adjacentEpisodes(messy, 'tt1:1:x')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('series', messy, 'tt1:1:x')).toEqual({ previous: null, next: null });
     });
 
     it('handles duplicate ids and duplicate episode numbers', () => {
@@ -72,23 +72,31 @@ describe('adjacentEpisodes', () => {
             ep(1, 2, 'Cut A', 'tt1:1:2a'), ep(1, 2, 'Cut B', 'tt1:1:2b'), // two videos, one number
             ep(1, 3),
         ];
-        expect(ids(adjacentEpisodes(dupes, 'tt1:1:1'))).toEqual([null, 'tt1:1:2a']);
-        expect(ids(adjacentEpisodes(dupes, 'tt1:1:2a'))).toEqual(['tt1:1:1', 'tt1:1:2b']);
-        expect(ids(adjacentEpisodes(dupes, 'tt1:1:2b'))).toEqual(['tt1:1:2a', 'tt1:1:3']);
+        expect(ids(adjacentEpisodes('series', dupes, 'tt1:1:1'))).toEqual([null, 'tt1:1:2a']);
+        expect(ids(adjacentEpisodes('series', dupes, 'tt1:1:2a'))).toEqual(['tt1:1:1', 'tt1:1:2b']);
+        expect(ids(adjacentEpisodes('series', dupes, 'tt1:1:2b'))).toEqual(['tt1:1:2a', 'tt1:1:3']);
     });
 
     it('shows nothing for a movie, an unknown id, or no episode list', () => {
         const movie = [{ id: 'tt9', title: 'A Movie', deepLinks: { metaDetailsStreams: '#/x' } }];
-        expect(adjacentEpisodes(movie, 'tt9')).toEqual({ previous: null, next: null });
-        expect(adjacentEpisodes(videos, 'tt1:9:9')).toEqual({ previous: null, next: null });
-        expect(adjacentEpisodes([], 'tt1:1:1')).toEqual({ previous: null, next: null });
-        expect(adjacentEpisodes(undefined, 'tt1:1:1')).toEqual({ previous: null, next: null });
-        expect(adjacentEpisodes(videos, null)).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('series', movie, 'tt9')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('series', videos, 'tt1:9:9')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('series', [], 'tt1:1:1')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('series', undefined, 'tt1:1:1')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('series', videos, null)).toEqual({ previous: null, next: null });
+    });
+
+    it('shows nothing for a movie or channel meta, even with numbered videos', () => {
+        // The same numbered list that yields arrows for a series.
+        expect(adjacentEpisodes('movie', videos, 'tt1:1:2')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes('channel', videos, 'tt1:1:2')).toEqual({ previous: null, next: null });
+        expect(adjacentEpisodes(undefined, videos, 'tt1:1:2')).toEqual({ previous: null, next: null });
+        expect(ids(adjacentEpisodes('series', videos, 'tt1:1:2'))).toEqual(['tt1:1:1', 'tt1:1:3']);
     });
 
     it('gives a null link when a neighbour carries no deep link', () => {
         const bare = [ep(1, 1), { id: 'tt1:1:2', season: 1, episode: 2 }];
-        const { next } = adjacentEpisodes(bare, 'tt1:1:1');
+        const { next } = adjacentEpisodes('series', bare, 'tt1:1:1');
         expect(next.link).toBeNull();
         expect(next.label).toBe('S1E2');
     });

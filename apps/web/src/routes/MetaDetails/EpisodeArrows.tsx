@@ -13,7 +13,8 @@
  * The neighbours come from adjacentEpisodes (season-then-episode order,
  * specials only from a special); the click follows the target video's own
  * metaDetailsStreams deep link, exactly as picking it from the episode list
- * does. An end of the list shows no arrow at all; a movie or anything
+ * does. An end of the list shows no arrow at all; anything but a series
+ * (a movie, a channel, even one whose videos carry numbers) or a series
  * without an episode list renders the children untouched.
  *
  * Keyboard: Left/Right step too, but only while nothing on the page holds
@@ -44,7 +45,9 @@ type Target = {
 
 type Props = {
     className?: string;
-    // The title's episode list (meta.videos) and the video on screen.
+    // The media type ('series' is the only one with arrows), the title's
+    // episode list (meta.videos) and the video on screen.
+    type: string;
     videos: any[];
     videoId: string;
     children: React.ReactNode;
@@ -63,10 +66,10 @@ const ARROW_CLASS = cn(
     'sm:pointer-events-auto sm:absolute sm:top-1/2 sm:size-13 sm:-translate-y-1/2 sm:p-0',
 );
 
-const EpisodeArrows = ({ className, videos, videoId, children }: Props) => {
+const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) => {
     const navigate = useNavigate();
     const navRef = React.useRef<HTMLElement>(null);
-    const { previous, next } = React.useMemo(() => adjacentEpisodes(videos, videoId), [videos, videoId]);
+    const { previous, next } = React.useMemo(() => adjacentEpisodes(type, videos, videoId), [type, videos, videoId]);
     const previousTarget = navigable(previous) ? previous : null;
     const nextTarget = navigable(next) ? next : null;
     const hasArrows = previousTarget !== null || nextTarget !== null;

@@ -8,8 +8,9 @@
 // it crosses season boundaries (last of S1 -> first of S2). Specials (season
 // 0) are left out unless the current episode is itself a special. A video
 // without a usable season/episode number cannot be placed in that order and
-// is left out; when the CURRENT video has none (a movie, a channel upload)
-// there is nothing to step through and both sides are null.
+// is left out; when the CURRENT video has none there is nothing to step
+// through and both sides are null. Anything but a series meta (a movie, a
+// channel) is null on both sides whatever its videos carry.
 
 const isEpisodeNumber = (value) => typeof value === 'number' && Number.isFinite(value);
 
@@ -39,8 +40,10 @@ const toTarget = (video) => ({
 
 const NONE = Object.freeze({ previous: null, next: null });
 
-const adjacentEpisodes = (videos, currentVideoId) => {
-    if (!Array.isArray(videos) || typeof currentVideoId !== 'string') {
+// `type` is the meta's media type: only a series has episodes to step
+// through, even when a movie or channel meta carries numbered videos.
+const adjacentEpisodes = (type, videos, currentVideoId) => {
+    if (type !== 'series' || !Array.isArray(videos) || typeof currentVideoId !== 'string') {
         return NONE;
     }
 

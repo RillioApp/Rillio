@@ -271,10 +271,12 @@ const MetaDetails = () => {
                         </div>
                         {
                             // EpisodeArrows: previous/next episode out at the
-                            // side edges (renders the list untouched for a movie).
+                            // side edges (series only: renders the list
+                            // untouched for a movie or channel).
                             streamPath !== null ?
                                 <EpisodeArrows
                                     className="mt-8 flex-none self-stretch"
+                                    type={streamPath.type}
                                     videos={episodes}
                                     videoId={streamPath.id}
                                 >
