@@ -124,7 +124,7 @@ const StreamsList = ({ className, video, type, metaId, videoId, libraryItem, onE
 
     return (
         <div className={cn('flex flex-col', className)}>
-            <div className="z-[2] mx-4 mt-4 flex items-center gap-x-2">
+            <div data-streams-header="" className="z-[2] mx-4 mt-4 flex items-center gap-x-2">
                 {
                     video ?
                         <React.Fragment>
