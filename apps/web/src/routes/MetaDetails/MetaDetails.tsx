@@ -270,9 +270,10 @@ const MetaDetails = () => {
                             }
                         </div>
                         {
-                            // EpisodeArrows: previous/next episode out at the
-                            // side edges (series only: renders the list
-                            // untouched for a movie or channel).
+                            // EpisodeArrows: owns the centred 80rem streams
+                            // column and puts previous/next episode in its side
+                            // margins (series only: no arrows for a movie or
+                            // channel).
                             streamPath !== null ?
                                 <EpisodeArrows
                                     className="mt-8 flex-none self-stretch"
@@ -281,7 +282,7 @@ const MetaDetails = () => {
                                     videoId={streamPath.id}
                                 >
                                     <StreamsList
-                                        className="w-full max-w-[80rem] flex-none self-center"
+                                        className="w-full flex-none"
                                         streams={metaDetails.streams}
                                         video={video}
                                         type={streamPath.type}
