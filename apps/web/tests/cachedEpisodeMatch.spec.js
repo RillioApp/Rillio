@@ -241,6 +241,23 @@ describe('single-episode torrents and numbering', () => {
         expect(matchCachedEpisode({ entries: [entry], filesByHash: { [ih]: files }, ...viewing(2) })[0].fileIdx).toBe(0);
     });
 
+    test('a double-episode file is offered on BOTH episodes\' pages', () => {
+        const ih = 'e'.repeat(40);
+        const files = [
+            { index: 0, path: `${DIR}/Mankind.S01E03E04.2160p.mp4`, length: 15 * GB, downloaded: 15 * GB, selected: true, video: true },
+            { index: 1, path: `${DIR}/Mankind.S01E05.2160p.mp4`, length: 8 * GB, downloaded: 8 * GB, selected: true, video: true },
+        ];
+        const entry = packEntry({ infoHash: ih, meta: showMeta({ videoId: null, fileIdx: null }) });
+        for (const n of [3, 4]) {
+            const [offer] = matchCachedEpisode({ entries: [entry], filesByHash: { [ih]: files }, ...viewing(n) });
+            expect(offer.fileIdx).toBe(0);
+            expect(offer.meta.videoId).toBe(`${SHOW}:1:${n}`);
+        }
+        expect(matchCachedEpisode({ entries: [entry], filesByHash: { [ih]: files }, ...viewing(2) })).toEqual([]);
+        expect(isViewedEpisode({ season: 1, episode: 3, lastEpisode: 5 }, 1, 4)).toBe(true);
+        expect(isViewedEpisode({ season: 1, episode: 3, lastEpisode: 5 }, 1, 6)).toBe(false);
+    });
+
     test('absolute numbering matches season 1 or a seasonless addon, never a later season', () => {
         const parsed = { season: null, episode: 3 };
         expect(isViewedEpisode(parsed, 1, 3)).toBe(true);

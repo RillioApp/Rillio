@@ -15,9 +15,10 @@
 // Everything after one of these tokens is release packaging, not the title.
 const NOISE = /\b(2160p|1080p|720p|480p|4k|uhd|hdr10?\+?|dv|dolby|vision|hevc|x?26[45]|h ?26[45]|10bit|8bit|aac\d?|ac3|eac3|dts(-?hd)?|truehd|atmos|remux|bluray|blu-ray|bdrip|brrip|web-?dl|web-?rip|webrip|hdtv|dvdrip|amzn|nf|dsnp|hmax|atvp|repack|proper|extended|unrated|imax|multi|dual|subs?)\b/i;
 
-// S01E03, S01.E03, "s01 e03". Ends on a non-digit rather than a word boundary
-// so a double episode (S01E03E04) still reads as its first episode.
-const SEASON_EPISODE = /\bs(\d{1,2})[\s._-]?e(\d{1,3})(?!\d)/i;
+// S01E03, S01.E03, "s01 e03", plus the further episodes of a combined file
+// (S01E03E04, S01E03-E04, S01E03.E04, S01E03-05) in group 3. A bare "-NN"
+// continuation must stand alone, so "S01E03-720p" is one episode.
+const SEASON_EPISODE = /\bs(\d{1,2})[\s._-]?e(\d{1,3})((?:[\s-]?e\d{1,3}(?!\d)|-\d{1,3}(?![\da-z]))*)(?!\d)/i;
 // 1x03 (never 1920x1080: the digits must stand alone on both sides).
 const CROSS = /\b(\d{1,2})x(\d{2,3})\b/i;
 // A season on its own: a pack's "S01" or a folder's "Season 1".
@@ -71,8 +72,10 @@ const parseReleaseName = (raw) => {
 
 /**
  * The season/episode one file of a torrent holds, from its path inside the
- * torrent (folders included, either slash). Returns { season, episode } with
- * season null for absolute numbering, or null when the path names no episode.
+ * torrent (folders included, either slash). Returns { season, episode,
+ * lastEpisode } (season null for absolute numbering; lastEpisode > episode for
+ * a combined file covering episode..lastEpisode, else equal), or null when the
+ * path names no episode.
  */
 const parseEpisode = (path) => {
     if (typeof path !== 'string' || path.length === 0) return null;
@@ -83,9 +86,19 @@ const parseEpisode = (path) => {
     const folders = segments.slice(0, -1).map(spaced);
 
     const se = file.match(SEASON_EPISODE);
-    if (se) return { season: parseInt(se[1], 10), episode: parseInt(se[2], 10) };
+    if (se) {
+        const episode = parseInt(se[2], 10);
+        // The combined file runs to its highest named episode; a lower one
+        // ("E04-E03") is not a range and is ignored.
+        const further = (se[3].match(/\d+/g) ?? []).map((n) => parseInt(n, 10));
+        const lastEpisode = Math.max(episode, ...further);
+        return { season: parseInt(se[1], 10), episode, lastEpisode };
+    }
     const cross = file.match(CROSS);
-    if (cross) return { season: parseInt(cross[1], 10), episode: parseInt(cross[2], 10) };
+    if (cross) {
+        const episode = parseInt(cross[2], 10);
+        return { season: parseInt(cross[1], 10), episode, lastEpisode: episode };
+    }
 
     // The season the file sits in: its own name first, then the nearest folder.
     const seasonSource = [file, ...folders.reverse()].map((part) => part.match(SEASON_ONLY)).find(Boolean);
@@ -98,7 +111,8 @@ const parseEpisode = (path) => {
     const leading = season !== null ? file.match(LEADING_NUMBER) : null;
     const episodeMatch = episodeOnly ?? dash ?? leading;
     if (!episodeMatch) return null;
-    return { season, episode: parseInt(episodeMatch[1], 10) };
+    const episode = parseInt(episodeMatch[1], 10);
+    return { season, episode, lastEpisode: episode };
 };
 
 module.exports = { parseReleaseName, parseEpisode };

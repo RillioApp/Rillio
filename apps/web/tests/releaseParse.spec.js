@@ -12,8 +12,6 @@ describe('parseEpisode', () => {
         ['Mankind.S01E03.Nixons.Women.2160p.ATVP.WEB-DL.DDP5.1.Atmos.DoVi.HEVC.by.DVT.mp4', 1, 3],
         ['For.All.Mankind.S01.2160p.ATVP.WEB-DL-DVT/Mankind.S01E04.He.Built.the.Saturn.V.2160p.mp4', 1, 4],
         ['show s02 e10 720p.mkv', 2, 10],
-        // A double episode names its first.
-        ['Show.S01E03E04.1080p.mkv', 1, 3],
         // 1x03.
         ['show.1x03.hdtv.mkv', 1, 3],
         ['Show - 2x11 - Title.avi', 2, 11],
@@ -29,7 +27,29 @@ describe('parseEpisode', () => {
         ['Show - 05 - The Title [1080p].mkv', null, 5],
     ];
     test.each(cases)('%s -> S%s E%s', (path, season, episode) => {
-        expect(parseEpisode(path)).toEqual({ season, episode });
+        expect(parseEpisode(path)).toEqual({ season, episode, lastEpisode: episode });
+    });
+
+    // A combined file covers every episode it names: it must match on each
+    // of those pages, not only the first.
+    const multi = [
+        ['Show.S01E03E04.1080p.mkv', 1, 3, 4],
+        ['Show.S01E03-E04.1080p.mkv', 1, 3, 4],
+        ['Show.S01E03.E04.1080p.mkv', 1, 3, 4],
+        ['Show S01E03-05 Title.mkv', 1, 3, 5],
+        ['Show.S01E03E04E05.mkv', 1, 3, 5],
+    ];
+    test.each(multi)('%s -> S%s E%s-E%s', (path, season, episode, lastEpisode) => {
+        expect(parseEpisode(path)).toEqual({ season, episode, lastEpisode });
+    });
+
+    // What follows an episode tag is not automatically more episodes.
+    test.each([
+        ['Show.S01E03-720p.mkv', 1, 3],
+        ['Show.S01E03.1080p.x265.mkv', 1, 3],
+        ['Show.S01E04-E03.mkv', 1, 4],
+    ])('%s -> S%s E%s only', (path, season, episode) => {
+        expect(parseEpisode(path)).toEqual({ season, episode, lastEpisode: episode });
     });
 
     const negatives = [

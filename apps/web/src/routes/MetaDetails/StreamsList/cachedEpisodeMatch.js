@@ -46,11 +46,14 @@ const metaIsTitle = (entry, metaId) => Boolean(entry.meta) && entry.meta.metaId 
 const tiedEntries = (entries, metaId, addonStreams) => entries.filter((entry) =>
     metaIsTitle(entry, metaId) || streamsFor(addonStreams, entry.infoHash).length > 0);
 
-// Whether a parsed file is the viewed episode. Absolute numbering (no season
-// in the path) equals per-season numbering only in a show's first season, or
-// on an addon that numbers without seasons.
+// Whether a parsed file is (or, for a combined file, covers) the viewed
+// episode. Absolute numbering (no season in the path) equals per-season
+// numbering only in a show's first season, or on an addon that numbers
+// without seasons.
 const isViewedEpisode = (parsed, season, episode) => {
-    if (parsed === null || typeof episode !== 'number' || parsed.episode !== episode) return false;
+    if (parsed === null || typeof episode !== 'number') return false;
+    const last = typeof parsed.lastEpisode === 'number' ? parsed.lastEpisode : parsed.episode;
+    if (episode < parsed.episode || episode > last) return false;
     const viewedSeason = typeof season === 'number' ? season : null;
     if (parsed.season === null) return viewedSeason === null || viewedSeason === 1;
     return viewedSeason === null ? parsed.season === 1 : parsed.season === viewedSeason;
