@@ -354,6 +354,40 @@ describe('a filename-matched offer keeps the episode context', () => {
         );
     });
 
+    test('two addons list the torrent: the link names the one that supplied the file', () => {
+        // A lists the pack without an index; B lists it with E03's index 2
+        // (and no player link of its own). The file is B's, so is the addon.
+        const OTHER = 'https://other-addon.example/manifest.json';
+        const fromA = { infoHash: PACK, addonTransportUrl: OTHER };
+        const fromB = { infoHash: PACK, fileIdx: 2, addonTransportUrl: TORRENTIO };
+        for (const addonStreams of [[fromA, fromB], [fromB, fromA]]) {
+            const [offer] = matchCachedEpisode({
+                entries: [packEntry({ meta: undefined })],
+                filesByHash: { [PACK]: packFiles() },
+                ...viewing(3, { addonStreams, page }),
+            });
+            expect(offer.fileIdx).toBe(2);
+            expect(offer.meta.streamTransportUrl).toBe(TORRENTIO);
+        }
+    });
+
+    test('an addon listing ANOTHER file of the pack is not the lister of this one', () => {
+        // C lists the pack for file 4; A lists it without an index; the
+        // episode's file (2) is found by name. A is the honest lister.
+        const OTHER = 'https://other-addon.example/manifest.json';
+        const THIRD = 'https://third-addon.example/manifest.json';
+        const [offer] = matchCachedEpisode({
+            entries: [packEntry({ meta: undefined })],
+            filesByHash: { [PACK]: packFiles().map((file) => ({ ...file, selected: true, downloaded: file.length })) },
+            ...viewing(3, {
+                addonStreams: [{ infoHash: PACK, fileIdx: 9, addonTransportUrl: THIRD }, { infoHash: PACK, addonTransportUrl: OTHER }],
+                page,
+            }),
+        });
+        expect(offer.fileIdx).toBe(2);
+        expect(offer.meta.streamTransportUrl).toBe(OTHER);
+    });
+
     test('a movie tied only by an addon gets the same full link', () => {
         const MOVIE = 'tt0000102';
         const ih = 'f'.repeat(40);

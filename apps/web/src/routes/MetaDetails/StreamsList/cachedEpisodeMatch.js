@@ -81,7 +81,12 @@ const hrefFor = (streams, fileIdx) => {
 const pageMeta = (view, streams, fileIdx) => {
     const { page, metaId, videoId, season, episode } = view;
     if (!page || typeof page.metaTransportUrl !== 'string' || page.metaTransportUrl.length === 0) return undefined;
-    const lister = streams.find((stream) => typeof stream.addonTransportUrl === 'string');
+    // The addon that supplied THIS file: one listing the torrent with exactly
+    // this fileIdx, else one listing it with no index (its stream is "the
+    // torrent"), never one listing it for a different file of the pack.
+    const listers = streams.filter((stream) => typeof stream.addonTransportUrl === 'string');
+    const lister = listers.find((stream) => typeof fileIdx === 'number' && stream.fileIdx === fileIdx) ??
+        listers.find((stream) => typeof stream.fileIdx !== 'number');
     const episodeView = typeof videoId === 'string' && videoId.length > 0 && videoId !== metaId;
     return {
         metaId,
