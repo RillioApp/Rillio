@@ -3,7 +3,7 @@
 // the episode is offered on that episode's page even when the torrent was
 // first played from (and recorded as) another episode.
 
-const { matchCachedEpisode, tiedEntries } = require('../src/routes/MetaDetails/StreamsList/cachedEpisodeMatch');
+const { matchCachedEpisode, tiedEntries, isViewedEpisode } = require('../src/routes/MetaDetails/StreamsList/cachedEpisodeMatch');
 
 const SHOW = 'tt7772588';
 const PACK = 'a'.repeat(40);
@@ -203,6 +203,27 @@ describe('tying a torrent to the title', () => {
             ...viewing(3),
         });
         expect(offer.fileIdx).toBe(2);
+    });
+});
+
+describe('single-episode torrents and numbering', () => {
+    test('a lone S01E02 torrent recorded as E02 is not offered on E03', () => {
+        const ih = 'c'.repeat(40);
+        const files = [{ index: 0, path: 'For.All.Mankind.S01E02.1080p.mkv', length: 3 * GB, downloaded: 3 * GB, selected: true, video: true }];
+        const entry = packEntry({ infoHash: ih, fileIdx: 0, fileCount: 1, meta: showMeta({ fileIdx: 0 }) });
+        expect(matchCachedEpisode({ entries: [entry], filesByHash: { [ih]: files }, ...viewing(3) })).toEqual([]);
+        expect(matchCachedEpisode({ entries: [entry], filesByHash: { [ih]: files }, ...viewing(2) })[0].fileIdx).toBe(0);
+    });
+
+    test('absolute numbering matches season 1 or a seasonless addon, never a later season', () => {
+        const parsed = { season: null, episode: 3 };
+        expect(isViewedEpisode(parsed, 1, 3)).toBe(true);
+        expect(isViewedEpisode(parsed, null, 3)).toBe(true);
+        expect(isViewedEpisode(parsed, 2, 3)).toBe(false);
+        expect(isViewedEpisode({ season: 2, episode: 3 }, 2, 3)).toBe(true);
+        expect(isViewedEpisode({ season: 2, episode: 3 }, 1, 3)).toBe(false);
+        expect(isViewedEpisode({ season: 1, episode: 4 }, 1, 3)).toBe(false);
+        expect(isViewedEpisode(null, 1, 3)).toBe(false);
     });
 });
 
