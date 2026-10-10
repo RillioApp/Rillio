@@ -3,20 +3,14 @@
 /**
  * EpisodeArrows - previous/next episode navigation for the streams view.
  *
- * Wraps the streams region and owns its centred 80rem column. The two
- * arrows are anchored to that column's outer edges, vertically centred on
- * the streams, so they belong to the page and read as page navigation
- * rather than a carousel control of the tiles:
- * - wide (the side margins can hold gap + arrow): in the empty margin, a
- *   fixed 3rem outside the column, so on very wide windows they stay with
- *   the column instead of drifting to the screen edges;
- * - medium (from `sm` until then): the column gives up a 5rem gutter each
- *   side and the arrows sit in it, 1.75rem off the cards, never over one;
- * - phone (below `sm`): no room for a gutter, so they become two small
- *   labelled pills ("S1E1", "S1E3") in a row above the streams header.
- * The wide/medium switch is a container query on the full content width
- * (so a meta-extension nav bar beside it counts), in rem like the column,
- * so it holds at every step of the root font-size ladder.
+ * Wraps the streams region and owns its centred 80rem column. From `sm`
+ * up the two arrows sit INSIDE that column, at its far left and far right,
+ * vertically centred on the streams, each in its own lane: the column
+ * insets the header, controls and cards by the arrow plus a gap, so the
+ * arrows never cover a card and read as page navigation rather than a
+ * carousel control of the tiles. Below `sm` two lanes would squeeze the
+ * cards, so the arrows become two small labelled pills ("S1E1", "S1E3")
+ * in a row above the streams header instead.
  *
  * The neighbours come from adjacentEpisodes (season-then-episode order,
  * specials only from a special); the click follows the target video's own
@@ -70,7 +64,7 @@ const ARROW_CLASS = cn(
     'bg-surface text-fg-muted hover:bg-surface-hover hover:text-fg',
     // Phone: a small labelled pill in the row above the streams.
     'h-11 gap-1 px-3.5 text-xs font-medium',
-    // sm and up: a round icon button out at the side edge.
+    // sm and up: a round icon button in its lane at the column's edge.
     'sm:pointer-events-auto sm:absolute sm:top-1/2 sm:size-13 sm:-translate-y-1/2 sm:p-0',
 );
 
@@ -109,66 +103,58 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
         return () => document.removeEventListener('keydown', onKeyDown);
     }, [hasArrows, previousTarget, nextTarget, go]);
 
-    // Three boxes: the query container (the full content width), the
-    // fallback gutter, and the centred 80rem streams column the arrows are
-    // anchored to. The sums, all in rem with the arrow at size-13 (3.25rem):
-    // - wide: 92.5rem = the column (80rem) + on each side the gap
-    //   (mr-12/ml-12, 3rem) + the arrow; from that container width up the
-    //   side margins hold the arrows and the gutter is dropped;
-    // - medium: the gutter (px-20, 5rem) = the gap (mr-7/ml-7, 1.75rem) + the
-    //   arrow, so the arrow ends exactly at the container's edge.
-    // Change the column width, gaps or arrow size and these sums together.
-    // Every box on the way from the arrow up to the container is
-    // overflow-visible: the global reset gives each element overflow:hidden,
-    // which would clip an arrow sitting outside the column.
+    // The centred 80rem streams column. From sm up, with arrows, it insets its
+    // content by a 5rem lane each side (px-20) = the arrow (size-13, 3.25rem)
+    // + a 1.75rem gap to the header and cards; the arrows sit at left-0 /
+    // right-0 inside the column's padding box, so nothing ever sits under
+    // them and nothing sticks out of a box (the global reset's
+    // overflow:hidden has nothing to clip). Change the arrow size and the
+    // lane together. Both lanes stay reserved at the first/last episode so
+    // the content never shifts sideways between episodes.
     return (
-        <div className={cn('@container flex flex-col overflow-visible', className)}>
-            <div className={cn('flex flex-col overflow-visible', hasArrows && 'sm:px-20 @min-[92.5rem]:px-0')}>
-                <div className="relative mx-auto flex w-full max-w-[80rem] flex-col overflow-visible">
-                    {
-                        hasArrows ?
-                            <nav
-                                ref={navRef}
-                                aria-label="Episodes"
-                                className="mx-2 flex items-center sm:pointer-events-none sm:absolute sm:inset-0 sm:mx-0 sm:overflow-visible"
-                            >
-                                {
-                                    previousTarget !== null ?
-                                        <Button
-                                            variant="ghost"
-                                            aria-label="Previous episode"
-                                            title={previousTarget.label}
-                                            onClick={() => go(previousTarget)}
-                                            className={cn(ARROW_CLASS, 'sm:right-full sm:mr-7 @min-[92.5rem]:mr-12')}
-                                        >
-                                            <ChevronLeft className="size-4 sm:size-6" />
-                                            <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
-                                        </Button>
-                                        :
-                                        null
-                                }
-                                {
-                                    nextTarget !== null ?
-                                        <Button
-                                            variant="ghost"
-                                            aria-label="Next episode"
-                                            title={nextTarget.label}
-                                            onClick={() => go(nextTarget)}
-                                            className={cn(ARROW_CLASS, 'ml-auto sm:left-full sm:ml-7 @min-[92.5rem]:ml-12')}
-                                        >
-                                            <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
-                                            <ChevronRight className="size-4 sm:size-6" />
-                                        </Button>
-                                        :
-                                        null
-                                }
-                            </nav>
-                            :
-                            null
-                    }
-                    {children}
-                </div>
-            </div>
+        <div className={cn('relative flex w-full max-w-[80rem] flex-col self-center', hasArrows && 'sm:px-20', className)}>
+            {
+                hasArrows ?
+                    <nav
+                        ref={navRef}
+                        aria-label="Episodes"
+                        className="mx-2 flex items-center sm:pointer-events-none sm:absolute sm:inset-0 sm:mx-0"
+                    >
+                        {
+                            previousTarget !== null ?
+                                <Button
+                                    variant="ghost"
+                                    aria-label="Previous episode"
+                                    title={previousTarget.label}
+                                    onClick={() => go(previousTarget)}
+                                    className={cn(ARROW_CLASS, 'sm:left-0')}
+                                >
+                                    <ChevronLeft className="size-4 sm:size-6" />
+                                    <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
+                                </Button>
+                                :
+                                null
+                        }
+                        {
+                            nextTarget !== null ?
+                                <Button
+                                    variant="ghost"
+                                    aria-label="Next episode"
+                                    title={nextTarget.label}
+                                    onClick={() => go(nextTarget)}
+                                    className={cn(ARROW_CLASS, 'ml-auto sm:right-0')}
+                                >
+                                    <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
+                                    <ChevronRight className="size-4 sm:size-6" />
+                                </Button>
+                                :
+                                null
+                        }
+                    </nav>
+                    :
+                    null
+            }
+            {children}
         </div>
     );
 };
