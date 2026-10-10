@@ -26,6 +26,7 @@ import StreamsList from './StreamsList';
 import VideosList from './VideosList';
 import HeroMedia from './HeroMedia';
 import SimilarRow from './SimilarRow';
+import EpisodeArrows from './EpisodeArrows';
 import useMetaDetails from './useMetaDetails';
 import useSeason from './useSeason';
 import useMetaExtensionTabs from './useMetaExtensionTabs';
@@ -77,6 +78,12 @@ const MetaDetails = () => {
             :
             null;
     }, [metaDetails.metaItem, streamPath]);
+    const episodes = React.useMemo(() => {
+        return metaDetails.metaItem !== null && metaDetails.metaItem.content.type === 'Ready' ?
+            metaDetails.metaItem.content.content.videos
+            :
+            [];
+    }, [metaDetails.metaItem]);
     const addToLibrary = React.useCallback(() => {
         if (metaDetails.metaItem === null || metaDetails.metaItem.content.type !== 'Ready') {
             return;
@@ -264,17 +271,25 @@ const MetaDetails = () => {
                             }
                         </div>
                             {
+                                // EpisodeArrows: previous/next episode out at the
+                                // side edges (renders the list untouched for a movie).
                                 streamPath !== null ?
-                                    <StreamsList
-                                        className="mt-8 w-full max-w-[80rem] flex-none self-center"
-                                        streams={metaDetails.streams}
-                                        video={video}
-                                        type={streamPath.type}
-                                        metaId={metaPath?.id ?? streamPath.id}
+                                    <EpisodeArrows
+                                        className="mt-8 flex-none self-stretch"
+                                        videos={episodes}
                                         videoId={streamPath.id}
-                                        libraryItem={metaDetails.libraryItem}
-                                        onEpisodeSearch={handleEpisodeSearch}
-                                    />
+                                    >
+                                        <StreamsList
+                                            className="w-full max-w-[80rem] flex-none self-center"
+                                            streams={metaDetails.streams}
+                                            video={video}
+                                            type={streamPath.type}
+                                            metaId={metaPath?.id ?? streamPath.id}
+                                            videoId={streamPath.id}
+                                            libraryItem={metaDetails.libraryItem}
+                                            onEpisodeSearch={handleEpisodeSearch}
+                                        />
+                                    </EpisodeArrows>
                                     :
                                     null
                             }
