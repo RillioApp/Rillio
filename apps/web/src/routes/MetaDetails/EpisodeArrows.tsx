@@ -28,7 +28,6 @@ import React from 'react';
 import { useNavigate } from 'react-router';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { Button } from 'rillio/components/ui/button';
-import { Tooltip } from 'rillio/components/ui/tooltip';
 import { cn } from 'rillio/components/ui/cn';
 
 const { adjacentEpisodes } = require('./adjacentEpisodes');
@@ -54,12 +53,14 @@ type Props = {
 const navigable = (target: Target | null): target is Target & { link: string } =>
     target !== null && typeof target.link === 'string';
 
+// Sizes are in rem and the app's root font is 14px: h-11 is ~38px, size-13
+// ~45px.
 const ARROW_CLASS = cn(
     'bg-surface text-fg-muted hover:bg-surface-hover hover:text-fg',
     // Phone: a small labelled pill in the row above the streams.
-    'h-9 gap-1 px-3 text-xs font-medium',
-    // sm and up: a 48px round icon button out at the side edge.
-    'sm:pointer-events-auto sm:absolute sm:top-1/2 sm:size-12 sm:-translate-y-1/2 sm:p-0',
+    'h-11 gap-1 px-3.5 text-xs font-medium',
+    // sm and up: a round icon button out at the side edge.
+    'sm:pointer-events-auto sm:absolute sm:top-1/2 sm:size-13 sm:-translate-y-1/2 sm:p-0',
 );
 
 const EpisodeArrows = ({ className, videos, videoId, children }: Props) => {
@@ -108,33 +109,31 @@ const EpisodeArrows = ({ className, videos, videoId, children }: Props) => {
                     >
                         {
                             previousTarget !== null ?
-                                <Tooltip label={previousTarget.label}>
-                                    <Button
-                                        variant="ghost"
-                                        aria-label="Previous episode"
-                                        onClick={() => go(previousTarget)}
-                                        className={cn(ARROW_CLASS, 'sm:-left-4')}
-                                    >
-                                        <ChevronLeft className="size-4 sm:size-6" />
-                                        <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
-                                    </Button>
-                                </Tooltip>
+                                <Button
+                                    variant="ghost"
+                                    aria-label="Previous episode"
+                                    title={previousTarget.label}
+                                    onClick={() => go(previousTarget)}
+                                    className={cn(ARROW_CLASS, 'sm:-left-4')}
+                                >
+                                    <ChevronLeft className="size-4 sm:size-6" />
+                                    <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
+                                </Button>
                                 :
                                 null
                         }
                         {
                             nextTarget !== null ?
-                                <Tooltip label={nextTarget.label}>
-                                    <Button
-                                        variant="ghost"
-                                        aria-label="Next episode"
-                                        onClick={() => go(nextTarget)}
-                                        className={cn(ARROW_CLASS, 'ml-auto sm:-right-4')}
-                                    >
-                                        <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
-                                        <ChevronRight className="size-4 sm:size-6" />
-                                    </Button>
-                                </Tooltip>
+                                <Button
+                                    variant="ghost"
+                                    aria-label="Next episode"
+                                    title={nextTarget.label}
+                                    onClick={() => go(nextTarget)}
+                                    className={cn(ARROW_CLASS, 'ml-auto sm:-right-4')}
+                                >
+                                    <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
+                                    <ChevronRight className="size-4 sm:size-6" />
+                                </Button>
                                 :
                                 null
                         }
