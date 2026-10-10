@@ -87,12 +87,6 @@ export const saveCacheMeta = (serverUrl: string, infoHash: string, meta: CacheMe
 // Release-name parsing
 // ---------------------------------------------------------------------------
 
-// Everything after one of these tokens is release packaging, not the title.
-const NOISE = /\b(2160p|1080p|720p|480p|4k|uhd|hdr10?\+?|dv|dolby|vision|hevc|x?26[45]|h ?26[45]|10bit|8bit|aac\d?|ac3|eac3|dts(-?hd)?|truehd|atmos|remux|bluray|blu-ray|bdrip|brrip|web-?dl|web-?rip|webrip|hdtv|dvdrip|amzn|nf|dsnp|hmax|atvp|repack|proper|extended|unrated|imax|multi|dual|subs?)\b/i;
-
-const SEASON_EPISODE = /\bs(\d{1,2})[\s._-]?e(\d{1,3})\b/i;
-const YEAR = /\b(19\d{2}|20\d{2})\b/;
-
 export type ParsedRelease = {
     title: string,
     year: string | null,
@@ -100,37 +94,13 @@ export type ParsedRelease = {
     episode: number | null,
 };
 
-/** Reduce a scene release name to a searchable title (+ year, + S/E). */
-export const parseReleaseName = (raw: string): ParsedRelease => {
-    // Drop a file extension and normalise separators to spaces.
-    let name = raw.replace(/\.[a-z0-9]{2,4}$/i, '');
-    name = name.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim();
-
-    const se = name.match(SEASON_EPISODE);
-    const season = se ? parseInt(se[1], 10) : null;
-    const episode = se ? parseInt(se[2], 10) : null;
-
-    // The title ends at whichever marker comes first: the season/episode tag,
-    // the release year, or the first packaging token. Everything to the left is
-    // the title, which is what a catalog search wants.
-    const cuts = [se?.index, name.match(YEAR)?.index, name.match(NOISE)?.index]
-        .filter((index): index is number => typeof index === 'number' && index > 0);
-    const cut = cuts.length > 0 ? Math.min(...cuts) : name.length;
-
-    const title = name
-        .slice(0, cut)
-        // A trailing group tag or bracketed junk survives the cut sometimes.
-        .replace(/[[({].*$/, '')
-        .replace(/[-\s]+$/, '')
-        .trim();
-
-    return {
-        title: title.length > 0 ? title : name,
-        year: name.match(YEAR)?.[1] ?? null,
-        season,
-        episode,
-    };
+// The one scene-name parser lives in a CommonJS sibling so the jest suite can
+// require it directly (tests/releaseParse.spec.js); the streams list uses the
+// same module to read season/episode from each file of a season pack.
+const { parseReleaseName } = require('./releaseParse') as {
+    parseReleaseName: (raw: string) => ParsedRelease,
 };
+export { parseReleaseName };
 
 // ---------------------------------------------------------------------------
 // Addon search
