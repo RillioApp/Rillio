@@ -15,10 +15,32 @@
 // Everything after one of these tokens is release packaging, not the title.
 const NOISE = /\b(2160p|1080p|720p|480p|4k|uhd|hdr10?\+?|dv|dolby|vision|hevc|x?26[45]|h ?26[45]|10bit|8bit|aac\d?|ac3|eac3|dts(-?hd)?|truehd|atmos|remux|bluray|blu-ray|bdrip|brrip|web-?dl|web-?rip|webrip|hdtv|dvdrip|amzn|nf|dsnp|hmax|atvp|repack|proper|extended|unrated|imax|multi|dual|subs?)\b/i;
 
-// S01E03, S01.E03, "s01 e03", plus the further episodes of a combined file
-// (S01E03E04, S01E03-E04, S01E03.E04, S01E03-05) in group 3. A bare "-NN"
-// continuation must stand alone, so "S01E03-720p" is one episode.
-const SEASON_EPISODE = /\bs(\d{1,2})[\s._-]?e(\d{1,3})((?:[\s-]?e\d{1,3}(?!\d)|-\d{1,3}(?![\da-z]))*)(?!\d)/i;
+// S01E03, S01.E03, "s01 e03", plus the further episodes of a combined file:
+// explicit ones (S01E03E04, S01E03-E04, S01E03.E04) in group 3, and one bare
+// "-NN" (S01E03-05) in group 4. The bare form is only a CANDIDATE: episode
+// titles start with numbers ("S05E17-99 Problems", "S02E01-2.0"), so
+// bareRangeEnd decides whether it is really a range.
+const SEASON_EPISODE = /\bs(\d{1,2})[\s._-]?e(\d{1,3})((?:[\s-]?e\d{1,3}(?!\d))*)(?:-(\d{1,3})(?![\da-z]))?(?!\d)/i;
+// How far a bare "-NN" may reach past the episode before it: a combined file
+// is two or three episodes, a title number ("99", "10") usually is not.
+const BARE_RANGE_SPAN = 3;
+
+// The end of a bare "-NN" range, or null when it is not one. It counts only
+// when it is plausibly the next episode(s) (greater than the episode before
+// it, by at most BARE_RANGE_SPAN) AND nothing title-like follows it: the
+// name must end there, or go on with a bracket or a packaging token
+// ("S01E03-05.1080p"). "S01E03-05.Title" is therefore read as E03 alone: a
+// combined file missed on its second episode's page beats a file played on
+// the wrong one.
+const bareRangeEnd = (match, name, previous) => {
+    if (match[4] === undefined) return null;
+    const end = parseInt(match[4], 10);
+    if (end <= previous || end - previous > BARE_RANGE_SPAN) return null;
+    const rest = name.slice(match.index + match[0].length).trim();
+    if (rest.length === 0 || /^[[(]/.test(rest)) return end;
+    const noise = rest.match(NOISE);
+    return noise !== null && noise.index === 0 ? end : null;
+};
 // 1x03 (never 1920x1080: the digits must stand alone on both sides).
 const CROSS = /\b(\d{1,2})x(\d{2,3})\b/i;
 // A season on its own: a pack's "S01" or a folder's "Season 1".
@@ -91,7 +113,8 @@ const parseEpisode = (path) => {
         // The combined file runs to its highest named episode; a lower one
         // ("E04-E03") is not a range and is ignored.
         const further = (se[3].match(/\d+/g) ?? []).map((n) => parseInt(n, 10));
-        const lastEpisode = Math.max(episode, ...further);
+        const explicitLast = Math.max(episode, ...further);
+        const lastEpisode = bareRangeEnd(se, file, explicitLast) ?? explicitLast;
         return { season: parseInt(se[1], 10), episode, lastEpisode };
     }
     const cross = file.match(CROSS);

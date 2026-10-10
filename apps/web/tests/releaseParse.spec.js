@@ -36,8 +36,12 @@ describe('parseEpisode', () => {
         ['Show.S01E03E04.1080p.mkv', 1, 3, 4],
         ['Show.S01E03-E04.1080p.mkv', 1, 3, 4],
         ['Show.S01E03.E04.1080p.mkv', 1, 3, 4],
-        ['Show S01E03-05 Title.mkv', 1, 3, 5],
         ['Show.S01E03E04E05.mkv', 1, 3, 5],
+        // A bare "-NN" range: the next few episodes, followed by packaging
+        // (or a bracket, or nothing), never by more title.
+        ['Show.S01E03-05.1080p.WEB-DL.mkv', 1, 3, 5],
+        ['Show S01E01-02 [1080p].mkv', 1, 1, 2],
+        ['Show.S01E07-08.mkv', 1, 7, 8],
     ];
     test.each(multi)('%s -> S%s E%s-E%s', (path, season, episode, lastEpisode) => {
         expect(parseEpisode(path)).toEqual({ season, episode, lastEpisode });
@@ -48,6 +52,14 @@ describe('parseEpisode', () => {
         ['Show.S01E03-720p.mkv', 1, 3],
         ['Show.S01E03.1080p.x265.mkv', 1, 3],
         ['Show.S01E04-E03.mkv', 1, 4],
+        // Episode titles that start with a number ("99 Problems",
+        // "10 Things", "2.0") are not ranges.
+        ['Supernatural.S05E17-99.Problems.mkv', 5, 17],
+        ['Show.S01E05-10.Things.mkv', 1, 5],
+        ['Show.S02E01-2.0.mkv', 2, 1],
+        ['Show S01E03-05 Title.mkv', 1, 3],
+        // Too far to be the next episode, even before packaging.
+        ['Show.S01E02-09.1080p.mkv', 1, 2],
     ])('%s -> S%s E%s only', (path, season, episode) => {
         expect(parseEpisode(path)).toEqual({ season, episode, lastEpisode: episode });
     });
