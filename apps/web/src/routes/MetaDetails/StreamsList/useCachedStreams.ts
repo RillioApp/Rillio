@@ -120,6 +120,9 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page
             });
         return fetchJson<CacheListEntry[]>('cache/list')
             .then(async (entries) => {
+                // Stopped while the list was loading: do not fan out a file
+                // listing per torrent for a page that is gone.
+                if (!isCurrent()) return;
                 const addonStreamsNow = streamsRef.current;
                 const filesByHash: Record<string, TorrentFile[]> = {};
                 // Which file of each tied torrent is this episode (or this

@@ -17,7 +17,9 @@ const pollSequential = (load, intervalMs) => {
     const isCurrent = () => !stopped;
     const run = () => {
         Promise.resolve()
-            .then(() => load(isCurrent))
+            // The first run is queued a microtask after the call, and a stop()
+            // can land in between (mount then unmount in the same tick).
+            .then(() => (stopped ? undefined : load(isCurrent)))
             // A failed load is the load's own business to report; it must
             // not end the poll.
             .catch((error) => console.error('pollSequential: a load failed', error))

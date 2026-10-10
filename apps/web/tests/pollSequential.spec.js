@@ -58,6 +58,18 @@ test('stopping (unmount, another title) invalidates the in-flight load and ends 
     expect(calls).toHaveLength(1);
 });
 
+test('stopped before the first load ran: no load at all', async () => {
+    // A mount immediately followed by an unmount (or a title change in the
+    // same tick): the queued first load must not start.
+    const { load, calls } = controlledLoad();
+    const stop = pollSequential(load, 3000);
+    stop();
+    await flush();
+    jest.advanceTimersByTime(30000);
+    await flush();
+    expect(calls).toHaveLength(0);
+});
+
 test('a load that throws does not end the poll', async () => {
     let count = 0;
     const stop = pollSequential(() => {
