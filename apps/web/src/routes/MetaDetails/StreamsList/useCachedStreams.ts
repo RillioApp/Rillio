@@ -4,65 +4,140 @@
 //
 // The streams panel lists what ADDONS can offer, which is a strange thing to
 // stare at when the file is already sitting in the cache, fully downloaded.
-// This reads the local cache and returns the entries that belong to the title
-// being viewed, matched through the metadata sidecar (common/cacheMetadata):
-// metaId for a movie, and the exact videoId for a series episode, so season 9
-// episode 2 never surfaces under episode 1.
+// This reads the local cache and returns the cached FILES that are the title
+// being viewed. The matching itself (which torrents are this title, which file
+// of a season pack is this episode) is pure and jest-covered in
+// cachedEpisodeMatch.js; this hook only fetches for it: the cache list, plus
+// each tied torrent's file listing on a series page.
 //
 // Cheap and quiet: one fetch per title (plus a refresh while a download is
 // still running), and a missing/unreachable server just yields nothing.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useProfile } from 'rillio/common';
 import type { CacheMeta } from 'rillio/common/cacheMetadata';
 import { serverFetch } from 'rillio/common/serverFetch';
+import type { TorrentFile } from 'rillio/routes/Cached/TorrentFiles';
 
+// One cached file offered on this page (see cachedEpisodeMatch.js).
 export type CachedStream = {
     infoHash: string,
     name: string,
+    // The file to play. Undefined when the torrent has no single playable
+    // file we could identify (a movie pack with several features).
+    fileIdx?: number,
+    // That file's bytes (the torrent's selection for a movie).
     downloaded: number,
     total: number,
     state: string,
-    fileIdx?: number,
+    // Aimed at the viewed episode; builds the full player deep link.
     meta?: CacheMeta,
+    // An addon's own deep link for exactly this file, when one is listed.
+    playHref: string | null,
+};
+
+type CacheListEntry = {
+    infoHash: string,
+    meta?: CacheMeta,
+};
+
+export type AddonStreamLike = {
+    infoHash?: unknown,
+    fileIdx?: unknown,
+    deepLinks?: { player?: unknown },
+};
+
+const { matchCachedEpisode, tiedEntries } = require('./cachedEpisodeMatch') as {
+    matchCachedEpisode: (args: {
+        entries: CacheListEntry[],
+        filesByHash: Record<string, TorrentFile[]>,
+        metaId: string,
+        videoId: string | null,
+        season: number | null,
+        episode: number | null,
+        addonStreams: AddonStreamLike[],
+    }) => CachedStream[],
+    tiedEntries: (entries: CacheListEntry[], metaId: string, addonStreams: AddonStreamLike[]) => CacheListEntry[],
 };
 
 const POLL_MS = 3000;
 
-const useCachedStreams = (metaId: string | null, videoId: string | null): CachedStream[] => {
+type Args = {
+    metaId: string | null,
+    videoId: string | null,
+    season: number | null,
+    episode: number | null,
+    // The addon streams listed on this page: an addon offering a cached
+    // torrent for this episode ties that torrent to the title and names its
+    // file.
+    addonStreams: AddonStreamLike[],
+};
+
+const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams }: Args): CachedStream[] => {
     const profile = useProfile();
     const serverUrl = profile.settings.streamingServerUrl;
     const [matches, setMatches] = useState<CachedStream[]>([]);
+    const loadToken = useRef(0);
+
+    // The core hands out a new streams array on every state update; restarting
+    // the poll for each would hammer the server. Only the torrent identities
+    // matter, so the poll restarts when THOSE change and reads the latest
+    // array from a ref.
+    const streamsRef = useRef(addonStreams);
+    streamsRef.current = addonStreams;
+    const evidenceKey = useMemo(() => addonStreams
+        .filter((stream) => typeof stream.infoHash === 'string')
+        .map((stream) => `${String(stream.infoHash).toLowerCase()}:${String(stream.fileIdx)}`)
+        .sort()
+        .join(','), [addonStreams]);
 
     const load = useCallback(() => {
         if (typeof serverUrl !== 'string' || typeof metaId !== 'string' || metaId.length === 0) {
             setMatches([]);
             return;
         }
-        serverFetch(new URL('cache/list', serverUrl))
+        loadToken.current += 1;
+        const token = loadToken.current;
+        const fetchJson = <T>(path: string): Promise<T> => serverFetch(new URL(path, serverUrl))
             .then((resp) => {
-                if (!resp.ok) throw new Error(`cache/list responded ${resp.status}`);
-                return resp.json();
-            })
-            .then((list: CachedStream[]) => {
-                setMatches(list.filter((entry) => {
-                    if (entry.meta?.metaId !== metaId) return false;
-                    // A series page is always scoped to one episode: only show a
-                    // torrent that holds THAT episode. An entry with no videoId
-                    // (a whole-season pack we could not pin down) is shown on any
-                    // episode of the title rather than hidden everywhere.
-                    if (typeof videoId === 'string' && videoId.length > 0) {
-                        const entryVideo = entry.meta?.videoId;
-                        return typeof entryVideo !== 'string' || entryVideo.length === 0 || entryVideo === videoId;
-                    }
-                    return true;
+                if (!resp.ok) throw new Error(`${path} responded ${resp.status}`);
+                return resp.json() as Promise<T>;
+            });
+        const episodeView = typeof videoId === 'string' && videoId.length > 0 && videoId !== metaId;
+        fetchJson<CacheListEntry[]>('cache/list')
+            .then(async (entries) => {
+                const addonStreamsNow = streamsRef.current;
+                const filesByHash: Record<string, TorrentFile[]> = {};
+                if (episodeView) {
+                    // Which file of each tied torrent is this episode is a
+                    // per-file question. A listing that fails leaves that
+                    // torrent out (logged), never guessed at.
+                    await Promise.all(tiedEntries(entries, metaId, addonStreamsNow).map((entry) =>
+                        fetchJson<TorrentFile[]>(`cache/files/${entry.infoHash}`)
+                            .then((files) => { filesByHash[entry.infoHash] = files; })
+                            .catch((error) => console.error('useCachedStreams: listing the files of', entry.infoHash, 'failed', error))));
+                }
+                // A slower, older load (the previous episode's, say) must not
+                // overwrite a newer one.
+                if (token !== loadToken.current) return;
+                setMatches(matchCachedEpisode({
+                    entries,
+                    filesByHash,
+                    metaId,
+                    videoId,
+                    season,
+                    episode,
+                    addonStreams: addonStreamsNow,
                 }));
             })
             // No streaming server, or it is down: there is simply nothing cached
             // to show. Never surfaced to the user - the addon streams below are
             // unaffected.
-            .catch(() => setMatches([]));
-    }, [serverUrl, metaId, videoId]);
+            .catch(() => {
+                if (token === loadToken.current) setMatches([]);
+            });
+        // evidenceKey stands in for addonStreams (read through the ref).
+    }, [serverUrl, metaId, videoId, season, episode, evidenceKey]);
 
     useEffect(() => {
         load();

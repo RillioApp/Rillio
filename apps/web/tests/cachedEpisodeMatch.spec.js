@@ -206,6 +206,32 @@ describe('tying a torrent to the title', () => {
     });
 });
 
+// The owner's S1E2 page showed "Downloaded 35.48 GB" and "22.51 GB": the whole
+// selection of each pack. A row's size and state are the episode file's.
+describe('size and progress are the episode file\'s, never the torrent\'s', () => {
+    test('episode file complete, torrent still downloading: complete, file-sized', () => {
+        const files = packFiles();
+        files[4] = { ...files[4], selected: true, downloaded: 1 * GB };
+        const entry = packEntry({ downloaded: 34 * GB, total: 46 * GB });
+        const [offer] = matchCachedEpisode({ entries: [entry], filesByHash: { [PACK]: files }, ...viewing(3) });
+        expect(offer.downloaded).toBe(11 * GB);
+        expect(offer.total).toBe(11 * GB);
+        expect(offer.downloaded >= offer.total).toBe(true);
+    });
+
+    test('torrent selection complete, episode file partial: partial, file-sized', () => {
+        // The entry claims its selection is done (as /cache/list reports for a
+        // finished selection), but this file is only partly here.
+        const files = packFiles();
+        files[2] = { ...files[2], downloaded: 4 * GB };
+        const entry = packEntry({ downloaded: 33 * GB, total: 33 * GB });
+        const [offer] = matchCachedEpisode({ entries: [entry], filesByHash: { [PACK]: files }, ...viewing(3) });
+        expect(offer.downloaded).toBe(4 * GB);
+        expect(offer.total).toBe(11 * GB);
+        expect(offer.downloaded < offer.total).toBe(true);
+    });
+});
+
 describe('single-episode torrents and numbering', () => {
     test('a lone S01E02 torrent recorded as E02 is not offered on E03', () => {
         const ih = 'c'.repeat(40);

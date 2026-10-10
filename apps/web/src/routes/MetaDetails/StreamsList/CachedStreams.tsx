@@ -9,6 +9,10 @@
  * row states what the addon list cannot: how much of it is actually here, and
  * where you stopped watching (the library's own timeOffset, the same number
  * that drives Continue Watching).
+ *
+ * Every number on a row is the viewed episode's FILE (its length, its
+ * downloaded bytes, "Downloaded" only when that file is complete), never the
+ * season pack it sits in: see cachedEpisodeMatch.js.
  */
 
 import React from 'react';
@@ -19,6 +23,7 @@ import { openModal } from 'rillio/common/modalEvents';
 import { Button } from 'rillio/components/ui/button';
 import { cn } from 'rillio/components/ui/cn';
 import { playerDeepLink } from 'rillio/common/cacheMetadata';
+import toPath from 'rillio/router/toPath';
 import type { CachedStream } from './useCachedStreams';
 
 const GB = 1024 ** 3;
@@ -65,18 +70,21 @@ const CachedStreams = ({ streams, libraryItem, videoId }: Props) => {
     }, [libraryItem, videoId]);
     const duration = libraryItem?.state?.duration ?? 0;
 
-    // The entry's own playable file, or - for a season pack, which has none -
-    // the file this specific episode was recorded as.
-    const fileIdxFor = (entry: CachedStream): number | undefined =>
-        typeof entry.fileIdx === 'number' ? entry.fileIdx :
-            typeof entry.meta?.fileIdx === 'number' ? entry.meta.fileIdx : undefined;
-
+    // Each entry is already ONE file: the viewed episode's file inside its
+    // torrent, or a movie's playable file (see cachedEpisodeMatch.js).
     const play = React.useCallback((entry: CachedStream) => {
+        // An addon listed exactly this file for this episode: its own deep
+        // link is the one a click on that addon stream would follow, transport
+        // urls and all, and the engine already holds the bytes.
+        if (typeof entry.playHref === 'string') {
+            navigate(toPath(entry.playHref));
+            return;
+        }
         core.transport.encodeStream({
             name: entry.name,
             description: '',
             infoHash: entry.infoHash,
-            fileIdx: fileIdxFor(entry),
+            fileIdx: entry.fileIdx,
         })
             .then((encoded: unknown) => {
                 if (typeof encoded !== 'string') {
@@ -101,7 +109,7 @@ const CachedStreams = ({ streams, libraryItem, videoId }: Props) => {
             {streams.map((entry, index) => {
                 const complete = entry.total > 0 && entry.downloaded >= entry.total;
                 const pct = entry.total > 0 ? Math.min(100, Math.round((entry.downloaded / entry.total) * 100)) : 0;
-                const playable = fileIdxFor(entry) !== undefined;
+                const playable = entry.fileIdx !== undefined;
                 return (
                     <Button
                         key={entry.infoHash}
@@ -114,7 +122,11 @@ const CachedStreams = ({ streams, libraryItem, videoId }: Props) => {
                                 'This torrent holds several videos; open it in Cache to pick one'
                         }
                         className={cn(
-                            'group flex h-auto w-44 shrink-0 flex-col items-stretch justify-start gap-1 whitespace-normal rounded-xl px-3.5 py-3 text-left font-normal',
+                            // Sized to its content (at least a carousel tile's
+                            // width): a fixed w-44 squeezed the header row, and
+                            // the global `word-break: break-word` then split
+                            // "Downloaded" mid-word onto two lines.
+                            'group flex h-auto w-max min-w-44 max-w-64 shrink-0 flex-col items-stretch justify-start gap-1 whitespace-normal rounded-xl px-3.5 py-3 text-left font-normal',
                             'bg-accent/10 ring-1 ring-inset ring-accent/30 hover:bg-accent/15',
                             // Breathing room before the addon tiles start.
                             index === streams.length - 1 && 'mr-4',
@@ -122,7 +134,7 @@ const CachedStreams = ({ streams, libraryItem, videoId }: Props) => {
                     >
                         <div className="flex items-center gap-1.5">
                             <HardDrive className="size-3.5 shrink-0 text-accent" />
-                            <span className="text-sm font-semibold text-accent">
+                            <span className="shrink-0 whitespace-nowrap text-sm font-semibold text-accent">
                                 {complete ? 'Downloaded' : `${pct}%`}
                             </span>
                             {
@@ -156,7 +168,7 @@ const CachedStreams = ({ streams, libraryItem, videoId }: Props) => {
                                     complete ? 'On this device' : 'Downloading now'
                             }
                         </div>
-                        <div className="flex items-center gap-2 text-[11px] tabular-nums text-fg-subtle">
+                        <div className="flex flex-wrap items-center gap-x-2 whitespace-nowrap text-[11px] tabular-nums text-fg-subtle">
                             <span>{complete ? formatBytes(entry.downloaded) : `${formatBytes(entry.downloaded)} of ${formatBytes(entry.total)}`}</span>
                             {
                                 resumeMs !== null && duration > 0 ?

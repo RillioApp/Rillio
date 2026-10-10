@@ -117,7 +117,20 @@ const StreamsList = ({ className, video, type, metaId, videoId, libraryItem, onE
     // branches below: whether addons are loading, empty or erroring has nothing
     // to do with whether the file is already here, and "no streams" while the
     // movie sits fully downloaded was the worst version of that.
-    const cachedStreams = useCachedStreams(metaId ?? null, videoId ?? null);
+    // Every addon's streams, regardless of the addon filter: an addon listing a
+    // cached torrent for this episode is evidence of what that torrent is.
+    const allAddonStreams = React.useMemo(() => {
+        return props.streams
+            .filter((streams) => streams.content.type === 'Ready')
+            .flatMap((streams) => streams.content.content);
+    }, [props.streams]);
+    const cachedStreams = useCachedStreams({
+        metaId: metaId ?? null,
+        videoId: videoId ?? null,
+        season: typeof video?.season === 'number' ? video.season : null,
+        episode: typeof video?.episode === 'number' ? video.episode : null,
+        addonStreams: allAddonStreams,
+    });
     // Whether the curated carousel will render (it is the preferred home for
     // the on-device tiles; see the fallback below).
     const hasCuratedStreams = filteredStreams.length > 0;
