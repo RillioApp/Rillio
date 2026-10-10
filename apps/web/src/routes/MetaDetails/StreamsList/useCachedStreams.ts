@@ -157,6 +157,13 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page
         // evidenceKey stands in for addonStreams (read through the ref).
     }, [serverUrl, metaId, videoId, season, episode, evidenceKey, pageType, pageName, metaTransportUrl]);
 
+    // Another title or episode: the previous one's cards go at once, rather
+    // than sitting on this page until the first (possibly slow) load lands.
+    // Keyed on the identity only: addon streams arriving must not blink them.
+    useEffect(() => {
+        setMatches((current) => (current.length === 0 ? current : []));
+    }, [metaId, videoId]);
+
     // Sequential: the next load starts POLL_MS after the previous one
     // finished, so a slow server's results still land (see pollSequential).
     useEffect(() => pollSequential(load, POLL_MS), [load]);
