@@ -80,6 +80,24 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-libmpv-windows.ps1
 
+      # The tauri CLI is PINNED, to the same version as release.yml (the full
+      # reasoning and the bump checklist live there). Left alone, tauri-action
+      # installs the newest @tauri-apps/cli 2.x at build time, and the CLI
+      # carries the NSIS installer template: that is how 2.12.0's Restart
+      # Manager app-running check arrived unannounced. `tauriScript: tauri`
+      # below makes the action run this install instead of doing its own.
+      # When bumping, re-check the template's CheckIfAppIsRunning against
+      # apps/desktop/src-tauri/windows/hooks.nsh.
+      - name: Install the pinned tauri CLI
+        shell: pwsh
+        env:
+          TAURI_CLI_VERSION: 2.12.2
+        run: |
+          npm install -g "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "npm install of @tauri-apps/cli@$env:TAURI_CLI_VERSION failed" }
+          $got = (tauri --version)
+          if ("$got" -notmatch "(^|\s)$([regex]::Escape($env:TAURI_CLI_VERSION))$") { throw "expected tauri CLI $env:TAURI_CLI_VERSION, got '$got'" }
+
       # Same action a release uses, minus tagName: with no tag, tauri-action
       # only builds (it creates no release), so this is a true dress rehearsal
       # of the release bundle rather than a compile check.
@@ -93,6 +111,8 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
         with:
           projectPath: apps/desktop/src-tauri
+          # The pinned global CLI installed above (see the comment there).
+          tauriScript: tauri
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
