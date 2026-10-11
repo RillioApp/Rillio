@@ -78,8 +78,6 @@ jobs:
 
       - name: Fetch and bundle libmpv
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/fetch-libmpv-windows.ps1
 
       # Same action a release uses, minus tagName: with no tag, tauri-action

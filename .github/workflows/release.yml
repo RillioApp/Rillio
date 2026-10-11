@@ -83,8 +83,6 @@ jobs:
 
       - name: Fetch and bundle libmpv
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/fetch-libmpv-windows.ps1
 
       - uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0 (latest; older pins fail release creation with "Resource not accessible")
