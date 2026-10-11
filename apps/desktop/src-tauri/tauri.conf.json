@@ -27,7 +27,8 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "headerImage": "installer/nsis-header.bmp",
-        "sidebarImage": "installer/nsis-sidebar.bmp"
+        "sidebarImage": "installer/nsis-sidebar.bmp",
+        "installerHooks": "windows/hooks.nsh"
       },
       "wix": {
         "bannerPath": "installer/wix-banner.bmp",
