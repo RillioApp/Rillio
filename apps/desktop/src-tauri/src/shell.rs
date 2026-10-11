@@ -147,6 +147,9 @@ pub struct Controller {
     snapshot: Mutex<SnapshotCache>,
     /// GPU panel-blur shader state (see [`player_blur_rect`]).
     blur: Mutex<BlurState>,
+    /// Held across one whole compute-and-write of the blur options, so that
+    /// concurrent applies cannot land out of order (see [`apply_blur`]).
+    blur_apply: Mutex<()>,
 }
 
 /// The most recent [`player_snapshot`] result and when it was produced.
@@ -602,6 +605,7 @@ impl Controller {
             props: Mutex::new(serde_json::Map::new()),
             snapshot: Mutex::new(SnapshotCache::default()),
             blur: Mutex::new(BlurState::default()),
+            blur_apply: Mutex::new(()),
         })
     }
 
@@ -1108,6 +1112,13 @@ fn ensure_blur_shader(app: &AppHandle, ctrl: &Arc<Controller>) -> Result<(), Str
 
 /// Push the currently desired blur state to mpv.
 fn apply_blur(ctrl: &Controller) -> Result<(), String> {
+    // ONE APPLY AT A TIME. Three threads call this (the web's IPC call, the
+    // throttle's trailing apply, and the event loop when the geometry changes),
+    // and each reads the inputs, renders a string and writes it. Unserialized,
+    // a caller that read the old geometry could write AFTER one that read the
+    // new, leaving mpv on the stale string while `last_opts` records the fresh
+    // one, so nothing would ever correct it.
+    let _applying = ctrl.blur_apply.lock().unwrap_or_else(|e| e.into_inner());
     let desired = {
         let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
         blur.trailing = false;
@@ -1119,14 +1130,14 @@ fn apply_blur(ctrl: &Controller) -> Result<(), String> {
     if blur_debug_paint() {
         opts.push_str(",debug=1");
     }
-    {
-        let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
-        if blur.last_opts.as_deref() == Some(opts.as_str()) {
-            return Ok(());
-        }
-        blur.last_opts = Some(opts.clone());
+    if ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).last_opts.as_deref() == Some(opts.as_str()) {
+        return Ok(());
     }
-    ctrl.mpv.set_property("glsl-shader-opts", &opts)
+    ctrl.mpv.set_property("glsl-shader-opts", &opts)?;
+    // Recorded only once mpv has accepted it: a rejected write must be retried
+    // by the next apply, not remembered as done.
+    ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).last_opts = Some(opts);
+    Ok(())
 }
 
 /// Re-derive the blur from the rects already asked for, after mpv reported a new
