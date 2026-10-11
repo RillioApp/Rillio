@@ -306,18 +306,28 @@ pub fn write_progress(progress: &UpdateProgress) {
 ///
 /// ★ This is not a detail, it is the whole reason updates work. The NSIS
 /// installer runs SILENTLY (`installMode: quiet` -> `/S /R`) and starts by
-/// looking for a running process literally named `rillio-desktop.exe`
-/// (`CheckIfAppIsRunning` in tauri-bundler's utils.nsh). Running the splash
-/// from the installed binary meant the installer found "the app" still running
-/// AND could not overwrite the locked exe - and its silent-mode failure path
-/// writes a red line to a console a windowed installer does not have and then
-/// `Abort`s, installing NOTHING and reporting NOTHING. The user was relaunched
-/// onto the OLD version by the backstop below, so a failed update looked like a
+/// checking whether the app is running (`CheckIfAppIsRunning` in
+/// tauri-bundler's utils.nsh). Up to tauri CLI 2.11.x that check looked for a
+/// process literally named `rillio-desktop.exe`; since CLI 2.12.0 it asks
+/// Windows Restart Manager which processes have `$INSTDIR\rillio-desktop.exe`
+/// in use, then force-shuts them down. Running the splash from the installed
+/// binary meant the installer found "the app" still running AND could not
+/// overwrite the locked exe - and its silent-mode failure path writes a red
+/// line to a console a windowed installer does not have and then `Abort`s,
+/// installing NOTHING and reporting NOTHING. The user was relaunched onto the
+/// OLD version by the backstop below, so a failed update looked like a
 /// successful one (v0.1.24 -> v0.1.25, 2026-07-21).
 ///
-/// A copy under another name is invisible to that check and holds no lock on
-/// the install directory, so the installer can replace every file while the
-/// splash keeps showing progress - which is the point of having a splash.
+/// The renamed temp copy still matters under the Restart Manager check, for a
+/// different reason than its name: it runs from a DIFFERENT IMAGE FILE, so it
+/// is not among the processes using `$INSTDIR\rillio-desktop.exe`, is not
+/// listed, and is not shut down. It also holds no lock on the install
+/// directory, so the installer can replace every file while the splash keeps
+/// showing progress - which is the point of having a splash.
+///
+/// The same check races the main process's own exit (the installer can reach
+/// it while the old process is still being torn down); the installer-side
+/// wait for that lives in `windows/hooks.nsh`.
 fn updater_copy_path() -> std::path::PathBuf {
     std::env::temp_dir().join("rillio-updater.exe")
 }
