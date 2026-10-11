@@ -26,4 +26,8 @@ const useRouteFocused = () => {
 
 export const RouteFocusedProvider = RouteFocusedContext.Provider;
 
+// Only "is my route the top one" (true outside any route), without the
+// window-focus half of useRouteFocused.
+export const useRouteOnTop = () => React.useContext(RouteFocusedContext);
+
 export default useRouteFocused;
