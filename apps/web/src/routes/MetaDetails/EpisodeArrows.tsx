@@ -35,6 +35,7 @@ import { Button } from 'rillio/components/ui/button';
 import { cn } from 'rillio/components/ui/cn';
 
 const { adjacentEpisodes } = require('./adjacentEpisodes');
+const { episodeArrowKey } = require('./episodeArrowKey');
 const { default: toPath } = require('rillio-router/toPath');
 
 type Target = {
@@ -96,14 +97,14 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
             return;
         }
         const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-            if (event.defaultPrevented || event.repeat) return;
-            if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
             const active = document.activeElement;
             const onArrow = active instanceof HTMLElement && navRef.current !== null && navRef.current.contains(active);
-            if (active !== null && active !== document.body && !onArrow) return;
-            if (document.querySelector('[role="dialog"]') !== null) return;
-            const target = event.key === 'ArrowLeft' ? previousTarget : nextTarget;
+            const step = episodeArrowKey(event, {
+                focusFree: active === null || active === document.body || onArrow,
+                dialogOpen: document.querySelector('[role="dialog"]') !== null,
+            });
+            if (step === null) return;
+            const target = step === 'previous' ? previousTarget : nextTarget;
             if (target === null) return;
             event.preventDefault();
             go(target);
