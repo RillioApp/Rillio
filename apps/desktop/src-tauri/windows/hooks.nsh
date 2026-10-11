@@ -11,10 +11,14 @@
 ; makes the silent installer Abort with no message. On an update the app starts
 ; the installer and exits at once (tauri-plugin-updater: ShellExecute, then
 ; std::process::exit(0)), so the installer can reach that check while the old
-; process is still being torn down by the kernel: it is still listed, it can no
-; longer be shut down (ERROR_FAIL_SHUTDOWN 351, Application event 10006), and
-; nothing gets installed. The pre-2.12 macro killed by process name and slept
-; 500 ms, which hid the race. Seen for real on the 0.1.46 -> 0.1.47 update.
+; process is still being torn down by the kernel. It is still listed, and
+; RmShutdown gives a process that is already exiting only about half a second
+; to disappear (measured: a teardown that outlasts that returns
+; ERROR_FAIL_SHUTDOWN 351 with Application event 10006, status 17), so nothing
+; gets installed. How long a teardown takes depends on how much memory the app
+; had committed and on what the machine is doing, which is why it is
+; intermittent. The pre-2.12 macro killed by process name and slept 500 ms,
+; which hid the race. Seen for real on the 0.1.46 -> 0.1.47 update.
 ;
 ; What. Only when /UPDATE was passed ($UpdateMode = 1, set by the template's
 ; .onInit) and the main binary already exists: poll until Restart Manager
