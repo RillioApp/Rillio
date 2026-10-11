@@ -8,9 +8,8 @@
  * vertically centred on the streams, each in its own lane: the column
  * insets the header, controls and cards by the arrow plus a gap, so the
  * arrows never cover a card and read as page navigation rather than a
- * carousel control of the tiles. The arrows are bare chevrons, and a faint
- * 1px rule in each gap (only beside an arrow that renders) separates the
- * lane from the content. Below `sm` two lanes would squeeze the
+ * carousel control of the tiles. The arrows are bare chevrons with no fill
+ * or rule beside them. Below `sm` two lanes would squeeze the
  * cards, so the arrows become two small labelled pills ("S1E1", "S1E3")
  * in a row above the streams header instead.
  *
@@ -78,13 +77,6 @@ const ARROW_CLASS = cn(
     'sm:pointer-events-auto sm:absolute sm:top-1/2 sm:size-13 sm:-translate-y-1/2 sm:bg-transparent sm:p-0 sm:hover:bg-transparent',
 );
 
-// The 1px rule between an arrow and the content, in the lane's gap: the gap
-// runs from the arrow's inner edge (3.25rem) to the content (5rem), so its
-// centre is 4.125rem (16.5 on the spacing scale) from the column edge. It
-// spans the full streams block, the same box the arrow is centred on, so the
-// chevron sits at the rule's midpoint. border-line token (white 8%).
-const DIVIDER_CLASS = 'hidden sm:absolute sm:inset-y-0 sm:block sm:w-px sm:bg-line';
-
 const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) => {
     const navigate = useNavigate();
     const navRef = React.useRef<HTMLElement>(null);
@@ -139,37 +131,31 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
                     >
                         {
                             previousTarget !== null ?
-                                <React.Fragment>
-                                    <Button
-                                        variant="ghost"
-                                        aria-label="Previous episode"
-                                        title={previousTarget.label}
-                                        onClick={() => go(previousTarget)}
-                                        className={cn(ARROW_CLASS, 'sm:left-0')}
-                                    >
-                                        <ChevronLeft className="size-4 sm:size-7" />
-                                        <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
-                                    </Button>
-                                    <span aria-hidden={true} className={cn(DIVIDER_CLASS, 'sm:left-16.5 sm:-translate-x-1/2')} />
-                                </React.Fragment>
+                                <Button
+                                    variant="ghost"
+                                    aria-label="Previous episode"
+                                    title={previousTarget.label}
+                                    onClick={() => go(previousTarget)}
+                                    className={cn(ARROW_CLASS, 'sm:left-0')}
+                                >
+                                    <ChevronLeft className="size-4 sm:size-7" />
+                                    <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
+                                </Button>
                                 :
                                 null
                         }
                         {
                             nextTarget !== null ?
-                                <React.Fragment>
-                                    <span aria-hidden={true} className={cn(DIVIDER_CLASS, 'sm:right-16.5 sm:translate-x-1/2')} />
-                                    <Button
-                                        variant="ghost"
-                                        aria-label="Next episode"
-                                        title={nextTarget.label}
-                                        onClick={() => go(nextTarget)}
-                                        className={cn(ARROW_CLASS, 'ml-auto sm:right-0')}
-                                    >
-                                        <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
-                                        <ChevronRight className="size-4 sm:size-7" />
-                                    </Button>
-                                </React.Fragment>
+                                <Button
+                                    variant="ghost"
+                                    aria-label="Next episode"
+                                    title={nextTarget.label}
+                                    onClick={() => go(nextTarget)}
+                                    className={cn(ARROW_CLASS, 'ml-auto sm:right-0')}
+                                >
+                                    <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
+                                    <ChevronRight className="size-4 sm:size-7" />
+                                </Button>
                                 :
                                 null
                         }
