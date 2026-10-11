@@ -272,6 +272,8 @@ const MetaDetails = () => {
                                         type={streamPath.type}
                                         metaId={metaPath?.id ?? streamPath.id}
                                         videoId={streamPath.id}
+                                        metaName={metaDetails.metaItem?.content.type === 'Ready' ? (metaDetails.metaItem.content.content as MetaItemMetaDetails).name : null}
+                                        metaTransportUrl={metaDetails.metaItem?.addon?.transportUrl ?? null}
                                         libraryItem={metaDetails.libraryItem}
                                         onEpisodeSearch={handleEpisodeSearch}
                                     />

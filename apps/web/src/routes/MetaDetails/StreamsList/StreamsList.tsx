@@ -43,11 +43,15 @@ type Props = {
     // can be surfaced above the addon streams (see CachedStreams).
     metaId?: string | null;
     videoId?: string | null;
+    // The title's name and the addon that served its meta: a cached torrent
+    // with no record of this title still plays as a catalog play would.
+    metaName?: string | null;
+    metaTransportUrl?: string | null;
     libraryItem?: any;
     onEpisodeSearch?: (season: number, episode: number) => void;
 };
 
-const StreamsList = ({ className, video, type, metaId, videoId, libraryItem, onEpisodeSearch, ...props }: Props) => {
+const StreamsList = ({ className, video, type, metaId, videoId, metaName, metaTransportUrl, libraryItem, onEpisodeSearch, ...props }: Props) => {
     const { t } = useTranslation();
     const platform = usePlatform();
     const profile = useProfile();
@@ -117,7 +121,30 @@ const StreamsList = ({ className, video, type, metaId, videoId, libraryItem, onE
     // branches below: whether addons are loading, empty or erroring has nothing
     // to do with whether the file is already here, and "no streams" while the
     // movie sits fully downloaded was the worst version of that.
-    const cachedStreams = useCachedStreams(metaId ?? null, videoId ?? null);
+    // Every addon's streams, regardless of the addon filter: an addon listing a
+    // cached torrent for this episode is evidence of what that torrent is.
+    // Each tagged with the addon that listed it, which becomes the stream
+    // transport url of a deep link built for that torrent.
+    const allAddonStreams = React.useMemo(() => {
+        return props.streams
+            .filter((streams) => streams.content.type === 'Ready')
+            .flatMap((streams) => streams.content.content.map((stream: any) => ({
+                ...stream,
+                addonTransportUrl: streams.addon?.transportUrl,
+            })));
+    }, [props.streams]);
+    const cachedStreams = useCachedStreams({
+        metaId: metaId ?? null,
+        videoId: videoId ?? null,
+        season: typeof video?.season === 'number' ? video.season : null,
+        episode: typeof video?.episode === 'number' ? video.episode : null,
+        addonStreams: allAddonStreams,
+        page: {
+            type: type ?? null,
+            name: metaName ?? null,
+            metaTransportUrl: metaTransportUrl ?? null,
+        },
+    });
     // Whether the curated carousel will render (it is the preferred home for
     // the on-device tiles; see the fallback below).
     const hasCuratedStreams = filteredStreams.length > 0;
