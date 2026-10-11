@@ -6,8 +6,13 @@
 // listeners bound to that name (onShortcut users: the player's keys, the
 // fullscreen key) and then to `onShortcut`, the app's own handler (tab
 // digits, search, history, the shortcuts and gamepad guides).
+//
+// `exclusive` is "the top route claims the keyboard" (useExclusiveKeyboard,
+// the player): the app's handler is then skipped whole, so no key can act
+// outside that route. Bound listeners still hear theirs: the route's own
+// keys, and fullscreen, which is bound outside every route.
 
-const dispatchShortcut = (shortcuts, { ctrlKey, shiftKey, altKey, metaKey, code, key }, { listeners, onShortcut }) => {
+const dispatchShortcut = (shortcuts, { ctrlKey, shiftKey, altKey, metaKey, code, key }, { listeners, onShortcut, exclusive }) => {
     shortcuts.forEach(({ name, combos }) => combos.forEach((keys) => {
         const modifers = (keys.includes('Ctrl') === ctrlKey)
             && (keys.includes('Shift') === shiftKey)
@@ -21,7 +26,9 @@ const dispatchShortcut = (shortcuts, { ctrlKey, shiftKey, altKey, metaKey, code,
                 bound.forEach((listener) => listener(combo, key));
             }
 
-            onShortcut(name, combo, key);
+            if (!exclusive) {
+                onShortcut(name, combo, key);
+            }
         }
     }));
 };

@@ -12,6 +12,7 @@ interface ShortcutsContext {
     grouped: ShortcutGroup[],
     on: (name: ShortcutName, listener: ShortcutListener) => void,
     off: (name: ShortcutName, listener: ShortcutListener) => void,
+    claimKeyboard: () => () => void,
 }
 
 const ShortcutsContext = createContext<ShortcutsContext>({} as ShortcutsContext);
@@ -34,6 +35,7 @@ const isInputFocused = () => {
 const ShortcutsProvider = ({ children, onShortcut }: Props) => {
     const listeners = useRef<Map<ShortcutName, Set<ShortcutListener>>>(new Map());
     const lastRepeatTime = useRef<Map<string, number>>(new Map());
+    const keyboardClaims = useRef<Set<object>>(new Set());
 
     const onKeyDown = useCallback((event: KeyboardEvent) => {
         if (isInputFocused()) return;
@@ -45,8 +47,21 @@ const ShortcutsProvider = ({ children, onShortcut }: Props) => {
             lastRepeatTime.current.set(event.code, now);
         }
 
-        dispatchShortcut(SHORTCUTS, event, { listeners: listeners.current, onShortcut });
+        dispatchShortcut(SHORTCUTS, event, {
+            listeners: listeners.current,
+            onShortcut,
+            exclusive: keyboardClaims.current.size > 0,
+        });
     }, [onShortcut]);
+
+    // See useExclusiveKeyboard. Returns the release.
+    const claimKeyboard = () => {
+        const claim = {};
+        keyboardClaims.current.add(claim);
+        return () => {
+            keyboardClaims.current.delete(claim);
+        };
+    };
 
     const on = (name: ShortcutName, listener: ShortcutListener) => {
         !listeners.current.has(name) && listeners.current.set(name, new Set());
@@ -63,7 +78,7 @@ const ShortcutsProvider = ({ children, onShortcut }: Props) => {
     }, [onKeyDown]);
 
     return (
-        <ShortcutsContext.Provider value={{ grouped: shortcuts, on, off }}>
+        <ShortcutsContext.Provider value={{ grouped: shortcuts, on, off, claimKeyboard }}>
             {children}
         </ShortcutsContext.Provider>
     );

@@ -11,7 +11,7 @@ import { rewriteServerUrl } from 'rillio/common/serverAddress';
 import { useCore } from 'rillio/core';
 import { useServices, useGamepad } from 'rillio/services';
 import { useContentGamepadNavigation } from 'rillio/services/GamepadNavigation';
-import { useSettings, useProfile, useFullscreen, useBinaryState, useToast, useStreamingServer, withCoreSuspender, usePlatform, onShortcut, useDiscord, EMPTY_DISCORD_TIMESTAMPS, getPlaybackDiscordActivity } from 'rillio/common';
+import { useSettings, useProfile, useFullscreen, useBinaryState, useToast, useStreamingServer, withCoreSuspender, usePlatform, onShortcut, useExclusiveKeyboard, useDiscord, EMPTY_DISCORD_TIMESTAMPS, getPlaybackDiscordActivity } from 'rillio/common';
 import { toPath } from 'rillio-router';
 import { Presence, ContextMenu } from 'rillio/components';
 import { cn } from 'rillio/components/ui/cn';
@@ -955,6 +955,18 @@ const Player = () => {
         closeMenus();
         !settings.escExitFullscreen && navigate(-1);
     }, [settings.escExitFullscreen]);
+
+    // Every key is the player's while it is on top: the app's own shortcuts
+    // (tab digits, search, history, the guides) are off. That takes the app's
+    // Backspace "go back" with it, so the player binds it as its own way out
+    // exactly when Escape is not one (escExitFullscreen, the default: Escape
+    // only leaves fullscreen). Combo 0 is plain Backspace; Ctrl+Backspace
+    // (forward) has nothing to do here.
+    useExclusiveKeyboard();
+
+    onShortcut('navigateHistory', (combo: number) => {
+        combo === 0 && navigate(-1);
+    }, [], settings.escExitFullscreen);
 
     React.useLayoutEffect(() => {
         if (menusOpen) {
