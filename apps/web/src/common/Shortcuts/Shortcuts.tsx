@@ -1,6 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef } from 'react';
 import shortcuts from './shortcuts.json';
 
+const { dispatchShortcut } = require('./dispatchShortcut');
+
 const SHORTCUTS = shortcuts.map(({ shortcuts }) => shortcuts).flat();
 
 export type ShortcutName = string;
@@ -33,29 +35,17 @@ const ShortcutsProvider = ({ children, onShortcut }: Props) => {
     const listeners = useRef<Map<ShortcutName, Set<ShortcutListener>>>(new Map());
     const lastRepeatTime = useRef<Map<string, number>>(new Map());
 
-    const onKeyDown = useCallback(({ ctrlKey, shiftKey, altKey, metaKey, code, key, repeat }: KeyboardEvent) => {
+    const onKeyDown = useCallback((event: KeyboardEvent) => {
         if (isInputFocused()) return;
 
-        if (repeat) {
+        if (event.repeat) {
             const now = Date.now();
-            const last = lastRepeatTime.current.get(code) ?? 0;
+            const last = lastRepeatTime.current.get(event.code) ?? 0;
             if (now - last < REPEAT_THROTTLE_MS) return;
-            lastRepeatTime.current.set(code, now);
+            lastRepeatTime.current.set(event.code, now);
         }
 
-        SHORTCUTS.forEach(({ name, combos }) => combos.forEach((keys) => {
-            const modifers = (keys.includes('Ctrl') === ctrlKey)
-                && (keys.includes('Shift') === shiftKey)
-                && !altKey
-                && !metaKey;
-
-            if (modifers && (keys.includes(code) || keys.includes(key.toUpperCase()))) {
-                const combo = combos.indexOf(keys);
-                listeners.current.get(name)?.forEach((listener) => listener(combo, key));
-
-                onShortcut(name as ShortcutName, combo, key);
-            }
-        }));
+        dispatchShortcut(SHORTCUTS, event, { listeners: listeners.current, onShortcut });
     }, [onShortcut]);
 
     const on = (name: ShortcutName, listener: ShortcutListener) => {
