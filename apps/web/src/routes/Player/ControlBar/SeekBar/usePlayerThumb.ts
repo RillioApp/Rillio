@@ -21,11 +21,24 @@ const MAX_TRIES = 30;
 
 const bucketOf = (timeSec: number) => Math.round(timeSec / BUCKET_SECONDS);
 
-const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null): string | null => {
+// How many DEVICE pixels a width in rem covers right now. The shell captures
+// the frame at exactly this width, so the image is never stretched: the root
+// font size steps with the window width (tailwind.css) and the pixel ratio
+// with the screen and the zoom, hence read live instead of assumed.
+const devicePixels = (rem: number) => {
+    const rootFontPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+    return Math.ceil(rem * rootFontPx * window.devicePixelRatio);
+};
+
+// `displayWidthRem` is the width the caller draws the thumbnail at.
+const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, displayWidthRem: number): string | null => {
     const tauri = getTauri();
     const enabled = tauri?.core?.invoke !== undefined && typeof streamUrl === 'string';
-    const cache = useRef<Map<number, string>>(new Map());
+    // Keyed by width AND bucket: after a move to a denser screen the frames
+    // captured for the old size must not be shown stretched.
+    const cache = useRef<Map<string, string>>(new Map());
     const [, bump] = useState(0);
+    const widthPx = enabled ? devicePixels(displayWidthRem) : null;
 
     // A new stream invalidates every cached frame, and the shadow instance is
     // torn down when the player leaves (cheap: it holds a decoder + a
@@ -39,37 +52,39 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null): s
         // the shadow while playback is starting, so the first real hover only
         // pays a warm seek+capture. The frame itself lands in the shell cache.
         if (typeof streamUrl === 'string' && t?.core?.invoke) {
-            t.core.invoke('player_thumb', { url: streamUrl, timeSec: 0 })
+            t.core.invoke('player_thumb', { url: streamUrl, timeSec: 0, widthPx: devicePixels(displayWidthRem) })
                 .catch(() => { /* shell-only */ });
         }
         return () => {
             t?.core?.invoke?.('player_thumb_stop').catch(() => { /* shell-only */ });
         };
-    }, [streamUrl]);
+    }, [streamUrl, displayWidthRem]);
 
     const bucket = enabled && hoverTimeMs !== null ? bucketOf(hoverTimeMs / 1000) : null;
+    const key = bucket !== null && widthPx !== null ? `${widthPx}:${bucket}` : null;
 
-    const request = useCallback((wantedBucket: number) => {
+    const request = useCallback((wantedBucket: number, wantedWidthPx: number) => {
         const t = getTauri();
         if (!t?.core?.invoke || typeof streamUrl !== 'string') return Promise.resolve(null);
         return t.core.invoke('player_thumb', {
             url: streamUrl,
             timeSec: wantedBucket * BUCKET_SECONDS,
+            widthPx: wantedWidthPx,
         }) as Promise<string | null>;
     }, [streamUrl]);
 
     useEffect(() => {
-        if (bucket === null || cache.current.has(bucket)) return;
+        if (bucket === null || widthPx === null || key === null || cache.current.has(key)) return;
         let cancelled = false;
         let tries = 0;
         const ask = () => {
             if (cancelled) return;
             tries += 1;
-            request(bucket)
+            request(bucket, widthPx)
                 .then((dataUrl) => {
                     if (cancelled) return;
                     if (typeof dataUrl === 'string') {
-                        cache.current.set(bucket, dataUrl);
+                        cache.current.set(key, dataUrl);
                         bump((n) => n + 1);
                     } else if (tries < MAX_TRIES) {
                         setTimeout(ask, RETRY_MS);
@@ -79,9 +94,9 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null): s
         };
         ask();
         return () => { cancelled = true; };
-    }, [bucket, request]);
+    }, [bucket, widthPx, key, request]);
 
-    return bucket !== null ? cache.current.get(bucket) ?? null : null;
+    return key !== null ? cache.current.get(key) ?? null : null;
 };
 
 export default usePlayerThumb;
