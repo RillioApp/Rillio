@@ -23,9 +23,11 @@ const FILLED = 'bg-(--color-accent)';
 const THUMB = 'bg-(--color-accent) transition-transform duration-150 group-hover:scale-[1.2]';
 
 // The trickplay preview's width (the frame, and the pill's cap under it). The
-// one owner of that size: the layout below is styled from it AND the shell is
-// asked for frames of exactly this many device pixels (usePlayerThumb), so the
-// capture can never again be smaller than what is drawn.
+// one owner of that size: the layout below is styled from it AND the width the
+// shell captures frames at is derived from it (usePlayerThumb: this many rem,
+// in device pixels, times its oversampling factor), so the capture can never
+// again be smaller than what is drawn. The frame is an <img> with the default
+// image-rendering, which is what gives the downscale its high-quality filter.
 const PREVIEW_WIDTH_REM = 16;
 
 type Chapter = { time: number, title?: string | null };

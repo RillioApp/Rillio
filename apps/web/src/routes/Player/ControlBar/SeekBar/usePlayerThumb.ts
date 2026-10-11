@@ -19,32 +19,47 @@ const RETRY_MS = 100;
 // torrent region that is not downloaded gives up until the next hover).
 const MAX_TRIES = 30;
 
+// Captured pixels per drawn device pixel. Above 1 the page downscales the
+// frame (the browser's own high-quality image filter), which hides the jpg's
+// chroma subsampling and block edges that a 1:1 frame shows. Mirrored by
+// thumbs.rs OVERSAMPLE, which only uses it to bound the request.
+const OVERSAMPLE = 2;
+
 const bucketOf = (timeSec: number) => Math.round(timeSec / BUCKET_SECONDS);
 
-// How many DEVICE pixels a width in rem covers right now. The shell captures
-// the frame at exactly this width, so the image is never stretched: the root
-// font size steps with the window width (tailwind.css) and the pixel ratio
-// with the screen and the zoom, hence read live instead of assumed.
-const devicePixels = (rem: number) => {
+// How many pixels to capture for a thumbnail drawn `rem` wide right now: the
+// DEVICE pixels it covers, times OVERSAMPLE. The root font size steps with the
+// window width (tailwind.css) and the pixel ratio with the screen and the
+// zoom, hence read live instead of assumed.
+const capturePixels = (rem: number) => {
     const rootFontPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
-    return Math.ceil(rem * rootFontPx * window.devicePixelRatio);
+    return Math.ceil(rem * rootFontPx * window.devicePixelRatio * OVERSAMPLE);
 };
+
+type ThumbCache = {
+    get: (widthPx: number, bucket: number) => string | null,
+    set: (widthPx: number, bucket: number, dataUrl: string) => void,
+    clear: () => void,
+};
+const { createThumbCache } = require('./thumbCache') as { createThumbCache: () => ThumbCache };
 
 // `displayWidthRem` is the width the caller draws the thumbnail at.
 const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, displayWidthRem: number): string | null => {
     const tauri = getTauri();
     const enabled = tauri?.core?.invoke !== undefined && typeof streamUrl === 'string';
-    // Keyed by width AND bucket: after a move to a denser screen the frames
-    // captured for the old size must not be shown stretched.
-    const cache = useRef<Map<string, string>>(new Map());
+    // A bounded, width-aware map (see thumbCache.js): after a move to a denser
+    // screen the frames captured for the old size must not be shown stretched.
+    const cache = useRef<ThumbCache | null>(null);
+    if (cache.current === null) cache.current = createThumbCache();
+    const frames = cache.current;
     const [, bump] = useState(0);
-    const widthPx = enabled ? devicePixels(displayWidthRem) : null;
+    const widthPx = enabled ? capturePixels(displayWidthRem) : null;
 
     // A new stream invalidates every cached frame, and the shadow instance is
     // torn down when the player leaves (cheap: it holds a decoder + a
     // connection to the streaming server).
     useEffect(() => {
-        cache.current = new Map();
+        frames.clear();
         const t = getTauri();
         // Warm the shadow up front: the FIRST hover otherwise pays the whole
         // shadow spawn (dll load + loadfile + first keyframe seek, ~1s) before
@@ -52,16 +67,18 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, di
         // the shadow while playback is starting, so the first real hover only
         // pays a warm seek+capture. The frame itself lands in the shell cache.
         if (typeof streamUrl === 'string' && t?.core?.invoke) {
-            t.core.invoke('player_thumb', { url: streamUrl, timeSec: 0, widthPx: devicePixels(displayWidthRem) })
+            t.core.invoke('player_thumb', { url: streamUrl, timeSec: 0, widthPx: capturePixels(displayWidthRem) })
                 .catch(() => { /* shell-only */ });
         }
         return () => {
             t?.core?.invoke?.('player_thumb_stop').catch(() => { /* shell-only */ });
         };
-    }, [streamUrl, displayWidthRem]);
+    }, [streamUrl, displayWidthRem, frames]);
 
     const bucket = enabled && hoverTimeMs !== null ? bucketOf(hoverTimeMs / 1000) : null;
-    const key = bucket !== null && widthPx !== null ? `${widthPx}:${bucket}` : null;
+    // Reading marks the frame used, and is what tells the cache the width in
+    // force (a new one empties it).
+    const thumb = bucket !== null && widthPx !== null ? frames.get(widthPx, bucket) : null;
 
     const request = useCallback((wantedBucket: number, wantedWidthPx: number) => {
         const t = getTauri();
@@ -74,7 +91,7 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, di
     }, [streamUrl]);
 
     useEffect(() => {
-        if (bucket === null || widthPx === null || key === null || cache.current.has(key)) return;
+        if (bucket === null || widthPx === null || frames.get(widthPx, bucket) !== null) return;
         let cancelled = false;
         let tries = 0;
         const ask = () => {
@@ -84,7 +101,7 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, di
                 .then((dataUrl) => {
                     if (cancelled) return;
                     if (typeof dataUrl === 'string') {
-                        cache.current.set(key, dataUrl);
+                        frames.set(widthPx, bucket, dataUrl);
                         bump((n) => n + 1);
                     } else if (tries < MAX_TRIES) {
                         setTimeout(ask, RETRY_MS);
@@ -94,9 +111,9 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, di
         };
         ask();
         return () => { cancelled = true; };
-    }, [bucket, widthPx, key, request]);
+    }, [bucket, widthPx, request, frames]);
 
-    return key !== null ? cache.current.get(key) ?? null : null;
+    return thumb;
 };
 
 export default usePlayerThumb;

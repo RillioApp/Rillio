@@ -39,15 +39,27 @@ const BUCKET_SECONDS: f64 = 2.0;
 // no post-capture resize is ever needed. For a hover thumbnail that width is
 // NOT owned here: the seek bar knows how wide it draws the preview and on what
 // pixel density, and sends the device-pixel width with every request (see
-// SeekBar.tsx PREVIEW_WIDTH_REM). A fixed width here is how previews went soft:
-// 240 px captured, shown 224-288 CSS px wide and up to twice that in device
-// pixels.
-/// Ceiling on a requested thumbnail width. The preview is 16rem wide and the
-/// root font tops out at 18 px, so this covers it up to a device pixel ratio
-/// of 4; beyond that a request is clamped rather than refused (a clamped
-/// thumbnail is merely less sharp, and the bound exists so a hover can never
-/// ask the shadow for full-resolution captures).
-const THUMB_WIDTH_MAX: u32 = 1152;
+// SeekBar.tsx PREVIEW_WIDTH_REM, usePlayerThumb.ts OVERSAMPLE). A fixed width
+// here is how previews went soft: 240 px captured, shown 224-288 CSS px wide
+// and up to twice that in device pixels.
+//
+// The shell only bounds the request, and the bound is the largest width the
+// web layer's own derivation (rem x root font px x pixel ratio x oversampling)
+// can produce on a screen we mean to serve at full sharpness:
+/// The preview's width in rem. Mirrors SeekBar.tsx PREVIEW_WIDTH_REM.
+const PREVIEW_WIDTH_REM: u32 = 16;
+/// The largest root font size the web app sets (tailwind.css, >= 2800 px wide).
+const ROOT_FONT_PX_MAX: u32 = 18;
+/// The densest screen served at full sharpness.
+const DEVICE_PIXEL_RATIO_MAX: u32 = 4;
+/// Captured pixels per drawn device pixel. Mirrors usePlayerThumb.ts OVERSAMPLE.
+const OVERSAMPLE: u32 = 2;
+/// Ceiling on a requested thumbnail width. A request beyond it is clamped
+/// rather than refused: a clamped thumbnail is merely less sharp. The chain
+/// never scales above the source width either way, so on real files the source
+/// is usually the tighter bound.
+const THUMB_WIDTH_MAX: u32 =
+    PREVIEW_WIDTH_REM * ROOT_FONT_PX_MAX * DEVICE_PIXEL_RATIO_MAX * OVERSAMPLE;
 /// Chain width while the scene scan samples. Its frames are only ever reduced
 /// to a 16x9 luma grid, so it keeps the small size no matter how large the
 /// hover thumbnails are (and `SCENE_CUT_THRESHOLD` was tuned at this size).
@@ -56,6 +68,14 @@ const SCAN_WIDTH: u32 = 240;
 /// (72, the old value, was only acceptable while the frame was being blurred
 /// by its own upscale). Measured on a 1080p film at 448 px: ~16 KB per frame.
 const JPEG_QUALITY: u32 = 90;
+/// How many thumbnails the cache holds; once full, each new one overwrites the
+/// least recently used. A frame is ~39 KB as a data URL at the 640 px a
+/// 125%-scaled 1440p screen asks for (measured, 1080p film), so this is ~10 MB
+/// there, and ~63 MB at the very worst (every frame a full 1920 px capture,
+/// ~246 KB). Latest-wins scrubbing lands about ten captures a second, so the
+/// cap is some 25 s of continuous scrubbing before the oldest ground is
+/// recaptured. Mirrors thumbCache.js THUMB_CACHE_MAX.
+const CACHE_MAX_THUMBS: usize = 256;
 /// How long a keyframe seek may take before the capture is abandoned (a live
 /// torrent region that is not downloaded yet stalls exactly here).
 const SEEK_SETTLE_MS: u64 = 4000;
@@ -140,6 +160,61 @@ fn luma_diff(a: &[u8], b: &[u8]) -> f64 {
     sum as f64 / a.len() as f64
 }
 
+/// The captured thumbnails of one stream at one width, by bucket: a rolling
+/// set of at most `max` frames. Reading a frame marks it used; adding one to a
+/// full cache overwrites the frame that has gone unused the longest.
+struct ThumbCache {
+    max: usize,
+    /// bucket -> (last use, data URL). `clock` only ever counts up, so the
+    /// smallest stamp is the least recently used frame.
+    frames: HashMap<u32, (u64, String)>,
+    clock: u64,
+}
+
+impl Default for ThumbCache {
+    fn default() -> Self {
+        Self::with_max(CACHE_MAX_THUMBS)
+    }
+}
+
+impl ThumbCache {
+    fn with_max(max: usize) -> Self {
+        Self { max, frames: HashMap::new(), clock: 0 }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn contains(&self, bucket: u32) -> bool {
+        self.frames.contains_key(&bucket)
+    }
+
+    fn get(&mut self, bucket: u32) -> Option<&String> {
+        let now = self.tick();
+        let (used, data_url) = self.frames.get_mut(&bucket)?;
+        *used = now;
+        Some(data_url)
+    }
+
+    fn insert(&mut self, bucket: u32, data_url: String) {
+        if !self.frames.contains_key(&bucket) && self.frames.len() >= self.max {
+            // A scan of at most `max` stamps, once per capture (~100 ms each).
+            let oldest = self.frames.iter().min_by_key(|(_, (used, _))| *used).map(|(b, _)| *b);
+            if let Some(oldest) = oldest {
+                self.frames.remove(&oldest);
+            }
+        }
+        let now = self.tick();
+        self.frames.insert(bucket, (now, data_url));
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+}
+
 #[derive(Default)]
 pub struct ThumbsState(Arc<Mutex<Inner>>);
 
@@ -156,7 +231,7 @@ struct Inner {
     /// request). A request for another width clears the cache: a preview drawn
     /// larger must not be served the small frames captured for the old size.
     width: u32,
-    cache: HashMap<u32, String>,
+    cache: ThumbCache,
     /// The single pending bucket - latest hover wins.
     wanted: Option<u32>,
     /// The scene sweep for the current url; created by the worker (it needs the
@@ -179,6 +254,12 @@ struct Shadow {
 /// the aspect ratio on an even height. Never up: a source narrower than the
 /// request is captured as it is. Spelled as a raw libavfilter graph because
 /// mpv's own `scale=` shorthand rejects the `min()` expression outright.
+///
+/// The scaler stays libswscale's default (bicubic), on measurement: against a
+/// reference downscale of the full frame at the drawn size, `flags=lanczos`
+/// scored slightly lower (PSNR 42.6 vs 42.9 dB) and cost ~10 ms more per
+/// capture, and mpv's `sws-scaler` option does not reach this graph at all
+/// (byte-identical screenshots).
 fn scale_filter(width: u32) -> String {
     format!("lavfi=[scale=w=min(iw\\,{width}):h=-2]")
 }
@@ -411,6 +492,49 @@ mod tests {
         assert!(shadow_url_for(&format!("rillio://{IH}/0"), None).is_err());
     }
 
+    /// A full cache overwrites the frame unused the longest, where "used" is a
+    /// read as much as a write; a frame that is still being looked at survives.
+    #[test]
+    fn cache_overwrites_the_least_recently_used() {
+        let mut cache = ThumbCache::with_max(3);
+        for bucket in [10, 11, 12] {
+            cache.insert(bucket, format!("frame {bucket}"));
+        }
+        // Under the cap nothing is dropped.
+        assert!([10, 11, 12].iter().all(|b| cache.contains(*b)));
+        // 10 is the oldest write, but reading it makes 11 the stalest.
+        assert_eq!(cache.get(10).map(String::as_str), Some("frame 10"));
+        cache.insert(13, "frame 13".into());
+        assert!(!cache.contains(11), "the least recently used frame is overwritten");
+        assert!([10, 12, 13].iter().all(|b| cache.contains(*b)));
+        // ...and so on, one out for each one in: 12 is next.
+        cache.insert(14, "frame 14".into());
+        assert!(!cache.contains(12));
+        assert_eq!(cache.frames.len(), 3);
+        // Rewriting a bucket that is already held evicts nothing.
+        cache.insert(10, "frame 10 again".into());
+        assert_eq!(cache.frames.len(), 3);
+        assert_eq!(cache.get(10).map(String::as_str), Some("frame 10 again"));
+        assert!([13, 14].iter().all(|b| cache.contains(*b)));
+        // A miss is a miss, and does not disturb the order: 13 goes next.
+        assert_eq!(cache.get(99), None);
+        cache.insert(15, "frame 15".into());
+        assert!(!cache.contains(13));
+        cache.clear();
+        assert!(cache.frames.is_empty());
+    }
+
+    /// The shipped cap, and the bound it is derived for.
+    #[test]
+    fn cache_default_is_the_named_cap() {
+        let mut cache = ThumbCache::default();
+        for bucket in 0..(CACHE_MAX_THUMBS as u32 + 5) {
+            cache.insert(bucket, String::new());
+        }
+        assert_eq!(cache.frames.len(), CACHE_MAX_THUMBS);
+        assert!(!cache.contains(0) && cache.contains(CACHE_MAX_THUMBS as u32 + 4));
+    }
+
     /// A requested width is captured as asked when it is sane, evened up when
     /// odd, capped when absurd, and refused when it is nothing at all.
     #[test]
@@ -467,6 +591,7 @@ mod tests {
         for interleave_scan in [false, true] {
             for &width in &widths {
                 let mut bytes_total = 0usize;
+                let mut ipc_micros = 0u128;
                 let mut millis: Vec<f64> = Vec::new();
                 let mut scan_millis: Vec<f64> = Vec::new();
                 let mut size = (0, 0);
@@ -484,6 +609,17 @@ mod tests {
                     let jpeg = shadow.capture_bytes().expect("capture");
                     millis.push(started.elapsed().as_secs_f64() * 1000.0);
                     bytes_total += jpeg.len();
+                    // The shell's half of the IPC: the data URL, then the JSON
+                    // string Tauri hands the webview.
+                    let started = Instant::now();
+                    use base64::Engine as _;
+                    let data_url = format!(
+                        "data:image/jpeg;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(&jpeg)
+                    );
+                    let json = serde_json::to_string(&Some(data_url)).expect("json");
+                    ipc_micros += started.elapsed().as_micros();
+                    assert!(json.len() > jpeg.len());
                     let img = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
                         .expect("a jpg");
                     size = (img.width(), img.height());
@@ -506,13 +642,15 @@ mod tests {
                 millis.sort_by(|a, b| a.total_cmp(b));
                 println!(
                     "width {width} scan-interleaved={interleave_scan}: {}x{} px, {} bytes/thumb \
-                     ({} as a data URL), median {:.0} ms, slowest {:.0} ms over {n} samples",
+                     ({} as a data URL), median {:.0} ms, slowest {:.0} ms over {n} samples, \
+                     base64 + json {} us/thumb",
                     size.0,
                     size.1,
                     bytes_total / n,
                     (bytes_total / n).div_ceil(3) * 4,
                     millis[n / 2],
                     millis[n - 1],
+                    ipc_micros / n as u128,
                 );
                 if interleave_scan {
                     scan_millis.sort_by(|a, b| a.total_cmp(b));
@@ -567,7 +705,7 @@ pub async fn player_thumb(
         inner.cache.clear();
         inner.wanted = None;
     }
-    if let Some(hit) = inner.cache.get(&bucket) {
+    if let Some(hit) = inner.cache.get(bucket) {
         return Ok(Some(hit.clone()));
     }
     if inner.disabled {
@@ -657,7 +795,7 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 Err(_) => return,
             };
             let job = if let Some(bucket) = inner.wanted.take() {
-                if inner.cache.contains_key(&bucket) {
+                if inner.cache.contains(bucket) {
                     continue;
                 }
                 Job::Thumb(bucket, inner.width)
