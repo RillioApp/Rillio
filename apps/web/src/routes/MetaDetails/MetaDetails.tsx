@@ -21,11 +21,11 @@ import { useContentGamepadNavigation } from 'rillio/services/GamepadNavigation';
 import { withCoreSuspender } from 'rillio/common';
 import { useNavigateWithOrigin } from 'rillio-router';
 import { VerticalNavBar, HorizontalNavBar, DelayedRenderer, EmptyState, Image, MetaPreview, ModalDialog } from 'rillio/components';
-import { cn } from 'rillio/components/ui/cn';
 import StreamsList from './StreamsList';
 import VideosList from './VideosList';
 import HeroMedia from './HeroMedia';
 import SimilarRow from './SimilarRow';
+import EpisodeArrows from './EpisodeArrows';
 import useMetaDetails from './useMetaDetails';
 import useSeason from './useSeason';
 import useMetaExtensionTabs from './useMetaExtensionTabs';
@@ -77,6 +77,12 @@ const MetaDetails = () => {
             :
             null;
     }, [metaDetails.metaItem, streamPath]);
+    const episodes = React.useMemo(() => {
+        return metaDetails.metaItem !== null && metaDetails.metaItem.content.type === 'Ready' ?
+            metaDetails.metaItem.content.content.videos
+            :
+            [];
+    }, [metaDetails.metaItem]);
     const addToLibrary = React.useCallback(() => {
         if (metaDetails.metaItem === null || metaDetails.metaItem.content.type !== 'Ready') {
             return;
@@ -210,42 +216,42 @@ const MetaDetails = () => {
                             pair read as lopsided - Michael, 2026-08-16). */}
                         <div className="flex flex-row items-center justify-center gap-10 self-stretch">
                             <div className="flex w-full min-w-0 max-w-[56rem] shrink-0 flex-col">
-                            {
-                                metaPath === null ?
-                                    <DelayedRenderer delay={500}>
-                                        <MetaMessage label={t('ERR_NO_META_SELECTED')} />
-                                    </DelayedRenderer>
-                                    :
-                                    metaDetails.metaItem === null ?
-                                        <MetaMessage label={t('ERR_NO_ADDONS_FOR_META')} />
+                                {
+                                    metaPath === null ?
+                                        <DelayedRenderer delay={500}>
+                                            <MetaMessage label={t('ERR_NO_META_SELECTED')} />
+                                        </DelayedRenderer>
                                         :
-                                        metaDetails.metaItem.content.type === 'Err' ?
-                                            <MetaMessage label={t('ERR_NO_META_FOUND')} />
+                                        metaDetails.metaItem === null ?
+                                            <MetaMessage label={t('ERR_NO_ADDONS_FOR_META')} />
                                             :
-                                            metaDetails.metaItem.content.type === 'Loading' ?
-                                                <MetaPreview.Placeholder className="min-h-[22rem] flex-none self-stretch" />
+                                            metaDetails.metaItem.content.type === 'Err' ?
+                                                <MetaMessage label={t('ERR_NO_META_FOUND')} />
                                                 :
-                                                <MetaPreview
-                                                    className="max-w-[52rem] flex-none self-stretch duration-300 animate-in fade-in"
-                                                    name={metaDetails.metaItem.content.content.name}
-                                                    logo={metaDetails.metaItem.content.content.logo}
-                                                    runtime={metaDetails.metaItem.content.content.runtime}
-                                                    releaseInfo={metaDetails.metaItem.content.content.releaseInfo}
-                                                    released={metaDetails.metaItem.content.content.released}
-                                                    description={
-                                                        video !== null && typeof video.overview === 'string' && video.overview.length > 0 ?
-                                                            video.overview
-                                                            :
-                                                            metaDetails.metaItem.content.content.description
-                                                    }
-                                                    links={metaDetails.metaItem.content.content.links}
-                                                    inLibrary={metaDetails.metaItem.content.content.inLibrary}
-                                                    toggleInLibrary={metaDetails.metaItem.content.content.inLibrary ? removeFromLibrary : addToLibrary}
-                                                    watched={metaDetails.metaItem.content.content.watched}
-                                                    toggleWatched={toggleWatched}
-                                                    ratingInfo={metaDetails.ratingInfo}
-                                                />
-                            }
+                                                metaDetails.metaItem.content.type === 'Loading' ?
+                                                    <MetaPreview.Placeholder className="min-h-[22rem] flex-none self-stretch" />
+                                                    :
+                                                    <MetaPreview
+                                                        className="max-w-[52rem] flex-none self-stretch duration-300 animate-in fade-in"
+                                                        name={metaDetails.metaItem.content.content.name}
+                                                        logo={metaDetails.metaItem.content.content.logo}
+                                                        runtime={metaDetails.metaItem.content.content.runtime}
+                                                        releaseInfo={metaDetails.metaItem.content.content.releaseInfo}
+                                                        released={metaDetails.metaItem.content.content.released}
+                                                        description={
+                                                            video !== null && typeof video.overview === 'string' && video.overview.length > 0 ?
+                                                                video.overview
+                                                                :
+                                                                metaDetails.metaItem.content.content.description
+                                                        }
+                                                        links={metaDetails.metaItem.content.content.links}
+                                                        inLibrary={metaDetails.metaItem.content.content.inLibrary}
+                                                        toggleInLibrary={metaDetails.metaItem.content.content.inLibrary ? removeFromLibrary : addToLibrary}
+                                                        watched={metaDetails.metaItem.content.content.watched}
+                                                        toggleWatched={toggleWatched}
+                                                        ratingInfo={metaDetails.ratingInfo}
+                                                    />
+                                }
                             </div>
                             {
                                 // The cap keeps it a card, not a cinema.
@@ -263,10 +269,20 @@ const MetaDetails = () => {
                                     null
                             }
                         </div>
-                            {
-                                streamPath !== null ?
+                        {
+                            // EpisodeArrows: owns the centred 80rem streams
+                            // column, with previous/next episode in lanes at its
+                            // inner edges (series only: no arrows for a movie or
+                            // channel).
+                            streamPath !== null ?
+                                <EpisodeArrows
+                                    className="mt-8 flex-none"
+                                    type={streamPath.type}
+                                    videos={episodes}
+                                    videoId={streamPath.id}
+                                >
                                     <StreamsList
-                                        className="mt-8 w-full max-w-[80rem] flex-none self-center"
+                                        className="w-full flex-none"
                                         streams={metaDetails.streams}
                                         video={video}
                                         type={streamPath.type}
@@ -277,27 +293,28 @@ const MetaDetails = () => {
                                         libraryItem={metaDetails.libraryItem}
                                         onEpisodeSearch={handleEpisodeSearch}
                                     />
-                                    :
-                                    null
-                            }
-                            {
-                                // The episode browser renders on the videos route
-                                // ONLY: once a stream is selected the streams list
-                                // owns the pane (both at once read as two competing
-                                // lists - Michael's call, 2026-08-15).
-                                streamPath === null && metaPath !== null ?
-                                    <VideosList
-                                        className="mt-8 w-full max-w-[80rem] flex-none self-center"
-                                        metaItem={metaDetails.metaItem}
-                                        libraryItem={metaDetails.libraryItem}
-                                        season={season}
-                                        selectedVideoId={metaDetails.libraryItem?.state?.video_id}
-                                        seasonOnSelect={seasonOnSelect}
-                                        toggleNotifications={toggleNotifications}
-                                    />
-                                    :
-                                    null
-                            }
+                                </EpisodeArrows>
+                                :
+                                null
+                        }
+                        {
+                            // The episode browser renders on the videos route
+                            // ONLY: once a stream is selected the streams list
+                            // owns the pane (both at once read as two competing
+                            // lists - Michael's call, 2026-08-15).
+                            streamPath === null && metaPath !== null ?
+                                <VideosList
+                                    className="mt-8 w-full max-w-[80rem] flex-none self-center"
+                                    metaItem={metaDetails.metaItem}
+                                    libraryItem={metaDetails.libraryItem}
+                                    season={season}
+                                    selectedVideoId={metaDetails.libraryItem?.state?.video_id}
+                                    seasonOnSelect={seasonOnSelect}
+                                    toggleNotifications={toggleNotifications}
+                                />
+                                :
+                                null
+                        }
                     </div>
                     {
                         // BOTTOM pane: "Similar", full-width under both columns.
