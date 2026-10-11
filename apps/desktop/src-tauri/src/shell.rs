@@ -373,6 +373,7 @@ impl ShellState {
             }
         }
         spawn_event_loop(ctrl.clone(), app.clone());
+        spawn_blur_probe(ctrl.clone());
         // With force-window, mpv's (black) output window exists from startup; push
         // it behind the WebView as soon as it appears so it never covers the UI.
         if wid.is_some() {
@@ -1101,7 +1102,10 @@ fn apply_blur(ctrl: &Controller) -> Result<(), String> {
         blur.desired.clone()
     };
     let Some(req) = desired else { return Ok(()) };
-    let opts = blur_shader_opts(ctrl, &req)?;
+    let mut opts = blur_shader_opts(ctrl, &req)?;
+    if blur_debug_paint() {
+        opts.push_str(",debug=1");
+    }
     {
         let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
         if blur.last_opts.as_deref() == Some(opts.as_str()) {
@@ -1110,6 +1114,83 @@ fn apply_blur(ctrl: &Controller) -> Result<(), String> {
         blur.last_opts = Some(opts.clone());
     }
     ctrl.mpv.set_property("glsl-shader-opts", &opts)
+}
+
+/// MEASUREMENT AID, off unless `RILLIO_BLUR_DEBUG_PAINT` is set: the shader
+/// paints the masked region flat magenta instead of blurred video, so a capture
+/// of the window shows exactly which pixels the mask covers (that is how the
+/// blur's alignment with a panel is measured rather than eyeballed).
+fn blur_debug_paint() -> bool {
+    std::env::var_os("RILLIO_BLUR_DEBUG_PAINT").is_some()
+}
+
+/// How often the blur probe samples. Shorter than one 60 Hz frame so that a lag
+/// of a single frame between two quantities is still visible in the log.
+const BLUR_PROBE_INTERVAL: Duration = Duration::from_millis(5);
+
+/// MEASUREMENT AID, off unless `RILLIO_BLUR_PROBE` names a file: append one
+/// JSON line to that file every time the blur's inputs or output change -
+/// the `osd-dimensions` the shell has CACHED (what [`video_rect`] reads), the
+/// same property read FRESH from mpv, the request the web last sent and the
+/// option string last written. With a wall-clock stamp (Unix ms, comparable to
+/// `Date.now()` in the page), that shows which of them is stale and for how
+/// long, which no screenshot can.
+fn spawn_blur_probe(ctrl: Arc<Controller>) {
+    let Some(path) = std::env::var_os("RILLIO_BLUR_PROBE") else { return };
+    let spawned = std::thread::Builder::new().name("mpv-blur-probe".into()).spawn(move || {
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::error!("shell: blur probe cannot open {}: {e}", PathBuf::from(&path).display());
+                return;
+            }
+        };
+        let mut last = String::new();
+        loop {
+            std::thread::sleep(BLUR_PROBE_INTERVAL);
+            let cached = ctrl
+                .props
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("osd-dimensions")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let fresh: serde_json::Map<String, Value> = ["w", "h", "ml", "mt", "mr", "mb"]
+                .iter()
+                .map(|key| {
+                    let value = ctrl
+                        .mpv
+                        .get_property_string(&format!("osd-dimensions/{key}"))
+                        .and_then(|text| text.parse::<f64>().ok());
+                    (key.to_string(), serde_json::json!(value))
+                })
+                .collect();
+            let (desired, opts) = {
+                let blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
+                (blur.desired.as_ref().map(|req| format!("{req:?}")), blur.last_opts.clone())
+            };
+            let state = serde_json::json!({
+                "cached": cached, "fresh": fresh, "desired": desired, "opts": opts,
+            })
+            .to_string();
+            if state == last {
+                continue;
+            }
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            if let Err(e) = writeln!(file, "{{\"t\":{stamp},\"s\":{state}}}") {
+                tracing::error!("shell: blur probe write failed: {e}");
+                return;
+            }
+            last = state;
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::error!("shell: blur probe thread did not start: {e}");
+    }
 }
 
 /// The video rectangle inside the mpv window, from mpv's `osd-dimensions`:

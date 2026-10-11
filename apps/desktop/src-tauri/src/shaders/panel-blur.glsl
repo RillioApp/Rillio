@@ -60,6 +60,19 @@
 // open, 0 skips both passes), `count` (how many rects are live), `radius`
 // (gaussian radius in OUTPUT pixels), then four rects r0..r3 as x/y/w/h in
 // OUTPUT-normalized coords plus c, the corner radius in OUTPUT pixels.
+//
+// `debug` is a MEASUREMENT AID, 0 in every normal run: at 1 the composite pass
+// paints the masked region flat magenta instead of the blurred video, so a
+// capture of the window shows exactly which pixels the mask covers. The shell
+// only ever sets it when RILLIO_BLUR_DEBUG_PAINT is in its environment (see
+// shell.rs, blur_debug_paint).
+
+//!PARAM debug
+//!DESC Measurement aid: 1 paints the masked region flat magenta
+//!TYPE DYNAMIC float
+//!MINIMUM 0
+//!MAXIMUM 1
+0
 
 //!PARAM enabled
 //!DESC 1 while a player panel is open; 0 skips both passes entirely
@@ -418,6 +431,9 @@ vec4 hook()
     // Bilinear upsample of the quarter-res blur - the upsample itself adds the
     // last touch of smoothing.
     vec4 blurred = RB_V_texOff(vec2(0.0));
+    if (debug > 0.0) {
+        blurred = vec4(1.0, 0.0, 1.0, 1.0);
+    }
 
     // A 1px feather across the panel's own edge. The web panel is drawn over
     // this boundary with the same rounded rect, and any subpixel disagreement
