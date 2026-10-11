@@ -4,10 +4,9 @@
  * EpisodeArrows - previous/next episode navigation for the streams view.
  *
  * Wraps the streams region and owns its centred 80rem column. From `sm`
- * up the two arrows sit inside that column, within the streams header's
- * extent (left arrow under the back chevron's edge, right arrow under the
- * addon filter's edge), vertically centred on the streams, each in its own
- * lane: the controls and cards are inset by the arrow plus a gap, so the
+ * up the two arrows sit INSIDE that column, at its far left and far right,
+ * vertically centred on the streams, each in its own lane: the column
+ * insets the header, controls and cards by the arrow plus a gap, so the
  * arrows never cover a card and read as page navigation rather than a
  * carousel control of the tiles. Below `sm` two lanes would squeeze the
  * cards, so the arrows become two small labelled pills ("S1E1", "S1E3")
@@ -65,7 +64,7 @@ const ARROW_CLASS = cn(
     'bg-surface text-fg-muted hover:bg-surface-hover hover:text-fg',
     // Phone: a small labelled pill in the row above the streams.
     'h-11 gap-1 px-3.5 text-xs font-medium',
-    // sm and up: a round icon button in its lane, aligned to the header.
+    // sm and up: a round icon button in its lane at the column's edge.
     'sm:pointer-events-auto sm:absolute sm:top-1/2 sm:size-13 sm:-translate-y-1/2 sm:p-0',
 );
 
@@ -104,28 +103,16 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
         return () => document.removeEventListener('keydown', onKeyDown);
     }, [hasArrows, previousTarget, nextTarget, go]);
 
-    // The centred 80rem streams column. The streams header (StreamsList's
-    // data-streams-header row: back chevron, title, addon filter) keeps its
-    // full width, 1rem (its own mx-4) inside the column, and the arrows align
-    // to it: left-4 / right-4, so the left arrow's left edge meets the
-    // chevron's and the right arrow's right edge meets the filter pill's.
-    // From sm up, with arrows, everything after the header (controls, cards,
-    // the all-streams pill, empty and loading states: the header's later
-    // siblings) is inset by a 6rem lane each side (mx-24) = the header's 1rem
-    // + the arrow (size-13, 3.25rem) + a 1.75rem gap, so nothing sits under
-    // an arrow. Insetting the body (rather than padding the column and
-    // pulling the header back out) keeps every box inside its parent, which
-    // the global reset's overflow:hidden would otherwise clip. Change the
-    // arrow size, the gap or the header's margin and these sums together.
-    // Both lanes stay reserved at the first/last episode so nothing shifts.
+    // The centred 80rem streams column. From sm up, with arrows, it insets its
+    // content by a 5rem lane each side (px-20) = the arrow (size-13, 3.25rem)
+    // + a 1.75rem gap to the header and cards; the arrows sit at left-0 /
+    // right-0 inside the column's padding box, so nothing ever sits under
+    // them and nothing sticks out of a box (the global reset's
+    // overflow:hidden has nothing to clip). Change the arrow size and the
+    // lane together. Both lanes stay reserved at the first/last episode so
+    // the content never shifts sideways between episodes.
     return (
-        <div
-            className={cn(
-                'relative flex w-full max-w-[80rem] flex-col self-center',
-                hasArrows && 'sm:[&_[data-streams-header]~*]:mx-24',
-                className,
-            )}
-        >
+        <div className={cn('relative flex w-full max-w-[80rem] flex-col self-center', hasArrows && 'sm:px-20', className)}>
             {
                 hasArrows ?
                     <nav
@@ -140,7 +127,7 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
                                     aria-label="Previous episode"
                                     title={previousTarget.label}
                                     onClick={() => go(previousTarget)}
-                                    className={cn(ARROW_CLASS, 'sm:left-4')}
+                                    className={cn(ARROW_CLASS, 'sm:left-0')}
                                 >
                                     <ChevronLeft className="size-4 sm:size-6" />
                                     <span className="sm:hidden">S{previousTarget.season}E{previousTarget.episode}</span>
@@ -155,7 +142,7 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
                                     aria-label="Next episode"
                                     title={nextTarget.label}
                                     onClick={() => go(nextTarget)}
-                                    className={cn(ARROW_CLASS, 'ml-auto sm:right-4')}
+                                    className={cn(ARROW_CLASS, 'ml-auto sm:right-0')}
                                 >
                                     <span className="sm:hidden">S{nextTarget.season}E{nextTarget.episode}</span>
                                     <ChevronRight className="size-4 sm:size-6" />
