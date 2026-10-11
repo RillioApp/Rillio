@@ -67,9 +67,11 @@ const useShaderBlurRect = (): ShaderBlurRegistry | null => {
     // is inert, the loop never starts and nothing below ever reaches the shell.
     const invoke = SHADER_BLUR_ENABLED ? TAURI?.core?.invoke : undefined;
 
+    // The registered MARKER elements (see ShaderBlurRect); `measure` resolves
+    // each to the panel it is pinned to.
     const panels = useRef<Set<HTMLElement>>(new Set()).current;
-    // Each panel's corner radius, read once when it registers. Radii do not
-    // animate, and reading one per frame would force a style flush per panel.
+    // Each panel's corner radius, keyed by the PANEL element and read the first
+    // time it is measured. Weak, so a closed panel's entry goes with its element.
     const corners = useRef<WeakMap<HTMLElement, number>>(new WeakMap()).current;
     const frame = useRef<number | null>(null);
     const sent = useRef<string | null>(null);
@@ -101,17 +103,38 @@ const useShaderBlurRect = (): ShaderBlurRegistry | null => {
                     animation instanceof CSSAnimation && animation.playState === 'running');
             }
             if (animating) return;
-            const rect = element.getBoundingClientRect();
+            // MEASURE THE PANEL, NOT THE MARKER. The marker is `absolute
+            // inset-0`, which pins it to the panel's PADDING box: one border
+            // width inside the edge the viewer sees (the panel paints its fill
+            // and border out to its border box), and, because every panel is
+            // also its own scroll container, it rides the panel's content when
+            // that scrolls. The marker's offsetParent is by definition the box
+            // it is pinned to - the panel - and that element's own rect is the
+            // visible panel, borders included, whatever its content does.
+            const panel = element.offsetParent;
+            // Not laid out (display: none): there is no panel on screen.
+            if (!(panel instanceof HTMLElement)) return;
+            const rect = panel.getBoundingClientRect();
             // A panel mid-fade can also measure to nothing; there is no video
             // to blur under a zero-sized rect.
             if (rect.width <= 0 || rect.height <= 0) return;
             if (rects.length >= MAX_RECTS) return;
+            let corner = corners.get(panel);
+            if (corner === undefined) {
+                // The panel's OWN outer radius, read off the element rather
+                // than hardcoded: the menus are rounded-card while the side
+                // drawer is flush and square, and this stays true if either
+                // ever changes. Read once per panel: radii do not animate, and
+                // reading one per frame would force a style flush per panel.
+                corner = parseFloat(getComputedStyle(panel).borderTopLeftRadius) || 0;
+                corners.set(panel, corner);
+            }
             rects.push({
                 x: rect.x,
                 y: rect.y,
                 width: rect.width,
                 height: rect.height,
-                corner: corners.get(element) ?? 0,
+                corner,
             });
         });
         return rects;
@@ -164,15 +187,10 @@ const useShaderBlurRect = (): ShaderBlurRegistry | null => {
     }, [invoke, panels, tick]);
 
     const register = useCallback((element: HTMLElement) => {
-        // The panel's OWN radius, read off the element rather than hardcoded: the
-        // menus are rounded-card while the side drawer is flush and square, and
-        // this stays true if either ever changes.
-        corners.set(element, parseFloat(getComputedStyle(element).borderTopLeftRadius) || 0);
         panels.add(element);
         start();
         return () => {
             panels.delete(element);
-            corners.delete(element);
             // Do NOT stop the loop here: the last panel closing is exactly when the
             // shell still has to be told to stop blurring. The loop sees an empty
             // set, pushes `rects: []`, and only then lets itself end.

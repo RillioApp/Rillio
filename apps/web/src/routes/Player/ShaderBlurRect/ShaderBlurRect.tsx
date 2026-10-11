@@ -9,10 +9,13 @@
  * through six component signatures. The registry arrives by context, which crosses
  * portals - the side drawer portals to <body> and still finds it.
  *
- * WHY A MARKER RATHER THAN THE PANEL ITSELF: `inset-0` gives this element the
- * panel's padding box and `rounded-[inherit]` its radius, so measuring it measures
- * the panel (inside its 1px border, which is invisible under the border itself).
- * That is exactly what SnapshotBackdrop's clip layer already does.
+ * WHAT GETS MEASURED IS THE PANEL, NOT THIS ELEMENT. `absolute` pins the marker
+ * to the panel (its nearest positioned ancestor), which makes the panel this
+ * element's `offsetParent`; useShaderBlurRect measures THAT element's border box
+ * and reads its radius. The marker's own rect is not the panel's: `inset-0` is
+ * the padding box, one border width inside the visible edge, and it scrolls with
+ * the panel's content. So a panel that hosts this must be positioned (every one
+ * is: MENU_LAYER is `absolute`, the side drawer's sheet is `fixed`).
  *
  * Renders null when the shell is not blurring (the flag is off, or we are not in
  * the shell at all), which is every case today. See useShaderBlurRect.
