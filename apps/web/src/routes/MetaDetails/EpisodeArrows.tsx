@@ -20,8 +20,9 @@
  * (a movie, a channel, even one whose videos carry numbers) or a series
  * without an episode list renders the children untouched.
  *
- * Keyboard: Left/Right step too, but only while nothing on the page holds
- * focus (or one of these arrows does). Everything on this page that already
+ * Keyboard: Left/Right step too, but only while this view is the top route
+ * (it stays mounted under the player, where the same keys seek) and nothing
+ * on the page holds focus (or one of these arrows does). Everything on this page that already
  * binds the arrow keys (the preset toggle's roving focus, the trailer
  * carousel, the language search, the addon select, the tile row's scroll,
  * the all-streams modal) only does so while focused, so a body-focused key
@@ -33,6 +34,7 @@ import { useNavigate } from 'react-router';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { Button } from 'rillio/components/ui/button';
 import { cn } from 'rillio/components/ui/cn';
+import useRouteFocused from 'rillio/common/useRouteFocused';
 
 const { adjacentEpisodes } = require('./adjacentEpisodes');
 const { episodeArrowKey } = require('./episodeArrowKey');
@@ -80,6 +82,7 @@ const ARROW_CLASS = cn(
 
 const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) => {
     const navigate = useNavigate();
+    const routeFocused = useRouteFocused();
     const navRef = React.useRef<HTMLElement>(null);
     const { previous, next } = React.useMemo(() => adjacentEpisodes(type, videos, videoId), [type, videos, videoId]);
     const previousTarget = navigable(previous) ? previous : null;
@@ -100,6 +103,7 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
             const active = document.activeElement;
             const onArrow = active instanceof HTMLElement && navRef.current !== null && navRef.current.contains(active);
             const step = episodeArrowKey(event, {
+                routeFocused,
                 focusFree: active === null || active === document.body || onArrow,
                 dialogOpen: document.querySelector('[role="dialog"]') !== null,
             });
@@ -111,7 +115,7 @@ const EpisodeArrows = ({ className, type, videos, videoId, children }: Props) =>
         };
         document.addEventListener('keydown', onKeyDown);
         return () => document.removeEventListener('keydown', onKeyDown);
-    }, [hasArrows, previousTarget, nextTarget, go]);
+    }, [hasArrows, routeFocused, previousTarget, nextTarget, go]);
 
     // The centred 80rem streams column. From sm up, with arrows, it insets its
     // content by a 5rem lane each side (px-20) = the arrow (size-13, 3.25rem)
