@@ -22,6 +22,14 @@ const BUFFERED = 'bg-ice/30';
 const FILLED = 'bg-(--color-accent)';
 const THUMB = 'bg-(--color-accent) transition-transform duration-150 group-hover:scale-[1.2]';
 
+// The trickplay preview's width (the frame, and the pill's cap under it). The
+// one owner of that size: the layout below is styled from it AND the width the
+// shell captures frames at is derived from it (usePlayerThumb: this many rem,
+// in device pixels, times its oversampling factor), so the capture can never
+// again be smaller than what is drawn. The frame is an <img> with the default
+// image-rendering, which is what gives the downscale its high-quality filter.
+const PREVIEW_WIDTH_REM = 16;
+
 type Chapter = { time: number, title?: string | null };
 
 // Two boundaries closer than this (fraction of the duration) merge: encoders
@@ -69,7 +77,7 @@ const SeekBar = ({ className, time, duration, buffered, thumbStreamUrl, chapters
         :
         null;
     const previewFraction = !disabled && previewTimeMs !== null ? previewTimeMs / (duration as number) : null;
-    const thumb = usePlayerThumb(thumbStreamUrl ?? null, previewTimeMs);
+    const thumb = usePlayerThumb(thumbStreamUrl ?? null, previewTimeMs, PREVIEW_WIDTH_REM);
 
     // Chapter boundaries as bar fractions: sorted, interior-only (a mark at 0
     // or at the very end draws no gap), near-duplicates merged.
@@ -167,15 +175,15 @@ const SeekBar = ({ className, time, duration, buffered, thumbStreamUrl, chapters
                 previewFraction !== null ?
                     <div
                         className={'pointer-events-none absolute bottom-full z-0 mb-3 flex -translate-x-1/2 flex-col items-center gap-2'}
-                        style={{ left: `clamp(8rem, ${previewFraction * 100}%, calc(100% - 8rem))` }}
+                        style={{ left: `clamp(${PREVIEW_WIDTH_REM / 2}rem, ${previewFraction * 100}%, calc(100% - ${PREVIEW_WIDTH_REM / 2}rem))` }}
                     >
                         {
                             thumb !== null ?
-                                <img src={thumb} alt={''} className={'block w-64 rounded-xl shadow-elevated'} draggable={false} />
+                                <img src={thumb} alt={''} className={'block rounded-xl shadow-elevated'} style={{ width: `${PREVIEW_WIDTH_REM}rem` }} draggable={false} />
                                 :
                                 null
                         }
-                        <div className={'flex max-w-64 items-center gap-2 rounded-full bg-black/60 px-3 py-1 text-sm text-ice backdrop-blur-sm'}>
+                        <div className={'flex items-center gap-2 rounded-full bg-black/60 px-3 py-1 text-sm text-ice backdrop-blur-sm'} style={{ maxWidth: `${PREVIEW_WIDTH_REM}rem` }}>
                             <span className={'tabular-nums'}>{formatTime(previewTimeMs as number)}</span>
                             {
                                 previewChapterTitle !== null ?
