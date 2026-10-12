@@ -39,7 +39,12 @@ const useCachedTorrents = () => {
     const toast = useToast();
     const serverUrl = profile.settings.streamingServerUrl;
     const [entries, setEntries] = useState<CacheEntry[] | null>(null);
-    const [failed, setFailed] = useState(false);
+    // Why the list could not be loaded, or null while it can (or has not been
+    // tried). The Cache window shows it: "not reachable" alone told nobody
+    // whether the server was still starting, had failed to start, or answered
+    // with an error.
+    const [error, setError] = useState<string | null>(null);
+    const loggedError = useRef<string | null>(null);
     // Deleted rows disappear immediately (the next poll confirms), so the UI
     // never shows a "deleted" item bouncing back for a second.
     const hidden = useRef<Set<string>>(new Set());
@@ -53,7 +58,11 @@ const useCachedTorrents = () => {
     const mutationSeq = useRef(0);
 
     const refresh = useCallback(() => {
-        if (typeof serverUrl !== 'string') return;
+        if (typeof serverUrl !== 'string') {
+            // Returning quietly here left the window on "Loading..." for good.
+            setError('No streaming server is set in the profile settings.');
+            return;
+        }
         const seq = mutationSeq.current;
         serverFetch(new URL('cache/list', serverUrl))
             .then((resp) => {
@@ -63,11 +72,18 @@ const useCachedTorrents = () => {
             .then((list: CacheEntry[]) => {
                 if (seq !== mutationSeq.current) return;
                 setEntries(list.filter((entry) => !hidden.current.has(entry.infoHash)));
-                setFailed(false);
+                setError(null);
+                loggedError.current = null;
             })
-            .catch(() => {
+            .catch((reason: unknown) => {
+                const message = reason instanceof Error ? reason.message : String(reason);
+                // Once per distinct failure, not once per 3s poll.
+                if (loggedError.current !== message) {
+                    loggedError.current = message;
+                    console.error('useCachedTorrents: cache/list failed', reason);
+                }
                 if (seq !== mutationSeq.current) return;
-                setFailed(true);
+                setError(message);
             });
     }, [serverUrl]);
 
@@ -154,7 +170,7 @@ const useCachedTorrents = () => {
         });
     }, [serverUrl, mutate]);
 
-    return { entries, failed, refresh, setPinned, setPaused, setFileSelected, remove };
+    return { entries, failed: error !== null, error, refresh, setPinned, setPaused, setFileSelected, remove };
 };
 
 export default useCachedTorrents;

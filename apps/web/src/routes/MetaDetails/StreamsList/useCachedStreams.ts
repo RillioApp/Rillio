@@ -100,6 +100,8 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page
     // array from a ref.
     const streamsRef = useRef(addonStreams);
     streamsRef.current = addonStreams;
+    // The last cache failure written to the console (see the catch in load).
+    const loggedFailure = useRef<string | null>(null);
     const evidenceKey = useMemo(() => addonStreams
         .filter((stream) => typeof stream.infoHash === 'string')
         .map((stream) => `${String(stream.infoHash).toLowerCase()}:${String(stream.fileIdx)}`)
@@ -137,6 +139,7 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page
                 // A load of the previous title/episode, or one finishing after
                 // unmount, must not overwrite anything.
                 if (!isCurrent()) return;
+                loggedFailure.current = null;
                 setMatches(matchCachedEpisode({
                     entries,
                     filesByHash,
@@ -148,10 +151,17 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page
                     page: { type: pageType, name: pageName, metaTransportUrl },
                 }));
             })
-            // No streaming server, or it is down: there is simply nothing cached
-            // to show. Never surfaced to the user - the addon streams below are
-            // unaffected.
-            .catch(() => {
+            // No streaming server, or it is down: there is nothing cached to
+            // show, and the addon streams below are unaffected, so the page
+            // stays quiet. The console does not: missing cards with no trace
+            // of why were undiagnosable. Once per distinct failure, not once
+            // per poll.
+            .catch((reason: unknown) => {
+                const message = reason instanceof Error ? reason.message : String(reason);
+                if (loggedFailure.current !== message) {
+                    loggedFailure.current = message;
+                    console.error('useCachedStreams: reading the cache failed, no cached cards are shown', reason);
+                }
                 if (isCurrent()) setMatches([]);
             });
         // evidenceKey stands in for addonStreams (read through the ref).

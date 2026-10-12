@@ -672,7 +672,7 @@ const Cached = ({ onClose }: Props) => {
     const closeCached = onClose;
     const navigate = useNavigate();
     const core = useCore();
-    const { entries, failed, refresh, setPinned, setPaused, setFileSelected, remove } = useCachedTorrents();
+    const { entries, failed, error, refresh, setPinned, setPaused, setFileSelected, remove } = useCachedTorrents();
     const libraryLinks = useLibraryLinksByInfoHash();
     const streamingMode = useStreamingModeSetting();
     // Identify anything the Player never got to write metadata for.
@@ -909,8 +909,23 @@ const Cached = ({ onClose }: Props) => {
             <div className="min-h-0 flex-1 overflow-y-auto">
                 {
                     failed ?
-                        <div className="px-5 py-10 text-center text-sm text-fg-muted">
-                            The streaming service is not reachable.
+                        // The reason is shown as it arrived (the shell's own words
+                        // for a server that did not start, or the failed request):
+                        // it is what tells a slow start from a dead one, and what
+                        // to send when reporting it. The list keeps re-checking on
+                        // its own every few seconds; the button is for right now.
+                        <div className="flex flex-col items-center gap-3 px-5 py-10 text-center">
+                            <div className="text-sm text-fg-muted">The cache could not be loaded.</div>
+                            {
+                                error !== null ?
+                                    <div className="max-w-md select-text break-words text-xs text-danger">{error}</div>
+                                    :
+                                    null
+                            }
+                            <div className="text-xs text-fg-subtle">Checking again automatically.</div>
+                            <Button variant="outline" size="sm" onClick={refresh} className="bg-surface px-3.5 text-fg-muted hover:text-fg">
+                                Try again
+                            </Button>
                         </div>
                         :
                         entries === null ?
