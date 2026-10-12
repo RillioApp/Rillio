@@ -42,6 +42,12 @@ pub(crate) struct CacheEntry {
     /// client reads the same verdict instead of re-deriving it from `state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<Issue>,
+    /// Why this entry cannot be removed from here, when it cannot: a
+    /// set-aside torrent whose data is not provably its own (see
+    /// `Engine::exclusive_data_folder`). Absent means removable. A client
+    /// offers no remove action it cannot carry out, and says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cannot_remove: Option<String>,
     pub pinned: bool,
     /// Whether the player marked this stream watched (streaming mode): an
     /// un-pinned watched entry is scheduled for automatic cleanup.
@@ -268,6 +274,7 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
                 _ => Vec::new(),
             };
             CacheEntry {
+                cannot_remove: None,
                 issue: derive_issue(Observed::Managed {
                     error: match stats.state {
                         TorrentStatsState::Error => {
@@ -309,6 +316,7 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
             state: "waiting".to_owned(),
             error: None,
             issue: derive_issue(Observed::SetAside(&record.reason)),
+            cannot_remove: engine.removal_refusal(&record),
             pinned: engine.is_pinned(&info_hash),
             watched: engine.is_watched(&info_hash),
             meta: engine.meta(&info_hash),
@@ -613,6 +621,18 @@ pub(crate) async fn delete(State(engine): State<Engine>, Json(body): Json<Delete
     if !is_valid_infohash(&body.info_hash) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    engine.remove(&body.info_hash.to_lowercase()).await;
-    Json(serde_json::json!({ "success": true })).into_response()
+    let info_hash = body.info_hash.to_lowercase();
+    match engine.remove(&info_hash).await {
+        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        // Refused or failed: nothing was orphaned and the entry is still
+        // listed. Say so, with the reason, instead of a success that is not.
+        Err(e) => {
+            tracing::error!("cache/delete {info_hash}: {e:#}");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+                .into_response()
+        }
+    }
 }

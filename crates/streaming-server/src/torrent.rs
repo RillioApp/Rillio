@@ -144,7 +144,11 @@ pub(crate) async fn create_magnet(
 /// `GET /:ih/remove` - stop and forget one torrent. Always `200 {}`.
 pub(crate) async fn remove(State(engine): State<Engine>, Path(info_hash): Path<String>) -> Response {
     if is_valid_infohash(&info_hash) {
-        engine.remove(&info_hash.to_lowercase()).await;
+        // The stremio-parity answer is `200 {}` whatever happened; a removal
+        // that was refused or failed is at least never silent.
+        if let Err(e) = engine.remove(&info_hash.to_lowercase()).await {
+            tracing::error!("remove {info_hash}: {e:#}");
+        }
     }
     Json(serde_json::json!({})).into_response()
 }
