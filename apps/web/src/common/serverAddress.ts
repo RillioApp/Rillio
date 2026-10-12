@@ -130,17 +130,27 @@ export const subscribeServerUrl = (listener: Listener): (() => void) => {
 /**
  * Resolves with the real address. Rejects after `timeoutMs` so a caller waiting
  * on a server that never bound gets a real failure instead of a hung promise;
- * the underlying poll keeps running.
+ * the underlying poll keeps running, so a later call succeeds as soon as the
+ * server is up. The rejection carries the shell's own reason when it has one
+ * (a failed start, a start still running), so the UI can say what is wrong.
  */
 export const whenServerUrlReady = (timeoutMs = POLL_COMPLAIN_AFTER_MS): Promise<string> => {
     if (actualUrl !== null) return Promise.resolve(actualUrl);
     const pending = ensureHandshake();
     if (pending === null) return Promise.resolve(getServerUrl());
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(
-            () => reject(new Error('serverAddress: the streaming service did not report an address')),
-            timeoutMs,
-        );
+        const timer = setTimeout(() => {
+            const unexplained = 'the streaming server has not started';
+            const invoke = getTauri()?.core?.invoke;
+            Promise.resolve(typeof invoke === 'function' ? invoke('streaming_server_problem') : null)
+                .catch((error: unknown) => {
+                    console.error('serverAddress: streaming_server_problem failed', error);
+                    return null;
+                })
+                .then((problem: unknown) => reject(new Error(
+                    typeof problem === 'string' && problem.length > 0 ? problem : unexplained,
+                )));
+        }, timeoutMs);
         pending.then((url) => {
             clearTimeout(timer);
             resolve(url);

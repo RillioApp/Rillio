@@ -10,8 +10,19 @@ export type CacheEntry = {
     name: string,
     downloaded: number,
     total: number,
+    // 'initializing' | 'live' | 'paused' | 'error', or 'waiting' for a torrent
+    // that is in the cache but not in the engine yet (see `issue`).
     state: string,
     error?: string,
+    // The server's ONE verdict on the entry's health: absent when it is fine,
+    // otherwise what is wrong (`kind` for code, `reason` for a person). The UI
+    // tags the row and offers "Fetch again" off this alone; it never derives
+    // health from `state` itself.
+    issue?: { kind: string, reason: string },
+    // Present when the server cannot remove this entry (a download waiting to
+    // be restored whose files it cannot tell apart from other downloads'),
+    // with the technical why. The row then offers no remove action.
+    cannotRemove?: string,
     pinned: boolean,
     // The player marked this stream watched: with streaming mode on, an
     // un-pinned watched entry cleans up automatically about an hour later.
@@ -39,7 +50,12 @@ const useCachedTorrents = () => {
     const toast = useToast();
     const serverUrl = profile.settings.streamingServerUrl;
     const [entries, setEntries] = useState<CacheEntry[] | null>(null);
-    const [failed, setFailed] = useState(false);
+    // Why the list could not be loaded, or null while it can (or has not been
+    // tried). The Cache window shows it: "not reachable" alone told nobody
+    // whether the server was still starting, had failed to start, or answered
+    // with an error.
+    const [error, setError] = useState<string | null>(null);
+    const loggedError = useRef<string | null>(null);
     // Deleted rows disappear immediately (the next poll confirms), so the UI
     // never shows a "deleted" item bouncing back for a second.
     const hidden = useRef<Set<string>>(new Set());
@@ -53,7 +69,11 @@ const useCachedTorrents = () => {
     const mutationSeq = useRef(0);
 
     const refresh = useCallback(() => {
-        if (typeof serverUrl !== 'string') return;
+        if (typeof serverUrl !== 'string') {
+            // Returning quietly here left the window on "Loading..." for good.
+            setError('No streaming server is set in the profile settings.');
+            return;
+        }
         const seq = mutationSeq.current;
         serverFetch(new URL('cache/list', serverUrl))
             .then((resp) => {
@@ -63,11 +83,18 @@ const useCachedTorrents = () => {
             .then((list: CacheEntry[]) => {
                 if (seq !== mutationSeq.current) return;
                 setEntries(list.filter((entry) => !hidden.current.has(entry.infoHash)));
-                setFailed(false);
+                setError(null);
+                loggedError.current = null;
             })
-            .catch(() => {
+            .catch((reason: unknown) => {
+                const message = reason instanceof Error ? reason.message : String(reason);
+                // Once per distinct failure, not once per 3s poll.
+                if (loggedError.current !== message) {
+                    loggedError.current = message;
+                    console.error('useCachedTorrents: cache/list failed', reason);
+                }
                 if (seq !== mutationSeq.current) return;
-                setFailed(true);
+                setError(message);
             });
     }, [serverUrl]);
 
@@ -141,6 +168,45 @@ const useCachedTorrents = () => {
         );
     }, [serverUrl, mutate]);
 
+    // "Fetch again" on a row with an issue: the server tries now to get what
+    // the torrent is missing and answers when the attempt is over (for lost
+    // details that can take a few minutes: it waits, bounded, for a peer).
+    // The row shows it is under way; the result is said either way.
+    const [refetching, setRefetching] = useState<string[]>([]);
+    const refetch = useCallback((infoHash: string) => {
+        if (typeof serverUrl !== 'string') return;
+        setRefetching((current) => current.includes(infoHash) ? current : [...current, infoHash]);
+        serverFetch(new URL('cache/refetch', serverUrl), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ infoHash }),
+        })
+            .then(async (resp) => {
+                if (!resp.ok) {
+                    const body = await resp.json().catch(() => null) as { error?: unknown } | null;
+                    throw new Error(typeof body?.error === 'string' ? body.error : `cache/refetch responded ${resp.status}`);
+                }
+                toast.show({ type: 'success', title: 'Fetched again', message: 'It is back in the cache.', timeout: 4000 });
+            })
+            .catch((error: unknown) => {
+                console.error('useCachedTorrents: cache/refetch failed', error);
+                // Plain words; the technical reason is on the row's "Copy
+                // details" (the server keeps the last one) and in the console.
+                toast.show({
+                    type: 'error',
+                    title: 'Could not fetch it again',
+                    message: 'It did not work this time. Rillio keeps trying on its own.',
+                    timeout: 8000,
+                });
+            })
+            .then(() => {
+                setRefetching((current) => current.filter((hash) => hash !== infoHash));
+                mutationSeq.current += 1;
+                refresh();
+                notifyCacheChanged();
+            });
+    }, [serverUrl, refresh, toast]);
+
     const remove = useCallback((infoHash: string) => {
         if (typeof serverUrl !== 'string') return;
         hidden.current.add(infoHash);
@@ -154,7 +220,7 @@ const useCachedTorrents = () => {
         });
     }, [serverUrl, mutate]);
 
-    return { entries, failed, refresh, setPinned, setPaused, setFileSelected, remove };
+    return { entries, failed: error !== null, error, refresh, setPinned, setPaused, setFileSelected, remove, refetch, refetching };
 };
 
 export default useCachedTorrents;

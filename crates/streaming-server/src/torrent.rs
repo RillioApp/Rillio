@@ -144,15 +144,29 @@ pub(crate) async fn create_magnet(
 /// `GET /:ih/remove` - stop and forget one torrent. Always `200 {}`.
 pub(crate) async fn remove(State(engine): State<Engine>, Path(info_hash): Path<String>) -> Response {
     if is_valid_infohash(&info_hash) {
-        engine.remove(&info_hash.to_lowercase()).await;
+        // The stremio-parity answer is `200 {}` whatever happened; a removal
+        // that was refused or failed is at least never silent.
+        if let Err(e) = engine.remove(&info_hash.to_lowercase()).await {
+            tracing::error!("remove {info_hash}: {e:#}");
+        }
     }
     Json(serde_json::json!({})).into_response()
 }
 
-/// `GET /removeAll` - stop and forget every torrent. Always `200 {}`.
+/// `POST /removeAll` - stop and forget every torrent in the session.
+///
+/// Answers what actually happened (`removed`, `skipped`, `failed`), and is
+/// only a `200` when nothing was skipped or failed: torrents waiting to be
+/// restored are never removed here, and a bare `200 {}` over a cache that
+/// still holds them would be a lie. `409` otherwise, same body.
 pub(crate) async fn remove_all(State(engine): State<Engine>) -> Response {
-    engine.remove_all().await;
-    Json(serde_json::json!({})).into_response()
+    let report = engine.remove_all().await;
+    let status = if report.skipped.is_empty() && report.failed.is_empty() {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::CONFLICT
+    };
+    (status, Json(report)).into_response()
 }
 
 /// What a create downloads when it is NEW. Both create routes are the "open
