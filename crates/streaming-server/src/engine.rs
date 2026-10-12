@@ -367,10 +367,6 @@ pub struct Engine {
     /// session; the cache list shows them with their issue, and they leave
     /// this map when restored or removed.
     unrestored: Arc<Mutex<HashMap<String, Unrestored>>>,
-    /// infohash -> the folder its files live in. librqbit keeps this to
-    /// itself, and it is NOT always derivable (an older cache can hold other
-    /// shapes), so it is recorded from session.json at start and at every add.
-    folders: Arc<Mutex<HashMap<String, PathBuf>>>,
     /// THE MUTATION GATE. One lock for every operation that changes which
     /// index points at a torrent's data, held for the whole of the operation:
     ///
@@ -931,6 +927,50 @@ fn replace_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The full paths of a torrent's files, for checking after a removal that
+/// they are gone. `Err` when either half is unknown: a removal that cannot
+/// say where the files were must not go on to conclude that none is left
+/// (and, for a restored torrent, delete the record that is their only other
+/// index). An empty list is only ever the answer for a torrent with no files.
+fn payload_paths(
+    folder: Option<PathBuf>,
+    relative_files: anyhow::Result<Vec<PathBuf>>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let folder = folder.context("the folder its files are in could not be determined")?;
+    let relative_files = relative_files.context("its file list could not be determined")?;
+    Ok(relative_files.iter().map(|file| folder.join(file)).collect())
+}
+
+#[cfg(test)]
+mod payload_paths_tests {
+    use super::*;
+
+    /// The state the review constructed: a torrent in the session whose
+    /// folder is not known. It used to yield an empty file list, so the
+    /// "is anything left?" check passed with nothing checked.
+    #[test]
+    fn an_unknown_folder_is_an_error_not_an_empty_file_list() {
+        let files = Ok(vec![PathBuf::from("a.mkv")]);
+        let err = payload_paths(None, files).unwrap_err();
+        assert!(format!("{err:#}").contains("folder"), "{err:#}");
+    }
+
+    #[test]
+    fn an_unknown_file_list_is_an_error_too() {
+        let err = payload_paths(Some(PathBuf::from("cache")), Err(anyhow::anyhow!("torrent is not resolved")))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("file list"), "{err:#}");
+    }
+
+    #[test]
+    fn known_folder_and_files_give_every_path() {
+        let paths =
+            payload_paths(Some(PathBuf::from("cache/Pack")), Ok(vec![PathBuf::from("a.mkv"), PathBuf::from("b.mkv")]))
+                .unwrap();
+        assert_eq!(paths, vec![PathBuf::from("cache/Pack").join("a.mkv"), PathBuf::from("cache/Pack").join("b.mkv")]);
+    }
+}
+
 /// Remove a file that may not exist. Any other failure is the caller's to act
 /// on: used where a file left behind would be wrong (a recovery record
 /// surviving the removal of its torrent).
@@ -1032,9 +1072,6 @@ fn read_records(session_dir: &Path) -> Vec<Unrestored> {
 struct Prepared {
     /// Every torrent set aside, old and new.
     set_aside: Vec<Unrestored>,
-    /// infohash -> the output folder librqbit persisted for it, for the
-    /// torrents that stay in the session.
-    folders: HashMap<String, PathBuf>,
 }
 
 /// Startup guard, run BEFORE the librqbit session is built. For every entry of
@@ -1048,7 +1085,6 @@ struct Prepared {
 /// retries) rather than either wait forever on that entry or drop it from the
 /// only index that knows where its data is.
 fn prepare_session(session_dir: &Path) -> anyhow::Result<Prepared> {
-    let mut folders = HashMap::new();
     let db_path = session_dir.join("session.json");
     let raw = match std::fs::read(&db_path) {
         Ok(b) => Some(b),
@@ -1119,8 +1155,7 @@ fn prepare_session(session_dir: &Path) -> anyhow::Result<Prepared> {
                     continue;
                 }
             }
-            in_session.insert(ih.clone());
-            folders.insert(ih, parsed.output_folder);
+            in_session.insert(ih);
         }
         if !remove_ids.is_empty() {
             for id in &remove_ids {
@@ -1151,7 +1186,7 @@ fn prepare_session(session_dir: &Path) -> anyhow::Result<Prepared> {
     // by an add that was cancelled before librqbit registered it is a few KB
     // nothing reads, and deciding at start that a copy is unreferenced needs a
     // proof (every entry and record read correctly) this code cannot give.
-    Ok(Prepared { set_aside, folders })
+    Ok(Prepared { set_aside })
 }
 
 impl Engine {
@@ -1261,7 +1296,6 @@ impl Engine {
         let mut engine = Self::from_session(session, cache_root);
         engine.set_aside_at_start =
             Arc::new(prepared.set_aside.iter().map(|entry| entry.info_hash.clone()).collect());
-        engine.folders = Arc::new(Mutex::new(prepared.folders));
         engine.unrestored = Arc::new(Mutex::new(
             prepared.set_aside.into_iter().map(|entry| (entry.info_hash.clone(), entry)).collect(),
         ));
@@ -1294,8 +1328,24 @@ impl Engine {
 
     /// Where a managed torrent's files live (the folder librqbit was given
     /// for it), when known.
+    ///
+    /// DERIVED from librqbit's own handle for the torrent, never remembered
+    /// here: the folder exists exactly as long as the torrent is in the
+    /// session, and no cancelled or failed step of ours can leave it missing
+    /// or stale. librqbit keeps the field private to its crate and exposes it
+    /// through its `api` listing, which reads it straight off each handle.
     pub fn output_folder(&self, info_hash: &str) -> Option<PathBuf> {
-        self.folders.lock().ok().and_then(|m| m.get(info_hash).cloned())
+        self.output_folders().remove(info_hash)
+    }
+
+    /// [`Engine::output_folder`] for every torrent in the session at once.
+    pub fn output_folders(&self) -> HashMap<String, PathBuf> {
+        librqbit::api::Api::new(self.session.clone(), None)
+            .api_torrent_list()
+            .torrents
+            .into_iter()
+            .map(|torrent| (torrent.info_hash, PathBuf::from(torrent.output_folder)))
+            .collect()
     }
 
     /// A persisted output folder is only honoured inside the cache root: the
@@ -1410,8 +1460,17 @@ impl Engine {
         torrent_bytes: bytes::Bytes,
         initial_peers: Vec<std::net::SocketAddr>,
     ) -> anyhow::Result<Handle> {
-        let _gate = self.gate.lock().await;
-        self.restore_gated(record, torrent_bytes, initial_peers).await
+        // A task that owns the gate, like every registration and removal: the
+        // request that asked for the restore can be dropped without ending it
+        // between librqbit's add and the clearing of the waiting entry.
+        let engine = self.clone();
+        let record = record.clone();
+        tokio::spawn(async move {
+            let _gate = engine.gate.clone().lock_owned().await;
+            engine.restore_gated(&record, torrent_bytes, initial_peers).await
+        })
+        .await
+        .context("the restore task ended abnormally")?
     }
 
     /// [`Engine::register_from_record`] for a caller that holds the gate.
@@ -1502,7 +1561,6 @@ impl Engine {
             set_aside_at_start: Arc::new(Vec::new()),
             session_dir: Arc::new(cache_root_session),
             unrestored: Arc::new(Mutex::new(HashMap::new())),
-            folders: Arc::new(Mutex::new(HashMap::new())),
             gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -2050,27 +2108,13 @@ impl Engine {
     async fn add_source(&self, add: AddTorrent<'_>, pick: Pick<'_>) -> anyhow::Result<Handle> {
         let listed = self.resolve_metadata(add).await?;
         let info_hash = listed.info_hash.as_string();
-        // The metadata was resolved OUTSIDE the gate (it can take minutes and
-        // changes nothing). From here to the end is ONE decision under it: is
-        // the torrent in the session, does it have a recovery record, or is it
-        // new. Taken apart, a play racing the background restore could see
-        // "not in the session" and "no record" on either side of the restore
-        // and register the torrent a second way.
-        let _gate = self.gate.lock().await;
-        // A concurrent add of the same torrent may have landed while we
-        // resolved: its selection stands, and re-adding would only come back
-        // as AlreadyManaged anyway.
-        if let Some(handle) = self.get(&info_hash) {
-            return Ok(handle);
-        }
-        let record = self.unrestored.lock().ok().and_then(|m| m.get(&info_hash).cloned());
-        if let Some(record) = record {
-            tracing::warn!("add {info_hash}: it is set aside; restoring it from its record instead of adding it anew");
-            return self.restore_gated(&record, listed.torrent_bytes, listed.seen_peers).await;
-        }
-        let selection = match pick {
-            Pick::Files(files) => files,
-            Pick::Decide(decide) => {
+        // What a NEW torrent would download, worked out here because the
+        // caller's `pick` borrows and cannot go into the task below. It is a
+        // pure function of the file list; an error in it only matters, and is
+        // only raised, if the torrent turns out to be new.
+        let selection: anyhow::Result<Vec<usize>> = match pick {
+            Pick::Files(files) => Ok(files),
+            Pick::Decide(decide) => (|| {
                 let mut offset = 0u64;
                 let files: Vec<types::File> = listed
                     .info
@@ -2084,11 +2128,36 @@ impl Engine {
                     .collect::<anyhow::Result<_>>()?;
                 let selection = decide(&files)?;
                 tracing::info!("add {info_hash}: selecting {selection:?} of {} files", files.len());
-                selection
-            }
+                Ok(selection)
+            })(),
         };
-        self.register(&info_hash, listed.torrent_bytes, selection, listed.output_folder, listed.seen_peers)
-            .await
+        // The metadata was resolved OUTSIDE the gate (it can take minutes and
+        // changes nothing). The rest is ONE transaction in a task that owns
+        // the gate, like a removal: the decision (in the session, has a
+        // recovery record, or new) and the registration it leads to. Taken
+        // apart, a play racing the background restore could register the
+        // torrent a second way; left on the caller's future, a request dropped
+        // inside librqbit's add would end the transaction half-way.
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _gate = engine.gate.clone().lock_owned().await;
+            // A concurrent add of the same torrent may have landed while we
+            // resolved: its selection stands, and re-adding would only come
+            // back as AlreadyManaged anyway.
+            if let Some(handle) = engine.get(&info_hash) {
+                return Ok(handle);
+            }
+            let record = engine.unrestored.lock().ok().and_then(|m| m.get(&info_hash).cloned());
+            if let Some(record) = record {
+                tracing::warn!("add {info_hash}: it is set aside; restoring it from its record instead of adding it anew");
+                return engine.restore_gated(&record, listed.torrent_bytes, listed.seen_peers).await;
+            }
+            engine
+                .register(&info_hash, listed.torrent_bytes, selection?, listed.output_folder, listed.seen_peers)
+                .await
+        })
+        .await
+        .context("the registration task ended abnormally")?
     }
 
     /// Hand a torrent whose metadata is in hand to librqbit: `selection` is
@@ -2128,15 +2197,11 @@ impl Engine {
         let handle = match resp {
             librqbit::AddTorrentResponse::Added(_, handle) => {
                 self.reject_if_unconfined(&handle).await?;
-                if let Ok(mut folders) = self.folders.lock() {
-                    folders.insert(info_hash.clone(), folder);
-                }
                 handle
             }
-            // librqbit already had it and applied NONE of these options: the
-            // torrent lives where it was registered, so the folder recorded
-            // for it stands. Writing ours over it would point every later
-            // look at its files at a folder it does not use.
+            // librqbit already had it and applied none of these options. Where
+            // it lives is read off its handle (see `output_folder`), so there
+            // is nothing here to get wrong.
             librqbit::AddTorrentResponse::AlreadyManaged(_, handle) => handle,
             librqbit::AddTorrentResponse::ListOnly(_) => anyhow::bail!("add_torrent returned list-only"),
         };
@@ -2355,10 +2420,12 @@ impl Engine {
         // Where its files are, for checking afterwards that they are gone:
         // librqbit drops the torrent from its index first and only LOGS a
         // file it could not delete (one a player still holds open, say).
-        let files: Vec<PathBuf> = self
-            .output_folder(info_hash)
-            .map(|folder| Self::files(&handle).iter().map(|file| folder.join(&file.path)).collect())
-            .unwrap_or_default();
+        // Worked out BEFORE anything is deleted, and required: "where its
+        // files are is not known" is never read as "nothing is left".
+        let relative: anyhow::Result<Vec<PathBuf>> = handle
+            .with_metadata(|m| m.file_infos.iter().map(|fi| fi.relative_filename.clone()).collect());
+        let files = payload_paths(self.output_folder(info_hash), relative)
+            .with_context(|| format!("{info_hash} was not removed"))?;
         drop(handle);
         self.session
             .delete(id.into(), Self::DELETE_FILES_ON_REMOVE)
@@ -2413,8 +2480,9 @@ impl Engine {
         if is_persisted_info_hash(info_hash) {
             remove_file_logged(&metadata_copy_path(&self.session_dir, info_hash));
         }
-        if let Ok(mut folders) = self.folders.lock() {
-            folders.remove(info_hash);
+        // And it is not waiting for anything any more.
+        if let Ok(mut waiting) = self.unrestored.lock() {
+            waiting.remove(info_hash);
         }
         // A deleted torrent must not leave a stale pin behind (it would
         // shield a future re-add of the same infohash from eviction), nor a

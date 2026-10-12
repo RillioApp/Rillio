@@ -938,6 +938,68 @@ async fn a_cancelled_removal_still_finishes_before_the_same_hash_registers_again
     }
 }
 
+/// A torrent's folder is read off librqbit's handle, not remembered beside it:
+/// a registration whose request was dropped part-way (after librqbit took the
+/// torrent, before the add returned) still reports where its files are.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_registered_through_a_cancelled_request_still_reports_its_folder() {
+    let dir = std::env::temp_dir().join("rillio-restore-cancelled-folder");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let engine = Engine::new(dir.clone()).await.unwrap();
+    for i in 0..300u64 {
+        let name = format!("Cancelled.Add.{i:04}.mkv");
+        let mut info = Vec::new();
+        info.extend_from_slice(format!("d6:lengthi{}e", PIECE).as_bytes());
+        info.extend_from_slice(format!("4:name{}:{name}", name.len()).as_bytes());
+        info.extend_from_slice(format!("12:piece lengthi{PIECE}e").as_bytes());
+        info.extend_from_slice(b"6:pieces20:");
+        info.extend_from_slice(&[0u8; 20]);
+        info.extend_from_slice(b"e");
+        let _ = tokio::time::timeout(
+            Duration::from_micros(i * 7),
+            engine.add_blob(bencode_torrent(info), Pick::Files(vec![0])),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let managed: Vec<String> = engine.all().iter().map(Engine::info_hash_hex).collect();
+    assert!(!managed.is_empty(), "some of the cancelled adds registered");
+    let key = |p: &Path| p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>();
+    for ih in &managed {
+        let folder = engine.output_folder(ih).unwrap_or_else(|| panic!("{ih} is in the session with no known folder"));
+        assert_eq!(key(&folder), key(&dir), "{ih}");
+    }
+    stop(engine).await;
+}
+
+/// A restore whose request is dropped part-way must not leave the torrent
+/// both in the session AND still marked as waiting: one row, and after it is
+/// removed, none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_restore_leaves_one_row_and_a_removal_leaves_none() {
+    for round in 0..12u64 {
+        let cache = seeded_cache(&format!("cancel-restore-{round}")).await;
+        let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
+        cache.poison_without_copy(&cache.pack);
+        let engine = cache.start().await;
+        wait_for(&engine, &cache.dir, "the pack waiting", |e| entry(e, &cache.pack).is_some()).await;
+        std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_micros(200 + round * 150), engine.refetch(&cache.pack)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let rows = |entries: &[Value]| entries.iter().filter(|e| e["infoHash"] == cache.pack.as_str()).count();
+        let entries = list(&engine, &cache.dir).await;
+        assert_eq!(rows(&entries), 1, "round {round}: {entries:?}");
+        if settled(&entries, &cache.pack) {
+            let (status, body) = delete(&engine, &cache, &cache.pack).await;
+            assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+            assert_eq!(rows(&list(&engine, &cache.dir).await), 0, "round {round}: nothing of it is listed after its removal");
+        }
+        stop(engine).await;
+    }
+}
+
 /// Hold a file open the way a player does, so that it cannot be deleted.
 #[cfg(windows)]
 fn hold_undeletable(path: &Path) -> std::fs::File {

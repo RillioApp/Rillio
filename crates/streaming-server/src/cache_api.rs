@@ -204,6 +204,8 @@ pub(crate) fn main_feature(videos: &[usize], length: impl Fn(usize) -> u64) -> O
 /// `GET /cache/list` - every torrent the engine manages (the session persists
 /// across restarts, so this is the whole cache), biggest first.
 pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> {
+    // Where each torrent's files are, read off librqbit's handles once.
+    let folders = engine.output_folders();
     let mut entries: Vec<CacheEntry> = engine
         .all()
         .iter()
@@ -263,7 +265,7 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
             // Selected files the engine counts bytes for that are not on disk
             // (deleted behind its back while it runs). Only checked where a
             // have-byte count exists, and only for files that claim some.
-            let missing: Vec<String> = match (&stats.state, engine.output_folder(&info_hash)) {
+            let missing: Vec<String> = match (&stats.state, folders.get(&info_hash).cloned()) {
                 (TorrentStatsState::Live | TorrentStatsState::Paused, Some(folder)) => selected
                     .iter()
                     .filter(|&&i| stats.file_progress.get(i).copied().unwrap_or(0) > 0)
