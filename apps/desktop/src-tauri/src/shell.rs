@@ -1270,6 +1270,13 @@ fn video_rect(ctrl: &Controller) -> Result<VideoRect, String> {
 /// depended on how far the window's shape was from the video's. Measured on a
 /// 16:9 clip (2026-10-12): exact in a 1600x900 window, 20 px out to the left in
 /// 1600x700, 105 px in a maximized 3440x1380 one.
+///
+/// THE VISIBLE PART ONLY. In the player's Crop mode the video is scaled past
+/// the window and the margins go NEGATIVE (a 16:9 clip cropped into 1600x700
+/// reports `mt = mb = -100`). The shader's OUTPUT texture is then the part of
+/// the video that is on screen, not the whole scaled picture (measured: with
+/// the full 1600x900 rect a panel's blur landed 23 px high and 49 px short),
+/// so a margin never reaches outside the window here.
 fn video_rect_from_osd_dimensions(dims: &Value) -> Result<VideoRect, String> {
     let get = |key: &str| -> Result<f64, String> {
         dims.get(key)
@@ -1277,7 +1284,8 @@ fn video_rect_from_osd_dimensions(dims: &Value) -> Result<VideoRect, String> {
             .ok_or_else(|| format!("player_blur_rect: osd-dimensions.{key} missing"))
     };
     let (win_w, win_h) = (get("w")?, get("h")?);
-    let (ml, mr, mt, mb) = (get("ml")?, get("mr")?, get("mt")?, get("mb")?);
+    let bar = |key: &str| -> Result<f64, String> { Ok(get(key)?.max(0.0)) };
+    let (ml, mr, mt, mb) = (bar("ml")?, bar("mr")?, bar("mt")?, bar("mb")?);
     let (video_w, video_h) = (win_w - ml - mr, win_h - mt - mb);
     if !(video_w > 0.0 && video_h > 0.0 && win_w > 0.0 && win_h > 0.0) {
         return Err(format!(
@@ -1870,6 +1878,10 @@ mod tests {
         // No bars: the video rect is the window.
         let dims = serde_json::json!({ "w": 1601, "h": 901, "ml": 0, "mr": 0, "mt": 0, "mb": 0 });
         assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(0.0, 0.0, 1601.0, 901.0));
+        // Crop mode: the video is scaled past the window, the margins are
+        // negative, and what the shader sees is the window-sized visible part.
+        let dims = serde_json::json!({ "w": 1600, "h": 700, "ml": 0, "mr": 0, "mt": -100, "mb": -100 });
+        assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(0.0, 0.0, 1600.0, 700.0));
         // Between files mpv reports an empty window: an error, not a division by zero.
         let dims = serde_json::json!({ "w": 0, "h": 0, "ml": 0, "mr": 0, "mt": 0, "mb": 0 });
         assert!(video_rect_from_osd_dimensions(&dims).is_err());
