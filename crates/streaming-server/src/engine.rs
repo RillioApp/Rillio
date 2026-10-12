@@ -404,6 +404,22 @@ pub struct Engine {
     ///    happen (a file librqbit could not delete, a record left behind) is
     ///    an error to the caller, never a success.
     ///
+    /// LOCK ORDER, the only one: [`Engine::selection`], then this gate, then
+    /// whatever librqbit locks inside the call made under them. The gate is
+    /// never held while waiting for `selection`, and no caller waits for a
+    /// gate-owning task (a registration, a restore, a removal) while holding
+    /// `selection`: the one path that holds both, a selection write, takes the
+    /// gate itself, directly, as the inner lock. Everything else takes the
+    /// gate alone.
+    ///
+    /// A selection write stays under the gate on purpose. librqbit rewrites
+    /// the session entry of whatever handle it is given, so the write has to
+    /// be serialized with removal or it can put a removed torrent's entry
+    /// back. The price is that whatever blocks inside librqbit's
+    /// `update_only_files` blocks the gate, which is why the deadlock that
+    /// call had is fixed at its source (vendor/README-RILLIO.md) and pinned by
+    /// `tests/selection_vs_peer_churn.rs`.
+    ///
     /// What is deliberately NOT under the gate: waiting on the swarm for a
     /// set-aside torrent's metadata (minutes, and it changes nothing on disk;
     /// the gate is taken afterwards and the record re-checked), and the

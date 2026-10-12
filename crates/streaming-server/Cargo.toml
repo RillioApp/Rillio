@@ -1,6 +1,15 @@
 # Standalone workspace: native-only, isolated from the wasm crates' lockfile.
 # Build/test from this directory (or with -p from root using --manifest-path).
 [workspace]
+# The vendored librqbit is a dependency, not a member: as a member its own
+# dev-dependencies would be pulled into this lockfile.
+exclude = ["vendor/librqbit"]
+
+# librqbit 8.1.1 with one deadlock fix (vendor/README-RILLIO.md). The shell's
+# workspace (apps/desktop/src-tauri) carries the same patch section; a build
+# that misses it gets the unpatched crate and the deadlock back.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
 
 [package]
 name = "rillio-streaming-server"

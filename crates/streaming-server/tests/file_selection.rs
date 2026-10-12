@@ -10,10 +10,16 @@
 //! next-episode preload), the explicit `/cache/select`, and a legacy torrent
 //! whose persisted selection is still "all".
 //!
-//! Offline by construction: the torrents are synthetic `.torrent` blobs with
-//! REAL piece hashes (so a file written to disk beforehand verifies as
-//! complete), each file exactly piece-aligned, and nothing ever connects to a
-//! peer. Streams are probed with HEAD, which resolves and selects the file but
+//! Needs no network: the torrents are synthetic `.torrent` blobs with REAL
+//! piece hashes (so a file written to disk beforehand verifies as complete),
+//! each file exactly piece-aligned, and no peer has their data. It is NOT
+//! sealed off from the network, though: the engine announces these made-up
+//! infohashes to its default trackers and the DHT like any other, and on a
+//! connected machine they answer with a handful of addresses, so the torrents
+//! do get peer connections that then die. That is how the concurrent test
+//! below found a deadlock in librqbit on Linux CI (see
+//! `selection_vs_peer_churn.rs`, which makes the same race on purpose and
+//! truly offline). Streams are probed with HEAD, which resolves and selects the file but
 //! never opens a body (a GET would park on pieces no peer will ever send).
 
 use std::net::SocketAddr;
