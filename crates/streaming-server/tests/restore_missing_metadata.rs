@@ -228,7 +228,15 @@ async fn seed_a_dev_cache_in_the_field_entrys_state() {
     );
     stop(engine).await;
     let metadata = std::fs::read(cache.saved(&cache.pack)).unwrap();
-    cache.poison_without_copy(&cache.pack);
+    // RILLIO_SEED_HEALTHY=1: leave both torrents healthy (a plain small cache).
+    if !std::env::var("RILLIO_SEED_HEALTHY").is_ok_and(|v| v == "1") {
+        cache.poison_without_copy(&cache.pack);
+    }
+    // RILLIO_SEED_POISON_MOVIE=1: the single-file movie too, for the row that
+    // cannot be removed.
+    if std::env::var("RILLIO_SEED_POISON_MOVIE").is_ok_and(|v| v == "1") {
+        cache.poison_without_copy(&cache.movie);
+    }
 
     // The session stores absolute folders: rebase them onto the target.
     let _ = std::fs::remove_dir_all(&target);

@@ -1193,6 +1193,10 @@ impl Engine {
         self.unrestored.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
+    pub(crate) fn is_cache_root(&self, folder: &Path) -> bool {
+        storage::absolutize(folder).is_ok_and(|folder| same_path(&folder, &self.cache_root))
+    }
+
     fn is_set_aside(&self, info_hash: &str) -> bool {
         self.unrestored.lock().map(|m| m.contains_key(info_hash)).unwrap_or(false)
     }

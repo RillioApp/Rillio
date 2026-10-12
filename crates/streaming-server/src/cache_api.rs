@@ -306,11 +306,15 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
     entries.extend(engine.unrestored().into_iter().map(|record| {
         let info_hash = record.info_hash.clone();
         CacheEntry {
+            // A pack's folder carries its name. A single-file torrent's folder
+            // is the cache root itself, which names nothing: say what is
+            // known instead.
             name: record
                 .output_folder
                 .file_name()
+                .filter(|_| !engine.is_cache_root(&record.output_folder))
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| info_hash.clone()),
+                .unwrap_or_else(|| format!("Download {}", &info_hash[..info_hash.len().min(8)])),
             downloaded: 0,
             total: 0,
             state: "waiting".to_owned(),
