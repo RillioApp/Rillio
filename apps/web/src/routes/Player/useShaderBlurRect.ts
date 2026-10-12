@@ -143,21 +143,26 @@ const useShaderBlurRect = (): ShaderBlurRegistry | null => {
     const push = useCallback(() => {
         if (!invoke || errors.current >= MAX_ERRORS) return;
         const rects = measure();
+        // Physical px per CSS px. The rects are CSS px and the shader works in
+        // the window's physical px; this is the exact ratio between the two
+        // (measured: a box painted at a CSS rect lands on rect x
+        // devicePixelRatio at every window size). It was the viewport size
+        // before, for the shell to divide its window by, but innerWidth is a
+        // whole number of CSS px and so is not the window: at a window size
+        // that is not a whole number of CSS px the quotient was off by up to a
+        // few px at the far edge. Read per push, so a move to a display with
+        // another scaling is picked up, and part of the de-dupe key below for
+        // the same reason.
+        const scale = window.devicePixelRatio;
         // The panels slide and fade in, so the loop below re-measures every frame;
         // only an actual change is worth an IPC hop. (The shell throttles and
         // de-dupes on its side too - this just keeps the bridge quiet.)
-        const key = JSON.stringify(rects);
+        const key = JSON.stringify({ rects, scale });
         if (key === sent.current) return;
         sent.current = key;
 
         document.documentElement.classList.toggle(BLUR_CLASS, rects.length > 0);
-        invoke('player_blur_rect', {
-            rects,
-            // The viewport, not devicePixelRatio: the shell divides its own window
-            // size by this to recover the scale by MEASUREMENT, which stays right
-            // through a display-scaling change. See blur_shader_opts.
-            viewport: { width: window.innerWidth, height: window.innerHeight },
-        }).catch((e: unknown) => {
+        invoke('player_blur_rect', { rects, scale }).catch((e: unknown) => {
             errors.current += 1;
             if (errors.current === 1) {
                 console.warn('Player', 'GPU panel blur unavailable, falling back to plain glass', e);
@@ -211,10 +216,8 @@ const useShaderBlurRect = (): ShaderBlurRegistry | null => {
             // Leaving the Player with a panel open must not leave the video blurred
             // under nothing.
             document.documentElement.classList.remove(BLUR_CLASS);
-            invoke('player_blur_rect', {
-                rects: [],
-                viewport: { width: window.innerWidth, height: window.innerHeight },
-            }).catch(() => { /* already tearing down; the shell logs its own side */ });
+            invoke('player_blur_rect', { rects: [], scale: window.devicePixelRatio })
+                .catch(() => { /* already tearing down; the shell logs its own side */ });
         };
     }, [invoke, push]);
 
