@@ -19,6 +19,10 @@ export type CacheEntry = {
     // tags the row and offers "Fetch again" off this alone; it never derives
     // health from `state` itself.
     issue?: { kind: string, reason: string },
+    // Present when the server cannot remove this entry (a download waiting to
+    // be restored whose files it cannot tell apart from other downloads'),
+    // with the technical why. The row then offers no remove action.
+    cannotRemove?: string,
     pinned: boolean,
     // The player marked this stream watched: with streaming mode on, an
     // un-pinned watched entry cleans up automatically about an hour later.
@@ -186,11 +190,13 @@ const useCachedTorrents = () => {
             })
             .catch((error: unknown) => {
                 console.error('useCachedTorrents: cache/refetch failed', error);
+                // Plain words; the technical reason is on the row's "Copy
+                // details" (the server keeps the last one) and in the console.
                 toast.show({
                     type: 'error',
                     title: 'Could not fetch it again',
-                    message: error instanceof Error ? error.message : String(error),
-                    timeout: 10000,
+                    message: 'It did not work this time. Rillio keeps trying on its own.',
+                    timeout: 8000,
                 });
             })
             .then(() => {

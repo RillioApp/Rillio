@@ -12,6 +12,7 @@ import SpeedChart from 'rillio/components/ui/speed-chart';
 import useCachedTorrents, { CacheEntry } from './useCachedTorrents';
 import TorrentFiles from './TorrentFiles';
 import useMetadataMatcher from './useMetadataMatcher';
+import UpdateFailureNotice from 'rillio/routes/Settings/General/UpdateFailureNotice';
 
 // What to call an entry: the matched title (with the episode tag for a series)
 // when the torrent has been identified, otherwise the scene filename it came
@@ -55,6 +56,43 @@ const ISSUE_LABELS: Record<string, string> = {
     'data-missing': 'Files missing',
 };
 const issueLabel = (kind: string): string => ISSUE_LABELS[kind] ?? 'Needs attention';
+
+// What the row says about its issue, in plain words. The server's own reason
+// is technical (an engine error, a path, a timeout): it is never put on the
+// row, it goes to the clipboard through "Copy details" for a report.
+const ISSUE_TEXT: Record<string, string> = {
+    'metadata-missing': 'Rillio lost the details of this download and is getting them again. What is on disk is kept.',
+    'engine-error': 'This download stopped on an error.',
+    'data-missing': 'Some of its files are no longer on disk.',
+};
+const issueText = (kind: string): string => ISSUE_TEXT[kind] ?? 'Something is wrong with this download.';
+
+// The issues "Fetch again" can do something about (see the server's
+// Engine::refetch): getting lost details again, and starting a stopped
+// download again. For anything else the way out is another source.
+const FETCHABLE_ISSUES = ['metadata-missing', 'engine-error'];
+
+// Clipboard API first; where it is refused, the legacy copy from an off-screen
+// textarea. Resolves to whether the text was copied.
+const copyText = (text: string): Promise<boolean> => {
+    const legacy = (): boolean => {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.left = '-9999px';
+        document.body.appendChild(area);
+        area.select();
+        let ok = false;
+        try { ok = document.execCommand('copy'); } catch { ok = false; }
+        document.body.removeChild(area);
+        return ok;
+    };
+    return navigator.clipboard?.writeText ?
+        navigator.clipboard.writeText(text).then(() => true, legacy)
+        :
+        Promise.resolve(legacy());
+};
 
 // Same parser the stream cards use: quality/HDR/languages are encoded in the
 // entry name (the selected file's name for single-file selections, e.g. an
@@ -528,6 +566,23 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
     // In the cache but not in the engine: there is no file list to open yet.
     const waiting = entry.state === 'waiting';
     const similarLink = streamsPageLink(entry);
+    // "Copy details": the server's technical reason, for a report. The pill
+    // says whether the copy happened; it never claims one that did not.
+    const [copied, setCopied] = useState<'idle' | 'copied' | 'failed'>('idle');
+    const copyDetails = useCallback(() => {
+        if (issue === undefined) return;
+        const details = [
+            `Rillio cache entry ${entry.infoHash}`,
+            `name: ${entry.name}`,
+            `issue: ${issue.kind}`,
+            `reason: ${issue.reason}`,
+            typeof entry.cannotRemove === 'string' ? `cannot be removed: ${entry.cannotRemove}` : null,
+        ].filter((line) => line !== null).join('\n');
+        copyText(details).then((ok) => {
+            setCopied(ok ? 'copied' : 'failed');
+            setTimeout(() => setCopied('idle'), 1500);
+        });
+    }, [entry.infoHash, entry.name, entry.cannotRemove, issue]);
     const pausable = issue === undefined && !complete && (entry.state === 'live' || paused);
     return (
         <div>
@@ -567,8 +622,13 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                     // under way) where the bytes and state would be: byte counts
                     // for a torrent the engine is not running would be invented.
                         issue !== undefined ?
-                            <div className="mt-1 line-clamp-2 text-xs text-fg-muted first-letter:uppercase" title={issue.reason}>
-                                {refetching ? 'Fetching again, this can take a few minutes' : issue.reason}
+                            <div className="mt-1 line-clamp-2 text-xs text-fg-muted">
+                                {
+                                    refetching ?
+                                        'Fetching again, this can take a few minutes'
+                                        :
+                                        `${issueText(issue.kind)}${typeof entry.cannotRemove === 'string' ? ' It cannot be removed from here until it is restored.' : ''}`
+                                }
                             </div>
                             :
                             null
@@ -633,18 +693,32 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                 // are the point of this row, into a few words.
                     issue !== undefined ?
                         <>
+                            {
+                                FETCHABLE_ISSUES.includes(issue.kind) ?
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={refetching}
+                                        onClick={() => onRefetch(entry.infoHash)}
+                                        title="Try now to get what this download is missing. What is already on disk is kept."
+                                        className={cn(
+                                            'shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg',
+                                            refetching ? 'inline-flex' : 'hidden group-hover:inline-flex',
+                                        )}
+                                    >
+                                        {refetching ? 'Fetching' : 'Fetch again'}
+                                    </Button>
+                                    :
+                                    null
+                            }
                             <Button
                                 variant="outline"
                                 size="sm"
-                                disabled={refetching}
-                                onClick={() => onRefetch(entry.infoHash)}
-                                title="Try now to get what this download is missing. What is already on disk is kept."
-                                className={cn(
-                                    'shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg',
-                                    refetching ? 'inline-flex' : 'hidden group-hover:inline-flex',
-                                )}
+                                onClick={copyDetails}
+                                title="Copy the technical details of this problem, for a report"
+                                className="hidden shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg group-hover:inline-flex"
                             >
-                                {refetching ? 'Fetching' : 'Fetch again'}
+                                {copied === 'copied' ? 'Copied' : copied === 'failed' ? 'Couldn\'t copy' : 'Copy details'}
                             </Button>
                             {
                                 similarLink !== null ?
@@ -730,13 +804,20 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                         :
                         null
                 }
-                <IconButton
-                    onClick={() => onDelete(entry.infoHash)}
-                    title="Delete from cache (frees disk space; can be re-downloaded)"
-                    className="size-9 text-fg-muted opacity-0 hover:text-danger group-hover:opacity-100"
-                >
-                    <Trash2 className="size-5" />
-                </IconButton>
+                {
+                    // No remove action the server has said it cannot carry out
+                    // (see CacheEntry.cannotRemove); the row says so instead.
+                    typeof entry.cannotRemove !== 'string' ?
+                        <IconButton
+                            onClick={() => onDelete(entry.infoHash)}
+                            title="Delete from cache (frees disk space; can be re-downloaded)"
+                            className="size-9 text-fg-muted opacity-0 hover:text-danger group-hover:opacity-100"
+                        >
+                            <Trash2 className="size-5" />
+                        </IconButton>
+                        :
+                        null
+                }
             </div>
             {
                 filesOpen ?
@@ -766,6 +847,17 @@ const Cached = ({ onClose }: Props) => {
     const navigate = useNavigate();
     const core = useCore();
     const { entries, failed, error, refresh, setPinned, setPaused, setFileSelected, remove, refetch, refetching } = useCachedTorrents();
+    // The load failure in the shape the shared failure notice takes: plain
+    // words on screen, the technical text only in what "Copy error" copies.
+    // Keyed on the error text so the 3s re-check does not reset the notice.
+    const loadFailure = useMemo(() => ({
+        stage: 'cache-list',
+        kind: 'unreachable',
+        summary: 'Rillio could not reach its download service.',
+        hint: 'It keeps trying on its own, and this list comes back as soon as the service answers.',
+        message: error ?? '',
+        report: `Rillio: the cache list could not be loaded\n${error ?? '(no detail)'}`,
+    }), [error]);
     const libraryLinks = useLibraryLinksByInfoHash();
     const streamingMode = useStreamingModeSetting();
     // Identify anything the Player never got to write metadata for.
@@ -1004,23 +1096,13 @@ const Cached = ({ onClose }: Props) => {
             <div className="min-h-0 flex-1 overflow-y-auto">
                 {
                     failed ?
-                        // The reason is shown as it arrived (the shell's own words
-                        // for a server that did not start, or the failed request):
-                        // it is what tells a slow start from a dead one, and what
-                        // to send when reporting it. The list keeps re-checking on
-                        // its own every few seconds; the button is for right now.
-                        <div className="flex flex-col items-center gap-3 px-5 py-10 text-center">
-                            <div className="text-sm text-fg-muted">The cache could not be loaded.</div>
-                            {
-                                error !== null ?
-                                    <div className="max-w-md select-text break-words text-xs text-danger">{error}</div>
-                                    :
-                                    null
-                            }
-                            <div className="text-xs text-fg-subtle">Checking again automatically.</div>
-                            <Button variant="outline" size="sm" onClick={refresh} className="bg-surface px-3.5 text-fg-muted hover:text-fg">
-                                Try again
-                            </Button>
+                        // Same treatment as a failed update (UpdateFailureNotice):
+                        // what happened in plain words, "Try again", and "Copy
+                        // error" for the technical text. Nothing technical and
+                        // nothing red on screen. The list keeps re-checking on its
+                        // own every few seconds; the button is for right now.
+                        <div className="px-6 py-10">
+                            <UpdateFailureNotice title="The cache could not be loaded" failure={loadFailure} onRetry={refresh} />
                         </div>
                         :
                         entries === null ?
