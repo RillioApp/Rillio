@@ -667,6 +667,169 @@ fn invalidate_stale_fastresume(session_dir: &Path) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unrestorable-entry guard
+// ---------------------------------------------------------------------------
+//
+// librqbit 8.1.1 restores a session by re-adding every entry of
+// `session/session.json` and AWAITS all of those adds inside
+// `Session::new_with_opts`. An entry whose `<infohash>.torrent` is missing or
+// empty is restored as a bare magnet (session_persistence `into_add_torrent`),
+// and a magnet add waits for a peer to deliver the metadata with NO deadline.
+// One such entry that nobody can serve therefore kept the session, and with it
+// the whole streaming server, from ever existing: no cache list, no cached
+// cards, no playback, on every launch. It is reachable in the field because
+// librqbit rewrites every `.torrent` at every start (open, truncate, write),
+// so a process killed at the wrong moment leaves one empty.
+//
+// The guard below runs BEFORE the session is built, like the fastresume guard
+// above: every entry whose saved metadata is unusable is moved out of
+// `session.json` into `session/unrestored.json`, so librqbit never sees it,
+// and the engine restores those entries itself afterwards, in the background
+// and bounded (see [`Engine::restore_set_aside`]). Nothing on disk is deleted:
+// the data files and the fastresume bitfield stay, so a restored torrent
+// resumes instead of downloading again.
+
+/// Filename of the record of torrents set aside at startup, under `session/`.
+const UNRESTORED_FILE: &str = "unrestored.json";
+
+/// What it takes to add a set-aside torrent again: librqbit's own persisted
+/// fields for it, minus the output folder (every add of ours uses the default
+/// one, which is derived from the metadata).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Unrestored {
+    info_hash: String,
+    #[serde(default)]
+    trackers: Vec<String>,
+    #[serde(default)]
+    only_files: Option<Vec<usize>>,
+    #[serde(default)]
+    is_paused: bool,
+}
+
+fn is_persisted_info_hash(ih: &str) -> bool {
+    ih.len() == 40 && ih.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// The saved `.torrent` of `info_hash` if it is usable: present, not empty and
+/// parseable. `Err` carries why it is not.
+fn saved_torrent_bytes(session_dir: &Path, info_hash: &str) -> anyhow::Result<Vec<u8>> {
+    let path = session_dir.join(format!("{info_hash}.torrent"));
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path:?}"))?;
+    if bytes.is_empty() {
+        anyhow::bail!("{path:?} is empty");
+    }
+    torrent_from_bytes::<ByteBuf>(&bytes).with_context(|| format!("parsing {path:?}"))?;
+    Ok(bytes)
+}
+
+fn read_unrestored(session_dir: &Path) -> Vec<Unrestored> {
+    let path = session_dir.join(UNRESTORED_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::error!("unrestored: {path:?} is unparseable ({e}); the torrents it named are not retried");
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::error!("unrestored: cannot read {path:?}: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Write `bytes` to `path` through a temp file and a rename, so a kill in the
+/// middle never leaves a half-written file under the real name.
+fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension("guard.tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {tmp:?}"))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {tmp:?} to {path:?}"))
+}
+
+fn write_unrestored(session_dir: &Path, list: &[Unrestored]) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(list).expect("the unrestored list serializes");
+    write_atomically(&session_dir.join(UNRESTORED_FILE), &body)
+}
+
+/// Startup guard: move every `session.json` entry whose saved metadata is
+/// unusable into [`UNRESTORED_FILE`] so the librqbit session built right after
+/// cannot wait on it. Returns everything recorded there, old and new.
+///
+/// The record is written BEFORE `session.json` is rewritten: a kill in between
+/// leaves the entry in both, which the next start resolves the same way, never
+/// in neither. If either write fails the guard leaves `session.json` alone and
+/// says so (the session may then wait on that entry, which is the old
+/// behaviour, loudly).
+fn set_aside_unrestorable(session_dir: &Path) -> Vec<Unrestored> {
+    let mut recorded = read_unrestored(session_dir);
+    let db_path = session_dir.join("session.json");
+    let raw = match std::fs::read(&db_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return recorded,
+        Err(e) => {
+            tracing::warn!("restore-guard: cannot read {db_path:?}: {e}; skipping guard");
+            return recorded;
+        }
+    };
+    let mut db: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("restore-guard: {db_path:?} unparseable ({e}); leaving it to librqbit");
+            return recorded;
+        }
+    };
+    let Some(torrents) = db.get_mut("torrents").and_then(|t| t.as_object_mut()) else {
+        return recorded;
+    };
+
+    let mut set_aside: Vec<(String, Unrestored)> = Vec::new();
+    for (id, entry) in torrents.iter() {
+        let Ok(parsed) = serde_json::from_value::<Unrestored>(entry.clone()) else {
+            tracing::warn!("restore-guard: skipping unreadable entry {id} in {db_path:?}");
+            continue;
+        };
+        if !is_persisted_info_hash(&parsed.info_hash) {
+            tracing::warn!("restore-guard: skipping malformed info_hash {:?} in {db_path:?}", parsed.info_hash);
+            continue;
+        }
+        if let Err(e) = saved_torrent_bytes(session_dir, &parsed.info_hash) {
+            tracing::error!(
+                "restore-guard: {} has no usable saved metadata ({e:#}); setting it aside so it \
+                 cannot hold up the engine, and restoring it in the background. Its files and \
+                 progress on disk are kept.",
+                parsed.info_hash
+            );
+            set_aside.push((id.clone(), parsed));
+        }
+    }
+    if set_aside.is_empty() {
+        return recorded;
+    }
+
+    let mut next = recorded.clone();
+    for (_, entry) in &set_aside {
+        if !next.iter().any(|known| known.info_hash == entry.info_hash) {
+            next.push(entry.clone());
+        }
+    }
+    if let Err(e) = write_unrestored(session_dir, &next) {
+        tracing::error!("restore-guard: recording the torrents set aside failed ({e:#}); leaving {db_path:?} as it is");
+        return recorded;
+    }
+    recorded = next;
+    for (id, _) in &set_aside {
+        torrents.remove(id);
+    }
+    let body = serde_json::to_vec(&db).expect("session.json re-serializes");
+    if let Err(e) = write_atomically(&db_path, &body) {
+        tracing::error!("restore-guard: rewriting {db_path:?} failed ({e:#}); the session may wait on the entries set aside");
+    }
+    recorded
+}
+
 impl Engine {
     /// Bootstrap the session rooted at `cache_dir`. librqbit lays out per-torrent
     /// subfolders beneath it.
@@ -760,9 +923,83 @@ impl Engine {
         // librqbit trusts the persisted bitfields at restore time, and a
         // "have all" bitfield over missing files silently becomes zero-filled
         // preallocations served as a 100%-complete stream.
-        invalidate_stale_fastresume(&cache_dir.join("session"));
+        let session_dir = cache_dir.join("session");
+        invalidate_stale_fastresume(&session_dir);
+        // Entries librqbit could only restore as a bare magnet must be out of
+        // its sight BEFORE the session is built: it awaits every restore, and
+        // a magnet nobody serves never finishes.
+        let set_aside = set_aside_unrestorable(&session_dir);
         let session = Session::new_with_opts(cache_dir, opts).await?;
-        Ok(Self::from_session(session, cache_root))
+        let engine = Self::from_session(session, cache_root);
+        if !set_aside.is_empty() {
+            let restorer = engine.clone();
+            let stop = engine.session.cancellation_token().clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = stop.cancelled() => {}
+                    _ = restorer.restore_set_aside(session_dir, set_aside) => {}
+                }
+            });
+        }
+        Ok(engine)
+    }
+
+    /// Restore the torrents the startup guard set aside (see
+    /// [`set_aside_unrestorable`]), one at a time, off the startup path.
+    ///
+    /// Each goes back in through the engine's own add: from its saved
+    /// `.torrent` if that is usable again, otherwise from a magnet carrying
+    /// its trackers, whose metadata resolution is bounded by
+    /// [`Engine::resolve_timeout`]. The selection and the paused state it was
+    /// persisted with are kept, and its files and fastresume bitfield were
+    /// never touched, so it resumes where it was. A torrent that comes back
+    /// leaves the record; one that does not stays in it for the next start,
+    /// and says so.
+    async fn restore_set_aside(&self, session_dir: PathBuf, set_aside: Vec<Unrestored>) {
+        let mut remaining = set_aside.clone();
+        for entry in set_aside {
+            let ih = entry.info_hash.as_str();
+            let all_files = |files: &[types::File]| Ok((0..files.len()).collect::<Vec<usize>>());
+            let pick = || match &entry.only_files {
+                Some(only) => Pick::Files(only.clone()),
+                // A legacy "every file" selection, kept as it was persisted.
+                None => Pick::Decide(&all_files),
+            };
+            let added = match saved_torrent_bytes(&session_dir, ih) {
+                Ok(bytes) => self.add_blob(bytes, pick()).await,
+                Err(_) => {
+                    let mut magnet = format!("magnet:?xt=urn:btih:{ih}");
+                    for tracker in &entry.trackers {
+                        magnet.push_str("&tr=");
+                        magnet.extend(form_urlencoded::byte_serialize(tracker.as_bytes()));
+                    }
+                    self.add_magnet(&magnet, pick()).await
+                }
+            };
+            let restored = match added {
+                Ok(handle) if entry.is_paused => {
+                    // librqbit refuses to pause a torrent that is still checking.
+                    let _ =
+                        tokio::time::timeout(METADATA_TIMEOUT, handle.wait_until_initialized()).await;
+                    self.pause(&handle).await
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            match restored {
+                Ok(()) => {
+                    tracing::warn!("restore-guard: {ih} is restored");
+                    remaining.retain(|known| known.info_hash != entry.info_hash);
+                    if let Err(e) = write_unrestored(&session_dir, &remaining) {
+                        tracing::error!("restore-guard: updating the record after restoring {ih} failed: {e:#}");
+                    }
+                }
+                Err(e) => tracing::error!(
+                    "restore-guard: {ih} could not be restored ({e:#}); it stays out of the cache \
+                     list, its files stay on disk, and the next start tries again"
+                ),
+            }
+        }
     }
 
     /// The engine around an already-built session, reading the persisted
