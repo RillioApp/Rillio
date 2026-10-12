@@ -124,10 +124,10 @@ impl NativePlayer {
         &self,
         app: &AppHandle,
         rects: Vec<BlurRect>,
-        viewport: BlurViewport,
+        scale: f64,
     ) -> Result<(), String> {
         match self {
-            NativePlayer::Mpv(ctrl) => blur_rect_mpv(ctrl, app, rects, viewport),
+            NativePlayer::Mpv(ctrl) => blur_rect_mpv(ctrl, app, rects, scale),
         }
     }
 }
@@ -147,6 +147,9 @@ pub struct Controller {
     snapshot: Mutex<SnapshotCache>,
     /// GPU panel-blur shader state (see [`player_blur_rect`]).
     blur: Mutex<BlurState>,
+    /// Held across one whole compute-and-write of the blur options, so that
+    /// concurrent applies cannot land out of order (see [`apply_blur`]).
+    blur_apply: Mutex<()>,
 }
 
 /// The most recent [`player_snapshot`] result and when it was produced.
@@ -208,6 +211,19 @@ const BLUR_SHADER: &str = include_str!("shaders/panel-blur.glsl");
 /// shader, which holds four sets of `r<i>{x,y,w,h}` parameters.
 const MAX_BLUR_RECTS: usize = 4;
 
+/// The shader's declared range for a rect's normalized position (`r<i>x`,
+/// `r<i>y`): plus or minus this many video-sizes. Must equal the `//!MINIMUM` /
+/// `//!MAXIMUM` of those params (a test holds the two together).
+const BLUR_POSITION_LIMIT: f64 = 32.0;
+/// The declared maximum of a rect's normalized size (`r<i>w`, `r<i>h`): the
+/// whole span between the two position limits, which is the widest a rect cut
+/// to those limits can be. Nothing clamps to it (the cut in [`shader_rect`]
+/// cannot exceed it); it exists for the test that holds the shader to it.
+#[cfg(test)]
+const BLUR_SIZE_LIMIT: f64 = 2.0 * BLUR_POSITION_LIMIT;
+/// The declared maximum of the shader's lengths in OUTPUT px (`radius`, `r<i>c`).
+const BLUR_LENGTH_LIMIT: f64 = 512.0;
+
 /// Gaussian radius for the panel blur, in CSS px (scaled to output pixels along
 /// with everything else). Matches the `blur-[24px]` the web fallback uses, so
 /// flipping the flag changes where the blur comes from, not how strong it looks.
@@ -244,18 +260,22 @@ pub struct BlurRect {
     corner: f64,
 }
 
-/// The WebView viewport, in CSS px (`innerWidth`/`innerHeight`).
-#[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
-pub struct BlurViewport {
-    width: f64,
-    height: f64,
-}
-
 /// The blur state the web layer last asked for.
 #[derive(Clone, PartialEq, Debug)]
 struct BlurRequest {
     rects: Vec<BlurRect>,
-    viewport: BlurViewport,
+    /// Physical px per CSS px in the WebView: the page's `devicePixelRatio`.
+    scale: f64,
+}
+
+/// The video rectangle inside the mpv window, in the window's physical px. This
+/// is the rectangle the shader's OUTPUT texture covers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct VideoRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 #[derive(Default)]
@@ -373,6 +393,7 @@ impl ShellState {
             }
         }
         spawn_event_loop(ctrl.clone(), app.clone());
+        spawn_blur_probe(ctrl.clone());
         // With force-window, mpv's (black) output window exists from startup; push
         // it behind the WebView as soon as it appears so it never covers the UI.
         if wid.is_some() {
@@ -601,6 +622,7 @@ impl Controller {
             props: Mutex::new(serde_json::Map::new()),
             snapshot: Mutex::new(SnapshotCache::default()),
             blur: Mutex::new(BlurState::default()),
+            blur_apply: Mutex::new(()),
         })
     }
 
@@ -645,8 +667,18 @@ impl Controller {
     fn run_command(&self, refs: &[&str]) -> Result<(), String> {
         // Drop cached stats when playback stops so the panel doesn't show a
         // previous title's codec/bitrate.
+        // GEOMETRY_PROPS stay: they describe the mpv WINDOW, which outlives the
+        // file (force-window), and mpv only reports a property when it CHANGES.
+        // Dropping `osd-dimensions` here meant the next title, opened in the
+        // same window at the same aspect, never got it back: every blur request
+        // then failed with "mpv has not reported osd-dimensions", and after
+        // three of those the web gives the blur up for the session (measured
+        // 2026-10-12: cache empty, no blur, until the window was next resized).
         if refs.first() == Some(&"stop") {
-            self.props.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.props
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|name, _| GEOMETRY_PROPS.contains(&name.as_str()));
         }
         // Normalize `loadfile`. The web client appends a positional
         // `replace`/index/`start=+N` (resume time) form whose exact shape depends
@@ -700,6 +732,19 @@ fn spawn_event_loop(ctrl: Arc<Controller>, app: AppHandle) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(name.clone(), value.clone());
+                    // The blur's option string is a function of TWO inputs: the
+                    // panel rects the web sent and this geometry. The web only
+                    // re-sends when ITS input changes, so a geometry change that
+                    // lands after the web's last word (mpv finishes a resize a
+                    // frame or two after the WebView does; a new file with
+                    // another aspect opens under an open panel) would otherwise
+                    // leave the blur computed against the old video rect until
+                    // the panel next moves. Recompute on this input too.
+                    if GEOMETRY_PROPS.contains(&name.as_str()) {
+                        if let Err(e) = reapply_blur_for_new_geometry(&ctrl) {
+                            tracing::warn!("shell: panel blur not re-applied to new geometry: {e}");
+                        }
+                    }
                     // High-signal, low-noise props at debug (skip the per-frame ones).
                     if !matches!(name.as_str(), "time-pos" | "demuxer-cache-time") {
                         tracing::debug!("mpv prop {name} = {value}");
@@ -934,7 +979,8 @@ fn downscale(image: image::DynamicImage, max_width: u32) -> image::DynamicImage 
 /// which lands tens to hundreds of ms late and reads as lag. A user shader inside
 /// mpv's own pipeline is the only way to get a live, free blur.
 ///
-/// `rects` are the open panels in CSS px relative to the WebView `viewport`; an
+/// `rects` are the open panels in CSS px relative to the WebView's viewport and
+/// `scale` is the page's `devicePixelRatio` (physical px per CSS px); an
 /// EMPTY list means "nothing is open, stop blurring". Each rect carries its own
 /// corner radius, so the blur ends on exactly the rounded edge the panel is
 /// drawn with rather than showing blurred video outside a rounded corner.
@@ -965,7 +1011,7 @@ pub fn player_blur_rect(
     app: AppHandle,
     state: State<ShellState>,
     rects: Vec<BlurRect>,
-    viewport: BlurViewport,
+    scale: f64,
 ) -> Result<(), String> {
     if rects.len() > MAX_BLUR_RECTS {
         return Err(format!(
@@ -973,7 +1019,7 @@ pub fn player_blur_rect(
             rects.len()
         ));
     }
-    state.ensure(&app)?.blur_rect(&app, rects, viewport)
+    state.ensure(&app)?.blur_rect(&app, rects, scale)
 }
 
 /// The mpv implementation of the panel blur (called from `NativePlayer::blur_rect`
@@ -983,7 +1029,7 @@ fn blur_rect_mpv(
     ctrl: &Arc<Controller>,
     app: &AppHandle,
     rects: Vec<BlurRect>,
-    viewport: BlurViewport,
+    scale: f64,
 ) -> Result<(), String> {
     // "Stop blurring" before anything was ever blurred: nothing to do, and in
     // particular nothing worth loading a shader for.
@@ -994,7 +1040,7 @@ fn blur_rect_mpv(
 
     let wait = {
         let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
-        blur.desired = Some(BlurRequest { rects, viewport });
+        blur.desired = Some(BlurRequest { rects, scale });
         match blur.last_applied.map(|t| t.elapsed()) {
             Some(elapsed) if elapsed < BLUR_MIN_INTERVAL => {
                 if blur.trailing {
@@ -1009,14 +1055,14 @@ fn blur_rect_mpv(
         }
     };
     match wait {
-        None => apply_blur(ctrl),
+        None => apply_blur(ctrl, BlurWrite::IfChanged),
         Some(delay) => {
             let ctrl = ctrl.clone();
             std::thread::Builder::new()
                 .name("mpv-blur-trailing".into())
                 .spawn(move || {
                     std::thread::sleep(delay);
-                    if let Err(e) = apply_blur(&ctrl) {
+                    if let Err(e) = apply_blur(&ctrl, BlurWrite::IfChanged) {
                         tracing::warn!("shell: panel blur trailing apply failed: {e}");
                     }
                 })
@@ -1039,6 +1085,10 @@ fn blur_shader_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Write the shader out and hand it to mpv, once per mpv instance.
 fn ensure_blur_shader(app: &AppHandle, ctrl: &Arc<Controller>) -> Result<(), String> {
+    // Inside the same serialization as the applies: two first requests racing
+    // here must not both load the shader, and no apply may write options to a
+    // pipeline that is halfway through being handed its shader.
+    let _applying = ctrl.blur_apply.lock().unwrap_or_else(|e| e.into_inner());
     if ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).loaded {
         return Ok(());
     }
@@ -1070,11 +1120,9 @@ fn ensure_blur_shader(app: &AppHandle, ctrl: &Arc<Controller>) -> Result<(), Str
     if let Err(e) = ctrl.mpv.set_property("blend-subtitles", "yes") {
         tracing::warn!("shell: blend-subtitles unavailable, subs stay above the panel blur: {e}");
     }
-    {
-        let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
-        blur.loaded = true;
-        blur.last_opts = None; // nothing has been applied to this fresh pipeline
-    }
+    // `last_opts` is still `None` here (nothing can have been applied before the
+    // shader existed), so the first apply after this always writes.
+    ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).loaded = true;
     tracing::info!("shell: panel blur shader loaded from {text}");
     // See BLUR_PARAM_SETTLE: re-apply once the VO thread has actually parsed the
     // file and registered the parameters, or this first open silently has no blur.
@@ -1083,8 +1131,7 @@ fn ensure_blur_shader(app: &AppHandle, ctrl: &Arc<Controller>) -> Result<(), Str
         .name("mpv-blur-settle".into())
         .spawn(move || {
             std::thread::sleep(BLUR_PARAM_SETTLE);
-            ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).last_opts = None;
-            if let Err(e) = apply_blur(&ctrl) {
+            if let Err(e) = apply_blur(&ctrl, BlurWrite::Always) {
                 tracing::warn!("shell: panel blur settle re-apply failed: {e}");
             }
         })
@@ -1092,8 +1139,36 @@ fn ensure_blur_shader(app: &AppHandle, ctrl: &Arc<Controller>) -> Result<(), Str
     Ok(())
 }
 
+/// Whether an apply may skip a write that would repeat the last recorded one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BlurWrite {
+    /// The normal case: mpv already has this string, so do not send it again.
+    IfChanged,
+    /// The post-load re-apply: the recorded string may be one mpv DROPPED (it
+    /// was written before the shader's params were registered, see
+    /// [`BLUR_PARAM_SETTLE`]), so it goes out again regardless. This is decided
+    /// INSIDE the apply's serialization: it used to be done by clearing
+    /// `last_opts` beforehand, outside it, where an apply already in flight
+    /// could store its string after the clear and have the forced write skipped
+    /// as a repeat.
+    Always,
+}
+
+impl BlurWrite {
+    fn is_due(self, last: Option<&str>, opts: &str) -> bool {
+        self == BlurWrite::Always || last != Some(opts)
+    }
+}
+
 /// Push the currently desired blur state to mpv.
-fn apply_blur(ctrl: &Controller) -> Result<(), String> {
+fn apply_blur(ctrl: &Controller, write: BlurWrite) -> Result<(), String> {
+    // ONE APPLY AT A TIME. Three threads call this (the web's IPC call, the
+    // throttle's trailing apply, and the event loop when the geometry changes),
+    // and each reads the inputs, renders a string and writes it. Unserialized,
+    // a caller that read the old geometry could write AFTER one that read the
+    // new, leaving mpv on the stale string while `last_opts` records the fresh
+    // one, so nothing would ever correct it.
+    let _applying = ctrl.blur_apply.lock().unwrap_or_else(|e| e.into_inner());
     let desired = {
         let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
         blur.trailing = false;
@@ -1101,43 +1176,168 @@ fn apply_blur(ctrl: &Controller) -> Result<(), String> {
         blur.desired.clone()
     };
     let Some(req) = desired else { return Ok(()) };
-    let opts = blur_shader_opts(ctrl, &req)?;
-    {
-        let mut blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
-        if blur.last_opts.as_deref() == Some(opts.as_str()) {
-            return Ok(());
-        }
-        blur.last_opts = Some(opts.clone());
+    let mut opts = blur_shader_opts(ctrl, &req)?;
+    if blur_debug_paint() {
+        opts.push_str(",debug=1");
     }
-    ctrl.mpv.set_property("glsl-shader-opts", &opts)
+    if !write.is_due(ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).last_opts.as_deref(), &opts) {
+        return Ok(());
+    }
+    ctrl.mpv.set_property("glsl-shader-opts", &opts)?;
+    // Recorded only once mpv has accepted it: a rejected write must be retried
+    // by the next apply, not remembered as done.
+    ctrl.blur.lock().unwrap_or_else(|e| e.into_inner()).last_opts = Some(opts);
+    Ok(())
 }
 
-/// The video rectangle inside the mpv window, from mpv's `osd-dimensions`:
-/// `(x, y, w, h, window_w, window_h)`, all in the window's physical pixels.
-///
-/// `osd-dimensions` reports the video rect's size (`w`/`h`) plus its margins to
-/// each window edge (`ml`/`mr`/`mt`/`mb`), so the window size falls out of the
-/// same object and no second source of truth (nor any assumed DPR) is needed.
-fn video_rect(ctrl: &Controller) -> Result<(f64, f64, f64, f64, f64, f64), String> {
+/// Re-derive the blur from the rects already asked for, after mpv reported a new
+/// video geometry. Nothing to do unless panels are actually being blurred: with
+/// none open the option string does not depend on the geometry at all (and
+/// between files mpv reports a 0x0 window, which is not an error worth a log).
+fn reapply_blur_for_new_geometry(ctrl: &Controller) -> Result<(), String> {
+    let blurring = {
+        let blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
+        blur.loaded && blur.desired.as_ref().is_some_and(|req| !req.rects.is_empty())
+    };
+    if !blurring {
+        return Ok(());
+    }
+    apply_blur(ctrl, BlurWrite::IfChanged)
+}
+
+/// A debug variable's value, with "set to nothing" read as unset: a launcher
+/// script that clears a variable by assigning it empty must not switch a
+/// measurement aid on.
+fn non_empty_env(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// MEASUREMENT AID, off unless `RILLIO_BLUR_DEBUG_PAINT` is set (to anything
+/// but the empty string): the shader paints the masked region flat magenta
+/// instead of blurred video, so a capture of the window shows exactly which
+/// pixels the mask covers (that is how the blur's alignment with a panel is
+/// measured rather than eyeballed). Read once per process: the environment
+/// does not change under a running shell, and this is asked on every apply.
+fn blur_debug_paint() -> bool {
+    static PAINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PAINT.get_or_init(|| non_empty_env(std::env::var_os("RILLIO_BLUR_DEBUG_PAINT")).is_some())
+}
+
+/// How often the blur probe samples. Shorter than one 60 Hz frame so that a lag
+/// of a single frame between two quantities is still visible in the log.
+const BLUR_PROBE_INTERVAL: Duration = Duration::from_millis(5);
+
+/// MEASUREMENT AID, off unless `RILLIO_BLUR_PROBE` names a file: append one
+/// JSON line to that file every time the blur's inputs or output change -
+/// the `osd-dimensions` the shell has CACHED (what [`video_rect`] reads), the
+/// same property read FRESH from mpv, the request the web last sent and the
+/// option string last written. With a wall-clock stamp (Unix ms, comparable to
+/// `Date.now()` in the page), that shows which of them is stale and for how
+/// long, which no screenshot can.
+fn spawn_blur_probe(ctrl: Arc<Controller>) {
+    let Some(path) = non_empty_env(std::env::var_os("RILLIO_BLUR_PROBE")) else { return };
+    let spawned = std::thread::Builder::new().name("mpv-blur-probe".into()).spawn(move || {
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::error!("shell: blur probe cannot open {}: {e}", PathBuf::from(&path).display());
+                return;
+            }
+        };
+        let mut last = String::new();
+        loop {
+            std::thread::sleep(BLUR_PROBE_INTERVAL);
+            let cached = ctrl
+                .props
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("osd-dimensions")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let fresh: serde_json::Map<String, Value> = ["w", "h", "ml", "mt", "mr", "mb"]
+                .iter()
+                .map(|key| {
+                    let value = ctrl
+                        .mpv
+                        .get_property_string(&format!("osd-dimensions/{key}"))
+                        .and_then(|text| text.parse::<f64>().ok());
+                    (key.to_string(), serde_json::json!(value))
+                })
+                .collect();
+            let (desired, opts) = {
+                let blur = ctrl.blur.lock().unwrap_or_else(|e| e.into_inner());
+                (blur.desired.as_ref().map(|req| format!("{req:?}")), blur.last_opts.clone())
+            };
+            let state = serde_json::json!({
+                "cached": cached, "fresh": fresh, "desired": desired, "opts": opts,
+            })
+            .to_string();
+            if state == last {
+                continue;
+            }
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            if let Err(e) = writeln!(file, "{{\"t\":{stamp},\"s\":{state}}}") {
+                tracing::error!("shell: blur probe write failed: {e}");
+                return;
+            }
+            last = state;
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::error!("shell: blur probe thread did not start: {e}");
+    }
+}
+
+/// The video rectangle inside the mpv window, from mpv's `osd-dimensions`.
+fn video_rect(ctrl: &Controller) -> Result<VideoRect, String> {
     let props = ctrl.props.lock().unwrap_or_else(|e| e.into_inner());
     let dims = props
         .get("osd-dimensions")
         .filter(|v| v.is_object())
         .ok_or("player_blur_rect: mpv has not reported osd-dimensions (nothing playing?)")?;
+    video_rect_from_osd_dimensions(dims)
+}
+
+/// The pure half of [`video_rect`]: read mpv's `osd-dimensions` object.
+///
+/// WHAT THE FIELDS MEAN (mpv manual, "osd-dimensions"): `w`/`h` are the "size
+/// of the VO WINDOW", and `ml`/`mr`/`mt`/`mb` are the "OSD to video margins",
+/// which "describe the area into which the video is rendered". So the window
+/// size is `w` x `h` as given, and the video rect is what is left of it INSIDE
+/// the margins. This function shipped reading `w`/`h` as the video rect's size
+/// and adding the margins on top to get the window: right only while the video
+/// fills the window (all margins 0), and otherwise it overstated both sizes by
+/// the bars, which scaled and shifted every panel's blur by an amount that
+/// depended on how far the window's shape was from the video's. Measured on a
+/// 16:9 clip (2026-10-12): exact in a 1600x900 window, 20 px out to the left in
+/// 1600x700, 105 px in a maximized 3440x1380 one.
+///
+/// THE VISIBLE PART ONLY. In the player's Crop mode the video is scaled past
+/// the window and the margins go NEGATIVE (a 16:9 clip cropped into 1600x700
+/// reports `mt = mb = -100`). The shader's OUTPUT texture is then the part of
+/// the video that is on screen, not the whole scaled picture (measured: with
+/// the full 1600x900 rect a panel's blur landed 23 px high and 49 px short),
+/// so a margin never reaches outside the window here.
+fn video_rect_from_osd_dimensions(dims: &Value) -> Result<VideoRect, String> {
     let get = |key: &str| -> Result<f64, String> {
         dims.get(key)
             .and_then(Value::as_f64)
             .ok_or_else(|| format!("player_blur_rect: osd-dimensions.{key} missing"))
     };
-    let (w, h) = (get("w")?, get("h")?);
-    let (ml, mr, mt, mb) = (get("ml")?, get("mr")?, get("mt")?, get("mb")?);
-    let (win_w, win_h) = (ml + w + mr, mt + h + mb);
-    if !(w > 0.0 && h > 0.0 && win_w > 0.0 && win_h > 0.0) {
+    let (win_w, win_h) = (get("w")?, get("h")?);
+    let bar = |key: &str| -> Result<f64, String> { Ok(get(key)?.max(0.0)) };
+    let (ml, mr, mt, mb) = (bar("ml")?, bar("mr")?, bar("mt")?, bar("mb")?);
+    let (video_w, video_h) = (win_w - ml - mr, win_h - mt - mb);
+    if !(video_w > 0.0 && video_h > 0.0 && win_w > 0.0 && win_h > 0.0) {
         return Err(format!(
-            "player_blur_rect: degenerate osd-dimensions ({w}x{h} video in a {win_w}x{win_h} window)"
+            "player_blur_rect: degenerate osd-dimensions ({video_w}x{video_h} video in a {win_w}x{win_h} window)"
         ));
     }
-    Ok((ml, mt, w, h, win_w, win_h))
+    Ok(VideoRect { x: ml, y: mt, width: video_w, height: video_h })
 }
 
 /// Render `req` as an mpv `glsl-shader-opts` string, mapping the web's panel
@@ -1148,67 +1348,120 @@ fn video_rect(ctrl: &Controller) -> Result<(f64, f64, f64, f64, f64, f64), Strin
 /// RECTANGLE - which is NOT the window: letterbox/pillarbox bars are not part of
 /// the OUTPUT texture at all. Three steps bridge that:
 ///
-///   1. CSS px -> the window's physical px, by `win_size / viewport_size`. This
-///      works because mpv's child window and the WebView are both sized to the
-///      SAME main-window client area (shell.rs only ever re-orders that child,
-///      never moves or resizes it), so the two describe one rectangle at two
-///      scales. Deriving the scale by measurement rather than trusting
-///      `devicePixelRatio` keeps them in step through a display-scaling change.
+///   1. CSS px -> the window's physical px, by the page's `devicePixelRatio`
+///      (`req.scale`). mpv's child window and the WebView both start at the
+///      main window's client origin (measured: identical rects at every size),
+///      so no offset is involved. This step shipped as `window size / viewport
+///      size` instead, "measuring" the ratio. That is NOT the ratio: the page's
+///      `innerWidth` is a whole number of CSS px and the WebView lays out a
+///      surface rounded up to even device px, so a 1601 px window reports 1282
+///      (1602.5 px worth) and the quotient is 1.2488 where the page really
+///      draws at 1.25 exactly (measured with a painted box at four window
+///      sizes, 2026-10-12): up to 3 px of error at the far edge of a 1600 px
+///      window, more on a wider one, at every size that is not a multiple of
+///      the scale's denominator.
 ///   2. window px -> output px, by subtracting the video rect's origin. Lengths
 ///      need no conversion at this step: the output rect is a sub-rect of the same
 ///      window, in the same physical pixels.
 ///   3. output px -> normalized, by dividing by the video rect's size.
 ///
-/// Nothing is clamped to the video rect: a panel overhanging into the black bars
-/// simply maps outside [0,1], and the shader's SDF intersects it with the texture
-/// for free. Values ARE clamped to each parameter's declared range, because mpv
-/// rejects the whole option string over a single out-of-range value.
+/// A panel overhanging into the black bars is NOT cut at the video's edge: it
+/// maps outside [0,1] and the shader's SDF intersects it with the texture for
+/// free, which keeps its rounded corners where the panel's are. A panel that
+/// does not touch the video at all is dropped (see [`shader_rect`]).
 fn blur_shader_opts(ctrl: &Controller, req: &BlurRequest) -> Result<String, String> {
-    blur_opts_string(video_rect(ctrl)?, req)
+    blur_opts_string(video_rect(ctrl), req)
+}
+
+/// One panel in the shader's terms: `x`/`y`/`w`/`h` normalized over the OUTPUT
+/// texture (the visible video rect), `corner` in OUTPUT px.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ShaderRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    corner: f64,
+}
+
+/// Map one panel into the shader's coordinates, or `None` when it does not
+/// overlap the visible video and so has nothing to blur.
+///
+/// EVERY VALUE MUST STAY INSIDE ITS `//!PARAM` RANGE (mpv rejects the whole
+/// option string over one that is not), and a panel over a sliver of video in a
+/// big window can be far outside it. Such a panel is cut to the representable
+/// box by moving its EDGES. Clamping the origin and the size separately, as this
+/// used to, moves the rectangle: an origin dragged in to the limit with the size
+/// kept put a panel that ended above the video on top of it. The box reaches
+/// [`BLUR_POSITION_LIMIT`] video-sizes away from the video on every side, so an
+/// edge cut there is never on screen, and a panel that overlaps the video still
+/// covers exactly the same part of it afterwards.
+fn shader_rect(video: VideoRect, panel: &BlurRect, scale: f64) -> Option<ShaderRect> {
+    let left = (panel.x * scale - video.x) / video.width;
+    let top = (panel.y * scale - video.y) / video.height;
+    let right = left + panel.width * scale / video.width;
+    let bottom = top + panel.height * scale / video.height;
+    // The video is [0,1] on both axes here. (A NaN fails every comparison and
+    // is dropped with the panels that miss.)
+    let overlaps = right > left && bottom > top && right > 0.0 && left < 1.0 && bottom > 0.0 && top < 1.0;
+    if !overlaps {
+        return None;
+    }
+    let (left, right) = (left.max(-BLUR_POSITION_LIMIT), right.min(BLUR_POSITION_LIMIT));
+    let (top, bottom) = (top.max(-BLUR_POSITION_LIMIT), bottom.min(BLUR_POSITION_LIMIT));
+    Some(ShaderRect {
+        x: left,
+        y: top,
+        w: right - left,
+        h: bottom - top,
+        corner: (panel.corner * scale).clamp(0.0, BLUR_LENGTH_LIMIT),
+    })
 }
 
 /// The pure half of [`blur_shader_opts`]: the geometry, with mpv's video rect
-/// (`(x, y, w, h, window_w, window_h)` in physical px) already read.
-fn blur_opts_string(
-    video: (f64, f64, f64, f64, f64, f64),
-    req: &BlurRequest,
-) -> Result<String, String> {
-    let (video_x, video_y, video_w, video_h, win_w, win_h) = video;
-    if !(req.viewport.width > 0.0 && req.viewport.height > 0.0) {
-        return Err(format!("player_blur_rect: bad viewport {:?}", req.viewport));
+/// already read (or the reason it could not be).
+///
+/// "STOP BLURRING" NEEDS NO GEOMETRY. An empty request renders the disabled
+/// string without looking at `video` or the scale: between files mpv reports an
+/// empty window, and a close that lands then must still switch the shader off.
+/// The web never repeats an empty request it has already sent, and the
+/// geometry re-apply skips an empty one, so a failure here would leave the
+/// video blurred under no panel.
+fn blur_opts_string(video: Result<VideoRect, String>, req: &BlurRequest) -> Result<String, String> {
+    if req.rects.is_empty() {
+        return Ok(render_blur_opts(&[], 0.0));
     }
-    let scale_x = win_w / req.viewport.width;
-    let scale_y = win_h / req.viewport.height;
-    // A length only needs the CSS->physical scale (step 2 above is a translation).
-    // x and y scale identically under any real display scaling; average them
-    // rather than silently picking one and being wrong if they ever diverge.
-    let length_scale = (scale_x + scale_y) * 0.5;
+    let video = video?;
+    let scale = req.scale;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!("player_blur_rect: bad scale {scale}"));
+    }
+    let rects: Vec<ShaderRect> =
+        req.rects.iter().filter_map(|panel| shader_rect(video, panel, scale)).collect();
+    Ok(render_blur_opts(&rects, (BLUR_RADIUS_CSS_PX * scale).clamp(0.0, BLUR_LENGTH_LIMIT)))
+}
 
-    let mut opts: Vec<String> = Vec::with_capacity(4 + MAX_BLUR_RECTS * 4);
-    opts.push(format!("enabled={}", u8::from(!req.rects.is_empty())));
-    opts.push(format!("count={}", req.rects.len()));
-    opts.push(format!("radius={:.4}", (BLUR_RADIUS_CSS_PX * length_scale).clamp(0.0, 512.0)));
+/// Write the option string for `rects` (at most [`MAX_BLUR_RECTS`], already in
+/// range). No rects is the disabled state: both shader stages are skipped, and
+/// the radius is written as 0 so that there is exactly one disabled string.
+fn render_blur_opts(rects: &[ShaderRect], radius: f64) -> String {
+    let radius = if rects.is_empty() { 0.0 } else { radius };
+    let mut opts: Vec<String> = Vec::with_capacity(3 + MAX_BLUR_RECTS * 5);
+    opts.push(format!("enabled={}", u8::from(!rects.is_empty())));
+    opts.push(format!("count={}", rects.len()));
+    opts.push(format!("radius={radius:.4}"));
     for i in 0..MAX_BLUR_RECTS {
         // Unused slots are zeroed rather than left stale: `count` already gates
         // them, but the whole string is written every time, so it should describe
         // the whole state.
-        let (x, y, w, h, c) = match req.rects.get(i) {
-            Some(r) => (
-                (r.x * scale_x - video_x) / video_w,
-                (r.y * scale_y - video_y) / video_h,
-                r.width * scale_x / video_w,
-                r.height * scale_y / video_h,
-                r.corner * length_scale,
-            ),
-            None => (0.0, 0.0, 0.0, 0.0, 0.0),
-        };
-        opts.push(format!("r{i}x={:.6}", x.clamp(-32.0, 32.0)));
-        opts.push(format!("r{i}y={:.6}", y.clamp(-32.0, 32.0)));
-        opts.push(format!("r{i}w={:.6}", w.clamp(0.0, 64.0)));
-        opts.push(format!("r{i}h={:.6}", h.clamp(0.0, 64.0)));
-        opts.push(format!("r{i}c={:.4}", c.clamp(0.0, 512.0)));
+        let r = rects.get(i).copied().unwrap_or(ShaderRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, corner: 0.0 });
+        opts.push(format!("r{i}x={:.6}", r.x));
+        opts.push(format!("r{i}y={:.6}", r.y));
+        opts.push(format!("r{i}w={:.6}", r.w));
+        opts.push(format!("r{i}h={:.6}", r.h));
+        opts.push(format!("r{i}c={:.4}", r.corner));
     }
-    Ok(opts.join(","))
+    opts.join(",")
 }
 
 /// Carry one outbound IPC message to mpv. `args` is the web client's argument
@@ -1649,8 +1902,12 @@ mod tests {
             .unwrap()
     }
 
-    fn request(rects: Vec<BlurRect>) -> BlurRequest {
-        BlurRequest { rects, viewport: BlurViewport { width: 1600.0, height: 900.0 } }
+    fn request(rects: Vec<BlurRect>, scale: f64) -> BlurRequest {
+        BlurRequest { rects, scale }
+    }
+
+    fn video(x: f64, y: f64, width: f64, height: f64) -> VideoRect {
+        VideoRect { x, y, width, height }
     }
 
     /// A 1600x900 CSS viewport on a 2x display, video filling the window: CSS px
@@ -1658,16 +1915,12 @@ mod tests {
     #[test]
     fn blur_maps_a_full_window_video() {
         // No letterbox: the video rect IS the 3200x1800 physical window.
-        let video = (0.0, 0.0, 3200.0, 1800.0, 3200.0, 1800.0);
-        let opts = blur_opts_string(
-            video,
-            &request(vec![BlurRect {
-                x: 800.0,
-                y: 450.0,
-                width: 400.0,
-                height: 225.0,
-                corner: 12.0,
-            }]),
+        let opts = opts_for(
+            video(0.0, 0.0, 3200.0, 1800.0),
+            &request(
+                vec![BlurRect { x: 800.0, y: 450.0, width: 400.0, height: 225.0, corner: 12.0 }],
+                2.0,
+            ),
         )
         .unwrap();
         assert_eq!(opt(&opts, "enabled"), 1.0);
@@ -1677,7 +1930,7 @@ mod tests {
         assert!((opt(&opts, "r0y") - 0.5).abs() < 1e-6);
         assert!((opt(&opts, "r0w") - 0.25).abs() < 1e-6);
         assert!((opt(&opts, "r0h") - 0.25).abs() < 1e-6);
-        // Lengths are CSS px scaled by the measured DPR, not passed through raw.
+        // Lengths are CSS px scaled by the DPR, not passed through raw.
         assert!((opt(&opts, "radius") - BLUR_RADIUS_CSS_PX * 2.0).abs() < 1e-3);
         assert!((opt(&opts, "r0c") - 24.0).abs() < 1e-3);
         // Unused slots are zeroed, not stale.
@@ -1689,77 +1942,292 @@ mod tests {
     #[test]
     fn blur_accounts_for_letterbox_bars() {
         // 1600x900 CSS at 1x; a 2.39:1 film leaves 180px bars top and bottom.
-        let video = (0.0, 180.0, 1600.0, 540.0, 1600.0, 900.0);
-        let req = BlurRequest {
-            rects: vec![BlurRect { x: 0.0, y: 180.0, width: 1600.0, height: 540.0, corner: 0.0 }],
-            viewport: BlurViewport { width: 1600.0, height: 900.0 },
-        };
-        let opts = blur_opts_string(video, &req).unwrap();
+        let film = video(0.0, 180.0, 1600.0, 540.0);
+        let covering = BlurRect { x: 0.0, y: 180.0, width: 1600.0, height: 540.0, corner: 0.0 };
+        let opts = opts_for(film, &request(vec![covering], 1.0)).unwrap();
         // A panel covering exactly the video rect maps to the whole output.
         assert!((opt(&opts, "r0x") - 0.0).abs() < 1e-6);
         assert!((opt(&opts, "r0y") - 0.0).abs() < 1e-6);
         assert!((opt(&opts, "r0w") - 1.0).abs() < 1e-6);
         assert!((opt(&opts, "r0h") - 1.0).abs() < 1e-6);
 
-        // A panel up in the top bar maps ABOVE the output (negative), which the
-        // shader's SDF intersects away. Deliberately not clamped.
-        let opts = blur_opts_string(
-            video,
-            &BlurRequest {
-                rects: vec![BlurRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0, corner: 0.0 }],
-                ..req
-            },
-        )
-        .unwrap();
-        assert!(opt(&opts, "r0y") < 0.0, "a panel over the top bar must map above the video");
+        // A panel reaching up into the top bar starts ABOVE the output (negative),
+        // which the shader's SDF intersects away. Deliberately not cut there.
+        let into_the_bar = BlurRect { x: 0.0, y: 90.0, width: 100.0, height: 180.0, corner: 0.0 };
+        let opts = opts_for(film, &request(vec![into_the_bar], 1.0)).unwrap();
+        assert!((opt(&opts, "r0y") + 90.0 / 540.0).abs() < 1e-6, "the top edge must stay above the video");
+    }
+
+    /// mpv's `osd-dimensions` gives the WINDOW size in `w`/`h` and the bars as
+    /// margins inside it (mpv manual, and measured against the mpv child
+    /// window's client rect). Reading `w`/`h` as the video's size is the bug
+    /// that shipped. The objects below are ones mpv really reported.
+    #[test]
+    fn video_rect_reads_osd_dimensions_as_window_size_and_margins() {
+        // 16:9 in a fullscreen 3440x1440 window: 440px pillarbox bars.
+        let dims = serde_json::json!({
+            "w": 3440, "h": 1440, "par": 1.0, "aspect": 3440.0 / 1440.0,
+            "ml": 440, "mr": 440, "mt": 0, "mb": 0,
+        });
+        assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(440.0, 0.0, 2560.0, 1440.0));
+        // 2.39:1 in a 1600x900 window: bars top and bottom, 115px each.
+        let dims = serde_json::json!({ "w": 1600, "h": 900, "ml": 0, "mr": 0, "mt": 115, "mb": 115 });
+        assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(0.0, 115.0, 1600.0, 670.0));
+        // Uneven bars at an odd size (16:9 maximized on a 3440x1380 work area).
+        let dims = serde_json::json!({ "w": 3440, "h": 1380, "ml": 493, "mr": 494, "mt": 0, "mb": 0 });
+        assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(493.0, 0.0, 2453.0, 1380.0));
+        // No bars: the video rect is the window.
+        let dims = serde_json::json!({ "w": 1601, "h": 901, "ml": 0, "mr": 0, "mt": 0, "mb": 0 });
+        assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(0.0, 0.0, 1601.0, 901.0));
+        // Crop mode: the video is scaled past the window, the margins are
+        // negative, and what the shader sees is the window-sized visible part.
+        let dims = serde_json::json!({ "w": 1600, "h": 700, "ml": 0, "mr": 0, "mt": -100, "mb": -100 });
+        assert_eq!(video_rect_from_osd_dimensions(&dims).unwrap(), video(0.0, 0.0, 1600.0, 700.0));
+        // Between files mpv reports an empty window: an error, not a division by zero.
+        let dims = serde_json::json!({ "w": 0, "h": 0, "ml": 0, "mr": 0, "mt": 0, "mb": 0 });
+        assert!(video_rect_from_osd_dimensions(&dims).is_err());
+    }
+
+    /// Where a panel's edges come back out of the shader's coordinates, in the
+    /// window's physical px: the shader places a rect relative to the OUTPUT
+    /// texture, which mpv draws at the video rect.
+    fn landed(video: VideoRect, opts: &str) -> (f64, f64, f64, f64) {
+        let left = video.x + opt(opts, "r0x") * video.width;
+        let top = video.y + opt(opts, "r0y") * video.height;
+        (left, top, left + opt(opts, "r0w") * video.width, top + opt(opts, "r0h") * video.height)
+    }
+
+    /// End to end on the owner's display (3440x1440 at 125%) with a pillarboxed
+    /// 16:9 film: a panel's edges must come back out on the same physical pixels
+    /// they went in on. The pre-fix code put this panel 83 px to the left.
+    #[test]
+    fn blur_lands_on_the_panel_through_real_osd_dimensions() {
+        let dims = serde_json::json!({ "w": 3440, "h": 1440, "ml": 440, "mr": 440, "mt": 0, "mb": 0 });
+        let film = video_rect_from_osd_dimensions(&dims).unwrap();
+        let panel = BlurRect { x: 2048.0, y: 400.0, width: 640.0, height: 400.0, corner: 12.0 };
+        let dpr = 1.25;
+        let opts = opts_for(film, &request(vec![panel], dpr)).unwrap();
+        let (left, top, right, bottom) = landed(film, &opts);
+        // The option string carries 6 decimals of a normalized coord, so 1e-2 px
+        // is the precision floor on a window this size, far inside one pixel.
+        assert!((left - panel.x * dpr).abs() < 1e-2, "left edge at {left}");
+        assert!((top - panel.y * dpr).abs() < 1e-2, "top edge at {top}");
+        assert!((right - (panel.x + panel.width) * dpr).abs() < 1e-2, "right edge at {right}");
+        assert!((bottom - (panel.y + panel.height) * dpr).abs() < 1e-2, "bottom edge at {bottom}");
+        assert!((opt(&opts, "radius") - BLUR_RADIUS_CSS_PX * dpr).abs() < 1e-3);
+    }
+
+    /// A window whose size is not a whole number of CSS px (1601x901 at 125%):
+    /// the page still draws at exactly its devicePixelRatio (measured), so the
+    /// panel the page reports at these CSS coords is at these physical pixels.
+    /// Dividing the window by the page's `innerWidth` (1282 here) instead, as
+    /// this code used to, lands the right edge 1.9 px short.
+    #[test]
+    fn blur_scale_is_the_device_pixel_ratio_at_an_odd_window_size() {
+        let film = video(0.0, 0.0, 1601.0, 901.0);
+        // The speed menu as measured in that window.
+        let panel = BlurRect { x: 973.6, y: 524.0, width: 252.0, height: 92.6, corner: 10.5 };
+        let opts = opts_for(film, &request(vec![panel], 1.25)).unwrap();
+        let (left, top, right, bottom) = landed(film, &opts);
+        assert!((left - 1217.0).abs() < 1e-2, "left edge at {left}");
+        assert!((top - 655.0).abs() < 1e-2, "top edge at {top}");
+        assert!((right - 1532.0).abs() < 1e-2, "right edge at {right}");
+        assert!((bottom - 770.75).abs() < 1e-2, "bottom edge at {bottom}");
     }
 
     /// An empty rect list is "stop blurring", and must switch the shader's stages
     /// off rather than blur a zero-sized panel.
     #[test]
     fn blur_disables_on_an_empty_rect_list() {
-        let video = (0.0, 0.0, 1600.0, 900.0, 1600.0, 900.0);
-        let opts = blur_opts_string(video, &request(vec![])).unwrap();
+        let opts = opts_for(video(0.0, 0.0, 1600.0, 900.0), &request(vec![], 1.0)).unwrap();
         assert_eq!(opt(&opts, "enabled"), 0.0);
         assert_eq!(opt(&opts, "count"), 0.0);
     }
 
-    /// Every value must stay inside the range its //!PARAM block declares, or mpv
-    /// rejects the whole option string and the blur silently stops updating.
+    /// A zero, negative or non-finite scale is nonsense in, not a blur at the
+    /// window's origin out.
     #[test]
-    fn blur_opts_stay_inside_the_declared_param_ranges() {
-        // A pathological sliver of video in a huge window drives the normalized
-        // coords far out; they must be clamped, not emitted raw.
-        let video = (0.0, 0.0, 1.0, 1.0, 4000.0, 4000.0);
-        let opts = blur_opts_string(
-            video,
-            &request(vec![BlurRect {
-                x: 1500.0,
-                y: 800.0,
-                width: 100.0,
-                height: 100.0,
-                corner: 9999.0,
-            }]),
-        )
-        .unwrap();
-        assert!(opt(&opts, "r0x") <= 32.0 && opt(&opts, "r0x") >= -32.0);
-        assert!(opt(&opts, "r0y") <= 32.0 && opt(&opts, "r0y") >= -32.0);
-        assert!(opt(&opts, "r0w") <= 64.0 && opt(&opts, "r0w") >= 0.0);
-        assert!(opt(&opts, "r0h") <= 64.0 && opt(&opts, "r0h") >= 0.0);
-        assert!(opt(&opts, "r0c") <= 512.0 && opt(&opts, "r0c") >= 0.0);
-        assert!(opt(&opts, "radius") <= 512.0);
+    fn blur_rejects_a_degenerate_scale() {
+        let panel = BlurRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0, corner: 0.0 };
+        for scale in [0.0, -1.25, f64::NAN, f64::INFINITY] {
+            assert!(
+                opts_for(video(0.0, 0.0, 1600.0, 900.0), &request(vec![panel], scale)).is_err(),
+                "scale {scale} was accepted"
+            );
+        }
     }
 
-    /// A zero-sized viewport (a hidden/collapsed WebView) is nonsense in, not a
-    /// division by zero out.
+    /// [`blur_opts_string`] with the geometry known.
+    fn opts_for(video: VideoRect, req: &BlurRequest) -> Result<String, String> {
+        blur_opts_string(Ok(video), req)
+    }
+
+    /// "Stop blurring" must not depend on the video geometry: between files mpv
+    /// reports an empty window, and a close that lands then has to switch the
+    /// shader off all the same, or the blur stays on under no panel (the web
+    /// never repeats an empty request it has already sent).
     #[test]
-    fn blur_rejects_a_degenerate_viewport() {
-        let video = (0.0, 0.0, 1600.0, 900.0, 1600.0, 900.0);
-        let req = BlurRequest {
-            rects: vec![BlurRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0, corner: 0.0 }],
-            viewport: BlurViewport { width: 0.0, height: 900.0 },
+    fn blur_disables_without_any_video_geometry() {
+        let opts = blur_opts_string(Err("no geometry".into()), &request(vec![], 1.25)).unwrap();
+        assert_eq!(opt(&opts, "enabled"), 0.0);
+        assert_eq!(opt(&opts, "count"), 0.0);
+        // The same string whatever came with the empty list.
+        assert_eq!(opts, blur_opts_string(Ok(video(0.0, 0.0, 1600.0, 900.0)), &request(vec![], f64::NAN)).unwrap());
+        // A blur that IS wanted still needs the geometry, and says so.
+        let panel = BlurRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0, corner: 0.0 };
+        assert!(blur_opts_string(Err("no geometry".into()), &request(vec![panel], 1.25)).is_err());
+    }
+
+    /// The edges of rect 0 in OUTPUT px, as the shader will place them.
+    fn output_px(video: VideoRect, opts: &str) -> (f64, f64, f64, f64) {
+        let (left, top, right, bottom) = landed(video, opts);
+        (left - video.x, top - video.y, right - video.x, bottom - video.y)
+    }
+
+    /// A panel that does not touch the visible video blurs nothing. It used to be
+    /// normalized and then clamped field by field, which could drag a far-away
+    /// panel's origin back toward the video while keeping its size, so that it
+    /// covered video it never overlapped.
+    #[test]
+    fn blur_culls_panels_outside_the_video() {
+        // The reviewer's case: a one-pixel-high strip of video at y=499, and a
+        // panel that ends 49 px above it.
+        let strip = video(0.0, 499.0, 1000.0, 1.0);
+        let above = BlurRect { x: 0.0, y: 400.0, width: 1000.0, height: 50.0, corner: 0.0 };
+        let opts = opts_for(strip, &request(vec![above], 1.0)).unwrap();
+        assert_eq!(opt(&opts, "enabled"), 0.0, "a panel wholly above the video was blurred: {opts}");
+        assert_eq!(opt(&opts, "count"), 0.0);
+
+        // Wholly outside each side of a pillarboxed, letterboxed video.
+        let film = video(400.0, 100.0, 800.0, 600.0);
+        for (side, panel) in [
+            ("left", BlurRect { x: 0.0, y: 300.0, width: 400.0, height: 100.0, corner: 8.0 }),
+            ("right", BlurRect { x: 1200.0, y: 300.0, width: 300.0, height: 100.0, corner: 8.0 }),
+            ("above", BlurRect { x: 600.0, y: 0.0, width: 100.0, height: 100.0, corner: 8.0 }),
+            ("below", BlurRect { x: 600.0, y: 700.0, width: 100.0, height: 90.0, corner: 8.0 }),
+        ] {
+            let opts = opts_for(film, &request(vec![panel], 1.0)).unwrap();
+            assert_eq!(opt(&opts, "enabled"), 0.0, "a panel {side} of the video was blurred: {opts}");
+        }
+
+        // One panel on the video and one in the bar: only the first is sent, in
+        // slot 0, and the count says one.
+        let on = BlurRect { x: 500.0, y: 200.0, width: 100.0, height: 100.0, corner: 0.0 };
+        let off = BlurRect { x: 0.0, y: 300.0, width: 400.0, height: 100.0, corner: 8.0 };
+        let opts = opts_for(film, &request(vec![off, on], 1.0)).unwrap();
+        assert_eq!(opt(&opts, "enabled"), 1.0);
+        assert_eq!(opt(&opts, "count"), 1.0);
+        let got = output_px(film, &opts);
+        for (got, expect) in [(got.0, 100.0), (got.1, 100.0), (got.2, 200.0), (got.3, 200.0)] {
+            assert!((got - expect).abs() < 1e-2, "{got} for {expect} in {opts}");
+        }
+        assert_eq!(opt(&opts, "r1w"), 0.0);
+    }
+
+    /// A panel straddling an edge of the video keeps its true edges: the part
+    /// over the bar maps outside [0,1] and the shader's SDF cuts it there, so its
+    /// corners stay where the panel's are instead of being rounded at the cut.
+    #[test]
+    fn blur_keeps_the_true_edges_of_a_panel_straddling_the_video() {
+        let film = video(400.0, 100.0, 800.0, 600.0);
+        for (edge, panel, expect) in [
+            ("left", BlurRect { x: 300.0, y: 300.0, width: 200.0, height: 100.0, corner: 8.0 }, (-100.0, 200.0, 100.0, 300.0)),
+            ("right", BlurRect { x: 1100.0, y: 300.0, width: 200.0, height: 100.0, corner: 8.0 }, (700.0, 200.0, 900.0, 300.0)),
+            ("top", BlurRect { x: 600.0, y: 50.0, width: 100.0, height: 100.0, corner: 8.0 }, (200.0, -50.0, 300.0, 50.0)),
+            ("bottom", BlurRect { x: 600.0, y: 650.0, width: 100.0, height: 100.0, corner: 8.0 }, (200.0, 550.0, 300.0, 650.0)),
+        ] {
+            let opts = opts_for(film, &request(vec![panel], 1.0)).unwrap();
+            assert_eq!(opt(&opts, "enabled"), 1.0, "{edge}");
+            let got = output_px(film, &opts);
+            for (got, expect) in [(got.0, expect.0), (got.1, expect.1), (got.2, expect.2), (got.3, expect.3)] {
+                assert!((got - expect).abs() < 1e-2, "{edge} edge: {got} for {expect} in {opts}");
+            }
+        }
+        // Larger than the video on every side: covers all of it, edges intact.
+        let all = BlurRect { x: 0.0, y: 0.0, width: 1600.0, height: 800.0, corner: 0.0 };
+        let opts = opts_for(film, &request(vec![all], 1.0)).unwrap();
+        let got = output_px(film, &opts);
+        assert!((got.0 + 400.0).abs() < 1e-2 && (got.1 + 100.0).abs() < 1e-2, "{opts}");
+        assert!((got.2 - 1200.0).abs() < 1e-2 && (got.3 - 700.0).abs() < 1e-2, "{opts}");
+    }
+
+    /// The declared range of one shader parameter: `(minimum, maximum)`.
+    fn declared_range(param: &str) -> (f64, f64) {
+        let block = BLUR_SHADER
+            .split("//!PARAM ")
+            .find(|block| block.lines().next().map(str::trim) == Some(param))
+            .unwrap_or_else(|| panic!("{param} is not a shader param"));
+        let bound = |directive: &str| -> f64 {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix(directive))
+                .unwrap_or_else(|| panic!("{param} has no {directive}"))
+                .trim()
+                .parse()
+                .unwrap()
         };
-        assert!(blur_opts_string(video, &req).is_err());
+        (bound("//!MINIMUM"), bound("//!MAXIMUM"))
+    }
+
+    /// The limits the shell clamps to ARE the ranges the shader declares; mpv
+    /// rejects the whole option string over one value outside its range.
+    #[test]
+    fn blur_limits_match_the_shader_param_ranges() {
+        assert_eq!(declared_range("radius"), (0.0, BLUR_LENGTH_LIMIT));
+        for i in 0..MAX_BLUR_RECTS {
+            assert_eq!(declared_range(&format!("r{i}x")), (-BLUR_POSITION_LIMIT, BLUR_POSITION_LIMIT));
+            assert_eq!(declared_range(&format!("r{i}y")), (-BLUR_POSITION_LIMIT, BLUR_POSITION_LIMIT));
+            assert_eq!(declared_range(&format!("r{i}w")), (0.0, BLUR_SIZE_LIMIT));
+            assert_eq!(declared_range(&format!("r{i}h")), (0.0, BLUR_SIZE_LIMIT));
+            assert_eq!(declared_range(&format!("r{i}c")), (0.0, BLUR_LENGTH_LIMIT));
+        }
+        assert_eq!(declared_range("enabled"), (0.0, 1.0));
+        assert_eq!(declared_range("count"), (0.0, MAX_BLUR_RECTS as f64));
+        assert_eq!(declared_range("debug"), (0.0, 1.0));
+    }
+
+    /// A panel over a sliver of video in a huge window is far bigger than the
+    /// video in normalized terms. It is cut to the representable box by moving
+    /// its EDGES (so it still covers the whole video and nothing else changes on
+    /// screen), and every value stays inside its declared range.
+    #[test]
+    fn blur_cuts_a_huge_panel_by_its_edges_and_stays_in_range() {
+        let sliver = video(2000.0, 2000.0, 1.0, 1.0);
+        let huge = BlurRect { x: 0.0, y: 0.0, width: 4000.0, height: 4000.0, corner: 9999.0 };
+        let opts = opts_for(sliver, &request(vec![huge], 1.0)).unwrap();
+        assert_eq!(opt(&opts, "enabled"), 1.0);
+        let (x, y, w, h) = (opt(&opts, "r0x"), opt(&opts, "r0y"), opt(&opts, "r0w"), opt(&opts, "r0h"));
+        assert!((-BLUR_POSITION_LIMIT..=BLUR_POSITION_LIMIT).contains(&x), "{opts}");
+        assert!((-BLUR_POSITION_LIMIT..=BLUR_POSITION_LIMIT).contains(&y), "{opts}");
+        assert!((0.0..=BLUR_SIZE_LIMIT).contains(&w) && (0.0..=BLUR_SIZE_LIMIT).contains(&h), "{opts}");
+        assert!((0.0..=BLUR_LENGTH_LIMIT).contains(&opt(&opts, "r0c")), "{opts}");
+        assert!((0.0..=BLUR_LENGTH_LIMIT).contains(&opt(&opts, "radius")), "{opts}");
+        // Still covers the whole video: [0,1] on both axes is inside it.
+        assert!(x <= 0.0 && x + w >= 1.0 && y <= 0.0 && y + h >= 1.0, "{opts}");
+
+        // Far outside AND huge: culled, not dragged onto the video.
+        let far = BlurRect { x: 0.0, y: 0.0, width: 1500.0, height: 4000.0, corner: 0.0 };
+        let opts = opts_for(sliver, &request(vec![far], 1.0)).unwrap();
+        assert_eq!(opt(&opts, "enabled"), 0.0, "{opts}");
+    }
+
+    /// The post-load re-apply must go out even when the string is the one last
+    /// recorded: that record may be of a write mpv dropped (see BLUR_PARAM_SETTLE).
+    #[test]
+    fn a_forced_blur_write_ignores_the_last_recorded_string() {
+        assert!(!BlurWrite::IfChanged.is_due(Some("a"), "a"));
+        assert!(BlurWrite::IfChanged.is_due(Some("a"), "b"));
+        assert!(BlurWrite::IfChanged.is_due(None, "a"));
+        assert!(BlurWrite::Always.is_due(Some("a"), "a"));
+    }
+
+    /// The measurement switches are off when unset AND when set to nothing (a
+    /// cleared variable in a launcher script must not turn them on).
+    #[test]
+    fn an_empty_debug_variable_is_off() {
+        assert_eq!(non_empty_env(None), None);
+        assert_eq!(non_empty_env(Some(std::ffi::OsString::new())), None);
+        assert_eq!(non_empty_env(Some("1".into())), Some("1".into()));
     }
 
     /// The shader and the shell must agree on how many rects exist, and on the
