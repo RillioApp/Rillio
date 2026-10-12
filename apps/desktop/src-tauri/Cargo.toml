@@ -105,6 +105,14 @@ futures-util = "0.3"
 [profile.dev.package.whisper-rs-sys]
 opt-level = 3
 
+# librqbit 8.1.1 with one deadlock fix, vendored beside the streaming server
+# (crates/streaming-server/vendor/README-RILLIO.md). A `[patch]` only applies
+# from the workspace being built, so the shell needs its own copy of the
+# section the streaming server's manifest has; without it this build gets the
+# unpatched crate and the deadlock back.
+[patch.crates-io]
+librqbit = { path = "../../../crates/streaming-server/vendor/librqbit" }
+
 [target.'cfg(windows)'.dependencies]
 # Win32 HWND for mpv `wid` embedding + child-window z-order (S3/S4). Already in
 # Tauri's tree.
