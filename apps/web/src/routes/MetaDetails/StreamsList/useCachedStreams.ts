@@ -39,6 +39,8 @@ export type CachedStream = {
 type CacheListEntry = {
     infoHash: string,
     meta?: CacheMeta,
+    // The server's health verdict (see routes/Cached/useCachedTorrents).
+    issue?: { kind: string, reason: string } | null,
 };
 
 export type AddonStreamLike = {
@@ -121,7 +123,11 @@ const useCachedStreams = ({ metaId, videoId, season, episode, addonStreams, page
                 return resp.json() as Promise<T>;
             });
         return fetchJson<CacheListEntry[]>('cache/list')
-            .then(async (entries) => {
+            .then(async (listed) => {
+                // An entry the server reports an issue on (waiting to be
+                // restored, stopped on an error, files missing) is not offered
+                // as playable here; the Cache window is where it is dealt with.
+                const entries = listed.filter((entry) => entry.issue === undefined || entry.issue === null);
                 // Stopped while the list was loading: do not fan out a file
                 // listing per torrent for a page that is gone.
                 if (!isCurrent()) return;

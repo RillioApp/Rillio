@@ -34,6 +34,28 @@ const metaDetailsLink = (entry: CacheEntry): string | null =>
         :
         null;
 
+// "Find another source": the title's own streams page (the episode's, for a
+// series), where every addon's sources for it are listed. Only for an entry
+// that has been identified; an unidentified one has no title to look up.
+const streamsPageLink = (entry: CacheEntry): string | null => {
+    const meta = entry.meta;
+    if (meta === undefined) return null;
+    const video = typeof meta.videoId === 'string' && meta.videoId.length > 0 ?
+        `/${encodeURIComponent(meta.videoId)}`
+        :
+        '';
+    return `#/metadetails/${encodeURIComponent(meta.type)}/${encodeURIComponent(meta.metaId)}${video}`;
+};
+
+// The tag a row with an issue carries, by the server's issue kind. A kind this
+// build does not know still gets a tag: the reason beside it says the rest.
+const ISSUE_LABELS: Record<string, string> = {
+    'metadata-missing': 'Waiting to restore',
+    'engine-error': 'Stopped on an error',
+    'data-missing': 'Files missing',
+};
+const issueLabel = (kind: string): string => ISSUE_LABELS[kind] ?? 'Needs attention';
+
 // Same parser the stream cards use: quality/HDR/languages are encoded in the
 // entry name (the selected file's name for single-file selections, e.g. an
 // episode filename, otherwise the torrent name - both carry the same tokens).
@@ -470,10 +492,13 @@ const HeroDownload = ({ entry, links, metaLink, streamingMode, onPlay, onPlayFil
     );
 };
 
-const Row = ({ entry, metaLink, streamingMode, onPlay, onPlayFile, onMoreInfo, onSetPaused, onSetPinned, onSetFileSelected, onDelete }: {
+const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, onMoreInfo, onSetPaused, onSetPinned, onSetFileSelected, onDelete, onRefetch }: {
     entry: CacheEntry,
     metaLink: string | null,
     streamingMode: boolean | null,
+    // A "Fetch again" for this row is under way.
+    refetching: boolean,
+    onRefetch: (infoHash: string) => void,
     onPlay: (entry: CacheEntry) => void,
     onPlayFile: (infoHash: string, fileIdx: number, name: string) => void,
     onMoreInfo: (link: string) => void,
@@ -496,166 +521,231 @@ const Row = ({ entry, metaLink, streamingMode, onPlay, onPlayFile, onMoreInfo, o
     // NOT while initializing - librqbit hard-refuses that ("torrent is
     // initializing, can't pause"), so offering the button only produced a pause
     // that reported success and did nothing. Delete still works there.
-    const pausable = !complete && (entry.state === 'live' || paused);
+    // The server's verdict (see CacheEntry.issue). A row with an issue is still
+    // a normal row: it carries a tag and its reason, offers "Fetch again" and
+    // "Find another source", and is never offered as playable.
+    const issue = entry.issue;
+    // In the cache but not in the engine: there is no file list to open yet.
+    const waiting = entry.state === 'waiting';
+    const similarLink = streamsPageLink(entry);
+    const pausable = issue === undefined && !complete && (entry.state === 'live' || paused);
     return (
         <div>
-        <div className="group flex items-center gap-4 px-6 py-4 transition hover:bg-white/5">
-            {/* The advanced affordance: a torrent is a directory, and this opens it.
+            <div className="group flex items-center gap-4 px-6 py-4 transition hover:bg-white/5">
+                {/* The advanced affordance: a torrent is a directory, and this opens it.
                 Quiet by default (a chevron, not a button) so the row still reads as
                 one title, which is what it is for almost everyone. */}
-            <IconButton
-                onClick={() => setFilesOpen((open) => !open)}
-                title={filesOpen ? 'Hide the files in this torrent' : 'Show all files in this torrent'}
-                className="-ml-2 size-6 shrink-0 text-fg-subtle hover:text-fg"
-            >
-                <ChevronRight className={cn('size-4 transition-transform', filesOpen && 'rotate-90')} />
-            </IconButton>
-            <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 items-center gap-2.5">
-                    <div className="truncate text-sm font-medium text-fg" title={entry.name}>
-                        {displayName(entry)}
+                <IconButton
+                    onClick={() => setFilesOpen((open) => !open)}
+                    title={filesOpen ? 'Hide the files in this torrent' : 'Show all files in this torrent'}
+                    className={cn('-ml-2 size-6 shrink-0 text-fg-subtle hover:text-fg', waiting && 'invisible')}
+                >
+                    <ChevronRight className={cn('size-4 transition-transform', filesOpen && 'rotate-90')} />
+                </IconButton>
+                <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center gap-2.5">
+                        <div className="truncate text-sm font-medium text-fg" title={entry.name}>
+                            {displayName(entry)}
+                        </div>
+                        <QualityBadges name={entry.name} />
+                        {
+                        // The issue tag: a quiet status-coloured word, not a badge.
+                            issue !== undefined ?
+                                <span className="shrink-0 whitespace-nowrap text-[0.6875rem] font-medium text-warning">
+                                    {issueLabel(issue.kind)}
+                                </span>
+                                :
+                                null
+                        }
                     </div>
-                    <QualityBadges name={entry.name} />
-                </div>
-                {/* danger, not warning: this row FAILED, it is not a caution. The rest
+                    {/* danger, not warning: this row FAILED, it is not a caution. The rest
                     of the app already draws that line (warning = the slow-source and
                     oversized-library notices; danger = every error and every
                     destructive control), and this file was the last holdout. */}
-                <div className={cn('mt-1 text-xs tabular-nums', entry.state === 'error' ? 'text-danger' : 'text-fg-muted')}>
                     {
-                        complete ?
-                            formatBytes(entry.downloaded)
+                    // A row with an issue says what is wrong (or that a fetch is
+                    // under way) where the bytes and state would be: byte counts
+                    // for a torrent the engine is not running would be invented.
+                        issue !== undefined ?
+                            <div className="mt-1 truncate text-xs text-fg-muted" title={issue.reason}>
+                                {refetching ? 'Fetching again, this can take a few minutes' : issue.reason}
+                            </div>
                             :
-                            preparing ?
-                                (entry.total > 0 ? formatBytes(entry.total) : null)
-                                :
-                                <>
-                                    {formatBytes(entry.downloaded)}
-                                    {entry.total > 0 ? <span className="text-fg-subtle">{` / ${formatBytes(entry.total)}`}</span> : null}
-                                </>
+                            null
                     }
-                    <span className="text-fg-subtle">{' · '}</span>
-                    {stateLabel(entry)}
-                    {
+                    <div className={cn('mt-1 text-xs tabular-nums', entry.state === 'error' ? 'text-danger' : 'text-fg-muted', issue !== undefined && 'hidden')}>
+                        {
+                            complete ?
+                                formatBytes(entry.downloaded)
+                                :
+                                preparing ?
+                                    (entry.total > 0 ? formatBytes(entry.total) : null)
+                                    :
+                                    <>
+                                        {formatBytes(entry.downloaded)}
+                                        {entry.total > 0 ? <span className="text-fg-subtle">{` / ${formatBytes(entry.total)}`}</span> : null}
+                                    </>
+                        }
+                        <span className="text-fg-subtle">{' · '}</span>
+                        {stateLabel(entry)}
+                        {
                         // Only for a genuine pack. A movie shipping a .nfo beside it
                         // resolves to one playable video, and calling that "2 files"
                         // read as "this is a season pack" when it is not.
-                        entry.fileCount > 1 && typeof entry.fileIdx !== 'number' ?
-                            <><span className="text-fg-subtle">{' · '}</span>{`${entry.fileCount} files`}</>
-                            :
-                            null
-                    }
-                    {
+                            entry.fileCount > 1 && typeof entry.fileIdx !== 'number' ?
+                                <><span className="text-fg-subtle">{' · '}</span>{`${entry.fileCount} files`}</>
+                                :
+                                null
+                        }
+                        {
                         // Honest about the pending cleanup: with streaming mode on, a
                         // watched un-kept stream is on the sweeper's list.
-                        streamingMode === true && entry.watched && !entry.pinned ?
-                            <><span className="text-fg-subtle">{' · '}</span>Watched, cleans up soon</>
-                            :
-                            null
-                    }
-                    {
+                            streamingMode === true && entry.watched && !entry.pinned ?
+                                <><span className="text-fg-subtle">{' · '}</span>Watched, cleans up soon</>
+                                :
+                                null
+                        }
+                        {
                         // The age makes the (default) newest-first order legible.
                         // Finished rows only: an active row's subline already
                         // carries progress and state.
-                        complete && formatAge(entry.addedAt) !== null ?
-                            <span className="text-fg-subtle">{` · ${formatAge(entry.addedAt)}`}</span>
+                            complete && formatAge(entry.addedAt) !== null ?
+                                <span className="text-fg-subtle">{` · ${formatAge(entry.addedAt)}`}</span>
+                                :
+                                null
+                        }
+                    </div>
+                    {
+                        issue === undefined && !complete && !preparing && entry.total > 0 ?
+                            <div className="mt-2.5 h-0.5 w-full overflow-hidden rounded-full bg-surface">
+                                <div className="h-full rounded-full bg-accent transition-[width] duration-700" style={{ width: `${Math.round(progress * 100)}%` }} />
+                            </div>
                             :
                             null
                     }
                 </div>
                 {
-                    !complete && !preparing && entry.total > 0 ?
-                        <div className="mt-2.5 h-0.5 w-full overflow-hidden rounded-full bg-surface">
-                            <div className="h-full rounded-full bg-accent transition-[width] duration-700" style={{ width: `${Math.round(progress * 100)}%` }} />
-                        </div>
+                // The two ways out of an issue, revealed on hover like the other
+                // row actions: try again to get what is missing, or go and pick
+                // another source for the same title.
+                    issue !== undefined ?
+                        <>
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={refetching}
+                                onClick={() => onRefetch(entry.infoHash)}
+                                title="Try now to get what this download is missing. What is already on disk is kept."
+                                className={cn(
+                                    'shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg',
+                                    refetching ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                                )}
+                            >
+                                {refetching ? 'Fetching' : 'Fetch again'}
+                            </Button>
+                            {
+                                similarLink !== null ?
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => onMoreInfo(similarLink)}
+                                        title="Open this title and pick another source for it"
+                                        className="shrink-0 bg-surface px-3.5 text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100"
+                                    >
+                                        Find another source
+                                    </Button>
+                                    :
+                                    null
+                            }
+                        </>
                         :
                         null
                 }
-            </div>
-            {/* Same labeled-pill treatment as Pause. Kept state stays visible
+                {/* Same labeled-pill treatment as Pause. Kept state stays visible
                 (it is standing information, not just an action); the un-kept
                 affordance appears on hover like Info/Delete. Hidden entirely
                 while auto-clean is off: nothing deletes, so Keep is a no-op. */}
-            {
-                streamingMode === true ?
-                    <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => onSetPinned(entry.infoHash, !entry.pinned)}
-                        title={entry.pinned ? 'Kept: never cleaned up automatically. Click to allow cleanup' : 'Keep this title in the cache (never cleaned up automatically)'}
-                        className={cn(
-                            'shrink-0 bg-surface px-3.5',
-                            entry.pinned ?
-                                'border-accent/40 text-accent opacity-100 hover:brightness-110'
-                                :
-                                'text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100',
-                        )}
-                    >
-                        {entry.pinned ? 'Kept' : 'Keep'}
-                    </Button>
-                    :
-                    null
-            }
-            {
+                {
+                    streamingMode === true ?
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => onSetPinned(entry.infoHash, !entry.pinned)}
+                            title={entry.pinned ? 'Kept: never cleaned up automatically. Click to allow cleanup' : 'Keep this title in the cache (never cleaned up automatically)'}
+                            className={cn(
+                                'shrink-0 bg-surface px-3.5',
+                                entry.pinned ?
+                                    'border-accent/40 text-accent opacity-100 hover:brightness-110'
+                                    :
+                                    'text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100',
+                            )}
+                        >
+                            {entry.pinned ? 'Kept' : 'Keep'}
+                        </Button>
+                        :
+                        null
+                }
+                {
                 // A labeled pill (not an icon): a pause/resume TRIANGLE would be
                 // confusable with the media Play button, and inline status text
                 // did not read as clickable. Always visible while transferring.
-                pausable ?
-                    <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => onSetPaused(entry.infoHash, !paused)}
-                        title={paused ? 'Resume this download' : 'Pause this download'}
-                        className="shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg"
-                    >
-                        {paused ? 'Resume' : 'Pause'}
-                    </Button>
-                    :
-                    null
-            }
+                    pausable ?
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => onSetPaused(entry.infoHash, !paused)}
+                            title={paused ? 'Resume this download' : 'Pause this download'}
+                            className="shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg"
+                        >
+                            {paused ? 'Resume' : 'Pause'}
+                        </Button>
+                        :
+                        null
+                }
+                {
+                // Never for a row with an issue: what it would play is in doubt.
+                    issue === undefined && typeof entry.fileIdx === 'number' ?
+                        <IconButton
+                            onClick={() => onPlay(entry)}
+                            title="Play"
+                            className="size-9 text-accent opacity-100 hover:brightness-110"
+                        >
+                            <Play className="size-5" />
+                        </IconButton>
+                        :
+                        null
+                }
+                {
+                    typeof metaLink === 'string' ?
+                        <IconButton
+                            onClick={() => onMoreInfo(metaLink)}
+                            title="More info"
+                            className="size-9 text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100"
+                        >
+                            <Info className="size-5" />
+                        </IconButton>
+                        :
+                        null
+                }
+                <IconButton
+                    onClick={() => onDelete(entry.infoHash)}
+                    title="Delete from cache (frees disk space; can be re-downloaded)"
+                    className="size-9 text-fg-muted opacity-0 hover:text-danger group-hover:opacity-100"
+                >
+                    <Trash2 className="size-5" />
+                </IconButton>
+            </div>
             {
-                typeof entry.fileIdx === 'number' ?
-                    <IconButton
-                        onClick={() => onPlay(entry)}
-                        title="Play"
-                        className="size-9 text-accent opacity-100 hover:brightness-110"
-                    >
-                        <Play className="size-5" />
-                    </IconButton>
+                filesOpen ?
+                    <TorrentFiles
+                        infoHash={entry.infoHash}
+                        initializing={preparing}
+                        onPlayFile={onPlayFile}
+                        onSetFileSelected={onSetFileSelected}
+                    />
                     :
                     null
             }
-            {
-                typeof metaLink === 'string' ?
-                    <IconButton
-                        onClick={() => onMoreInfo(metaLink)}
-                        title="More info"
-                        className="size-9 text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100"
-                    >
-                        <Info className="size-5" />
-                    </IconButton>
-                    :
-                    null
-            }
-            <IconButton
-                onClick={() => onDelete(entry.infoHash)}
-                title="Delete from cache (frees disk space; can be re-downloaded)"
-                className="size-9 text-fg-muted opacity-0 hover:text-danger group-hover:opacity-100"
-            >
-                <Trash2 className="size-5" />
-            </IconButton>
-        </div>
-        {
-            filesOpen ?
-                <TorrentFiles
-                    infoHash={entry.infoHash}
-                    initializing={preparing}
-                    onPlayFile={onPlayFile}
-                    onSetFileSelected={onSetFileSelected}
-                />
-                :
-                null
-        }
         </div>
     );
 };
@@ -672,7 +762,7 @@ const Cached = ({ onClose }: Props) => {
     const closeCached = onClose;
     const navigate = useNavigate();
     const core = useCore();
-    const { entries, failed, error, refresh, setPinned, setPaused, setFileSelected, remove } = useCachedTorrents();
+    const { entries, failed, error, refresh, setPinned, setPaused, setFileSelected, remove, refetch, refetching } = useCachedTorrents();
     const libraryLinks = useLibraryLinksByInfoHash();
     const streamingMode = useStreamingModeSetting();
     // Identify anything the Player never got to write metadata for.
@@ -778,6 +868,8 @@ const Cached = ({ onClose }: Props) => {
     // from the FILTERED list so the toolbar applies to it like any row.
     const heroEntry = useMemo(
         () => visible.find((entry) =>
+            // A download with an issue is a row with a tag, not the hero.
+            entry.issue === undefined &&
             entry.total > 0 && entry.downloaded < entry.total &&
             (entry.state === 'live' || entry.state === 'paused')) ?? null,
         [visible],
@@ -941,43 +1033,45 @@ const Cached = ({ onClose }: Props) => {
                                         Nothing here matches. Loosen the filters or clear the search.
                                     </div>
                                     :
-                                <>
-                                    {
-                                        heroEntry !== null ?
-                                            <HeroDownload
-                                                entry={heroEntry}
-                                                links={libraryLinks[heroEntry.infoHash]}
-                                                metaLink={metaDetailsLink(heroEntry) ?? libraryLinks[heroEntry.infoHash]?.metaLink ?? null}
-                                                streamingMode={streamingMode.enabled}
-                                                onPlay={play}
-                                                onPlayFile={playFile}
-                                                onMoreInfo={openMetaDetails}
-                                                onSetPaused={setPaused}
-                                                onSetPinned={setPinned}
-                                                onSetFileSelected={setFileSelected}
-                                                onDelete={remove}
-                                            />
-                                            :
-                                            null
-                                    }
-                                    <div className="divide-y divide-surface">
-                                        {visible.filter((entry) => entry.infoHash !== heroEntry?.infoHash).map((entry) => (
-                                            <Row
-                                                key={entry.infoHash}
-                                                entry={entry}
-                                                metaLink={metaDetailsLink(entry) ?? libraryLinks[entry.infoHash]?.metaLink ?? null}
-                                                streamingMode={streamingMode.enabled}
-                                                onPlay={play}
-                                                onPlayFile={playFile}
-                                                onMoreInfo={openMetaDetails}
-                                                onSetPaused={setPaused}
-                                                onSetPinned={setPinned}
-                                                onSetFileSelected={setFileSelected}
-                                                onDelete={remove}
-                                            />
-                                        ))}
-                                    </div>
-                                </>
+                                    <>
+                                        {
+                                            heroEntry !== null ?
+                                                <HeroDownload
+                                                    entry={heroEntry}
+                                                    links={libraryLinks[heroEntry.infoHash]}
+                                                    metaLink={metaDetailsLink(heroEntry) ?? libraryLinks[heroEntry.infoHash]?.metaLink ?? null}
+                                                    streamingMode={streamingMode.enabled}
+                                                    onPlay={play}
+                                                    onPlayFile={playFile}
+                                                    onMoreInfo={openMetaDetails}
+                                                    onSetPaused={setPaused}
+                                                    onSetPinned={setPinned}
+                                                    onSetFileSelected={setFileSelected}
+                                                    onDelete={remove}
+                                                />
+                                                :
+                                                null
+                                        }
+                                        <div className="divide-y divide-surface">
+                                            {visible.filter((entry) => entry.infoHash !== heroEntry?.infoHash).map((entry) => (
+                                                <Row
+                                                    key={entry.infoHash}
+                                                    entry={entry}
+                                                    metaLink={metaDetailsLink(entry) ?? libraryLinks[entry.infoHash]?.metaLink ?? null}
+                                                    streamingMode={streamingMode.enabled}
+                                                    refetching={refetching.includes(entry.infoHash)}
+                                                    onRefetch={refetch}
+                                                    onPlay={play}
+                                                    onPlayFile={playFile}
+                                                    onMoreInfo={openMetaDetails}
+                                                    onSetPaused={setPaused}
+                                                    onSetPinned={setPinned}
+                                                    onSetFileSelected={setFileSelected}
+                                                    onDelete={remove}
+                                                />
+                                            ))}
+                                        </div>
+                                    </>
                 }
             </div>
         </ModalRoute>

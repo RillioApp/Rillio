@@ -200,6 +200,61 @@ async fn seeded_cache(tag: &str) -> Cache {
     Cache { dir, pack, movie }
 }
 
+/// Not a test: writes a small cache in the field entry's poisoned state to
+/// `RILLIO_SEED_DIR`, for looking at the Cache window in a dev shell
+/// (`RILLIO_STREAMING_CACHE_DIR=<that dir>`). The pack is identified as a
+/// series episode so its row has a title, artwork and a streams page.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "seeds a dev cache; set RILLIO_SEED_DIR"]
+async fn seed_a_dev_cache_in_the_field_entrys_state() {
+    let target = PathBuf::from(std::env::var("RILLIO_SEED_DIR").expect("set RILLIO_SEED_DIR"));
+    let cache = seeded_cache("dev-seed").await;
+    let engine = cache.start().await;
+    engine.set_meta(
+        &cache.pack,
+        Some(serde_json::json!({
+            "metaId": "tt13210838",
+            "type": "series",
+            "name": "The Gentlemen",
+            "poster": "https://images.metahub.space/poster/medium/tt13210838/img",
+            "background": "https://images.metahub.space/background/medium/tt13210838/img",
+            "logo": "https://images.metahub.space/logo/medium/tt13210838/img",
+            "year": "2024",
+            "videoId": "tt13210838:1:1",
+            "season": 1,
+            "episode": 1,
+            "fileIdx": 0
+        })),
+    );
+    stop(engine).await;
+    cache.poison_without_copy(&cache.pack);
+
+    // The session stores absolute folders: rebase them onto the target.
+    let _ = std::fs::remove_dir_all(&target);
+    copy_tree(&cache.dir, &target);
+    let db_path = target.join("session").join("session.json");
+    let (from, to) = (cache.dir.to_string_lossy().into_owned(), target.to_string_lossy().into_owned());
+    let mut db: Value = serde_json::from_slice(&std::fs::read(&db_path).unwrap()).unwrap();
+    for e in db["torrents"].as_object_mut().unwrap().values_mut() {
+        let folder = e["output_folder"].as_str().unwrap().replacen(&from, &to, 1);
+        e["output_folder"] = Value::String(folder);
+    }
+    std::fs::write(&db_path, serde_json::to_vec(&db).unwrap()).unwrap();
+    println!("seeded {target:?}: pack {} (poisoned), movie {}", cache.pack, cache.movie);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let dest = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Startup is never held up, and nothing is lost
 // ---------------------------------------------------------------------------

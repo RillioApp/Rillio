@@ -10,8 +10,15 @@ export type CacheEntry = {
     name: string,
     downloaded: number,
     total: number,
+    // 'initializing' | 'live' | 'paused' | 'error', or 'waiting' for a torrent
+    // that is in the cache but not in the engine yet (see `issue`).
     state: string,
     error?: string,
+    // The server's ONE verdict on the entry's health: absent when it is fine,
+    // otherwise what is wrong (`kind` for code, `reason` for a person). The UI
+    // tags the row and offers "Fetch again" off this alone; it never derives
+    // health from `state` itself.
+    issue?: { kind: string, reason: string },
     pinned: boolean,
     // The player marked this stream watched: with streaming mode on, an
     // un-pinned watched entry cleans up automatically about an hour later.
@@ -157,6 +164,43 @@ const useCachedTorrents = () => {
         );
     }, [serverUrl, mutate]);
 
+    // "Fetch again" on a row with an issue: the server tries now to get what
+    // the torrent is missing and answers when the attempt is over (for lost
+    // details that can take a few minutes: it waits, bounded, for a peer).
+    // The row shows it is under way; the result is said either way.
+    const [refetching, setRefetching] = useState<string[]>([]);
+    const refetch = useCallback((infoHash: string) => {
+        if (typeof serverUrl !== 'string') return;
+        setRefetching((current) => current.includes(infoHash) ? current : [...current, infoHash]);
+        serverFetch(new URL('cache/refetch', serverUrl), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ infoHash }),
+        })
+            .then(async (resp) => {
+                if (!resp.ok) {
+                    const body = await resp.json().catch(() => null) as { error?: unknown } | null;
+                    throw new Error(typeof body?.error === 'string' ? body.error : `cache/refetch responded ${resp.status}`);
+                }
+                toast.show({ type: 'success', title: 'Fetched again', message: 'It is back in the cache.', timeout: 4000 });
+            })
+            .catch((error: unknown) => {
+                console.error('useCachedTorrents: cache/refetch failed', error);
+                toast.show({
+                    type: 'error',
+                    title: 'Could not fetch it again',
+                    message: error instanceof Error ? error.message : String(error),
+                    timeout: 10000,
+                });
+            })
+            .then(() => {
+                setRefetching((current) => current.filter((hash) => hash !== infoHash));
+                mutationSeq.current += 1;
+                refresh();
+                notifyCacheChanged();
+            });
+    }, [serverUrl, refresh, toast]);
+
     const remove = useCallback((infoHash: string) => {
         if (typeof serverUrl !== 'string') return;
         hidden.current.add(infoHash);
@@ -170,7 +214,7 @@ const useCachedTorrents = () => {
         });
     }, [serverUrl, mutate]);
 
-    return { entries, failed: error !== null, error, refresh, setPinned, setPaused, setFileSelected, remove };
+    return { entries, failed: error !== null, error, refresh, setPinned, setPaused, setFileSelected, remove, refetch, refetching };
 };
 
 export default useCachedTorrents;
