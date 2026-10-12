@@ -627,7 +627,10 @@ pub(crate) async fn delete(State(engine): State<Engine>, Json(body): Json<Delete
     }
     let info_hash = body.info_hash.to_lowercase();
     match engine.remove(&info_hash).await {
-        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Ok(true) => Json(serde_json::json!({ "success": true })).into_response(),
+        // Nothing by that hash: not a success to report (a second delete of
+        // something already gone, or of something that never was).
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         // Refused or failed: nothing was orphaned and the entry is still
         // listed. Say so, with the reason, instead of a success that is not.
         Err(e) => {

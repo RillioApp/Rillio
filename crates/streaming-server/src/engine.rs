@@ -859,25 +859,30 @@ fn usable_torrent_bytes(path: &Path, info_hash: &str) -> anyhow::Result<Vec<u8>>
     Ok(bytes)
 }
 
-/// Write `bytes` to `path` through a synced temp file and a rename.
+/// Write `bytes` to `path` through a synced temp file and a write-through
+/// replace. Used for every index file this code writes: recovery records,
+/// metadata copies, and its rewrite of `session.json`.
 ///
-/// What this guarantees on Windows/NTFS, and what it does not:
-/// - GUARANTEED: the temp file's CONTENT is on stable storage before the
-///   rename (`sync_all` is `FlushFileBuffers` on its handle), and the rename
-///   is atomic with respect to a crash: after one, `path` is either the old
-///   file or the new one, never a mixture and never a file that is half
-///   written. That is the property a reader of `path` needs.
-/// - NOT GUARANTEED: that the rename itself has reached the disk when this
-///   returns. Windows has no directory fsync; the rename is a metadata change
-///   in the NTFS log, which is flushed lazily. The second `sync_all`, on the
-///   renamed file, is a best effort that in practice flushes the log up to
-///   it, but nothing documents that as a promise. So after a power cut right
-///   after this returns, `path` may still be the OLD content (or absent, if
-///   it did not exist before).
+/// What is guaranteed when this returns `Ok`:
+/// - the temp file's CONTENT is on stable storage: `sync_all` is
+///   `FlushFileBuffers` on its handle (fsync elsewhere);
+/// - the replace is atomic for a reader: `path` is the old file or the whole
+///   new one, never a mixture or a half-written file;
+/// - on Windows the replace is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |
+///   MOVEFILE_WRITE_THROUGH`. Microsoft documents `MOVEFILE_WRITE_THROUGH` as
+///   the call not returning until the file is actually moved on the disk
+///   (<https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw>).
+///   That is the documented primitive for "the rename has reached the disk";
+///   the same page spells the flush out for a move done as copy-and-delete,
+///   and a same-directory replace like this one is a rename, so what is relied
+///   on here is the flag's first sentence;
+/// - elsewhere (the Android build): rename, then fsync of the parent
+///   directory, which is what makes a rename durable on a POSIX file system.
 ///
-/// The callers are ordered for exactly that: nothing is removed from one
-/// index on the strength of a write to the other having just returned (see
-/// the mutation protocol on `Engine::gate`).
+/// What is not: anything about hardware that acknowledges a flush it has not
+/// performed. Callers still order their writes so that the worst outcome of a
+/// lost write is an entry in both indexes, never in neither (see the mutation
+/// protocol on `Engine::gate`).
 fn write_durably(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     let dir = path.parent().context("write_durably: the path has no parent")?;
@@ -890,12 +895,40 @@ fn write_durably(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         f.write_all(bytes).with_context(|| format!("writing {tmp:?}"))?;
         f.sync_all().with_context(|| format!("syncing {tmp:?}"))?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming {tmp:?} to {path:?}"))?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|f| f.sync_all())
-        .with_context(|| format!("syncing {path:?} after the rename"))
+    replace_write_through(&tmp, path).with_context(|| format!("replacing {path:?} with {tmp:?}"))
+}
+
+/// Replace `to` with `from` and do not return before the move is on disk.
+#[cfg(windows)]
+fn replace_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    // kernel32, declared here rather than through a bindings crate: one
+    // function, no new dependency.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both pointers are to NUL-terminated UTF-16 buffers that outlive
+    // the call; the function reads them and nothing else.
+    let moved = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)?;
+    // A rename is durable once its directory is.
+    match to.parent() {
+        Some(dir) => std::fs::File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
 }
 
 /// Remove a file that may not exist. Any other failure is the caller's to act
@@ -925,15 +958,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// [`write_durably`], then opened again from disk and compared. Only after
 /// this returns `Ok` may the torrent's entry leave `session.json`.
 ///
-/// What remains possible: a power loss after both renames (this record's, then
-/// `session.json`'s) have returned but before NTFS has flushed its log. NTFS
-/// logs metadata changes in order, so the later rename cannot survive without
-/// the earlier one; the outcomes are "neither happened" (the entry is still in
-/// `session.json`, and the next start sets it aside again) or "both happened".
-/// For the entry to end up in neither index the file system would have to
-/// replay its log out of order. If that ever happened, the torrent would be
-/// missing from the Cache window with its data untouched on disk: nothing in
-/// this code deletes data it has no index for.
+/// The record's replace is write-through (see [`write_durably`]), so it is on
+/// disk before this returns, and `session.json` is rewritten only after that.
+/// A power loss can therefore leave the entry in both indexes (the next start
+/// resolves it) or still only in `session.json` (the next start sets it aside
+/// again), not in neither, short of a disk that acknowledges a flush it did
+/// not perform. Were that ever to happen, the torrent would be missing from
+/// the Cache window with its data untouched on disk: nothing in this code
+/// deletes data it has no index for.
 fn write_record_verified(session_dir: &Path, record: &Unrestored) -> anyhow::Result<()> {
     let path = record_path(session_dir, &record.info_hash);
     let ih = &record.info_hash;
@@ -1114,21 +1146,11 @@ fn prepare_session(session_dir: &Path) -> anyhow::Result<Prepared> {
         }
     }
 
-    // Copies nothing refers to any more (an add that was cancelled before
-    // librqbit registered it). Only when session.json was actually read: with
-    // no index in hand, "nothing refers to it" is not a fact.
-    if db.is_some() {
-        if let Ok(listing) = std::fs::read_dir(session_dir.join(METADATA_COPY_DIR)) {
-            for entry in listing.flatten() {
-                let path = entry.path();
-                let Some(ih) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-                // A record on disk counts even when it could not be read.
-                if !in_session.contains(ih) && !record_path(session_dir, ih).exists() {
-                    remove_file_logged(&path);
-                }
-            }
-        }
-    }
+    // Metadata copies are NOT cleaned up here. A copy is deleted in exactly
+    // one place, the successful end of its torrent's removal; one left behind
+    // by an add that was cancelled before librqbit registered it is a few KB
+    // nothing reads, and deciding at start that a copy is unreferenced needs a
+    // proof (every entry and record read correctly) this code cannot give.
     Ok(Prepared { set_aside, folders })
 }
 
@@ -2162,10 +2184,11 @@ impl Engine {
             // just registered, so there is nothing else of it to clear but
             // the metadata copy.
             let ih = Self::info_hash_hex(handle);
-            if let Err(e) = self.session.delete(handle.id().into(), Self::DELETE_FILES_ON_REMOVE).await {
-                tracing::error!("rejecting unconfined torrent {ih}: taking it back out failed: {e:#}");
+            match self.session.delete(handle.id().into(), Self::DELETE_FILES_ON_REMOVE).await {
+                Ok(()) => remove_file_logged(&metadata_copy_path(&self.session_dir, &ih)),
+                // Still in the session, as far as we know: its copy stays.
+                Err(e) => tracing::error!("rejecting unconfined torrent {ih}: taking it back out failed: {e:#}"),
             }
-            remove_file_logged(&metadata_copy_path(&self.session_dir, &ih));
             return Err(e);
         }
         Ok(())
@@ -2286,17 +2309,24 @@ impl Engine {
     /// managed. Returns whether one was found - the route responds `200 {}`
     /// either way (blob parity).
     ///
-    /// A torrent that is set aside (see the unrestorable-entry guard) is
-    /// removed too: its record, its leftover session files and its data. The
-    /// record goes FIRST and under the restore gate, so a restore already
-    /// under way finds it gone and stops instead of bringing the torrent back.
+    /// `Ok(true)` removed, `Ok(false)` nothing by that hash, `Err` refused or
+    /// not fully done (see [`Engine::remove_gated`]).
     ///
-    /// `Ok(true)` removed, `Ok(false)` nothing by that hash, `Err` REFUSED OR
-    /// FAILED: nothing an index points at was orphaned and the entry is still
-    /// listed. See the mutation protocol on [`Engine::gate`].
+    /// The whole removal is ONE transaction in a task of its own, and that
+    /// task owns the gate: librqbit's delete, the check that the files are
+    /// gone, and the bookkeeping. The request that asked for it can be dropped
+    /// at any await (a client that went away); the transaction then still runs
+    /// to its end with the gate held, so nothing can register that hash, or
+    /// anything else, in the middle of it.
     pub async fn remove(&self, info_hash: &str) -> anyhow::Result<bool> {
-        let _gate = self.gate.lock().await;
-        self.remove_gated(info_hash).await
+        let engine = self.clone();
+        let info_hash = info_hash.to_owned();
+        tokio::spawn(async move {
+            let _gate = engine.gate.clone().lock_owned().await;
+            engine.remove_gated(&info_hash).await
+        })
+        .await
+        .context("the removal task ended abnormally")?
     }
 
     /// What a client is told when it asks to remove a set-aside torrent.
@@ -2330,37 +2360,56 @@ impl Engine {
             .map(|folder| Self::files(&handle).iter().map(|file| folder.join(&file.path)).collect())
             .unwrap_or_default();
         drop(handle);
-        // In a task of its own: librqbit's delete has several awaits between
-        // "gone from its index" and "files deleted", and the request that
-        // asked for this may be dropped at any of them. The task is not.
-        let session = self.session.clone();
-        tokio::spawn(async move { session.delete(id.into(), Self::DELETE_FILES_ON_REMOVE).await })
+        self.session
+            .delete(id.into(), Self::DELETE_FILES_ON_REMOVE)
             .await
-            .context("the removal task ended abnormally")?
             .with_context(|| format!("removing {info_hash} from the torrent engine failed"))?;
-        // The torrent is gone from librqbit's index, so a record retained from
-        // its restore (see `register_from_record`) goes NOW, not before: had
-        // it gone first, a crash before the delete would have left the data
-        // with a session entry only, which is fine, but the reverse order
-        // costs nothing and keeps "an index outlives its data" true at every
-        // step. A crash right here leaves a record with nothing behind it:
-        // the next start lists it as waiting, and its restore comes back as a
-        // torrent with nothing downloaded (the bitfield went with the delete),
-        // never as one that claims data.
+        // FIRST: is its data really gone? A file is "left" unless it is known
+        // to be absent (or is one of the empty files librqbit creates for
+        // files nobody selected): a path that cannot be examined counts.
+        let left: Vec<&PathBuf> = files
+            .iter()
+            .filter(|path| match std::fs::metadata(path) {
+                Ok(meta) => meta.is_file() && meta.len() > 0,
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            })
+            .collect();
+        if !left.is_empty() {
+            // A record retained from this torrent's restore STAYS: data is
+            // still on disk, and the record is now the only index of it. The
+            // torrent is listed again as waiting, with that data, which is the
+            // truth. Without such a record there is nothing to fall back on:
+            // librqbit dropped the torrent from its index before it tried to
+            // unlink the files and only logs the ones it could not (as it did
+            // in v0.1.48 and before, where this was silent). No new index is
+            // invented for that case; it is reported, with the file named.
+            let record = std::fs::read(record_path(&self.session_dir, info_hash))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Unrestored>(&bytes).ok());
+            let kept = record.is_some();
+            if let (Some(record), Ok(mut waiting)) = (record, self.unrestored.lock()) {
+                waiting.insert(info_hash.to_owned(), record);
+            }
+            anyhow::bail!(
+                "{info_hash} is out of the torrent engine, but {} of its files could not be deleted and are still on disk (first: {:?}); {}",
+                left.len(),
+                left[0],
+                if kept { "it stays listed, waiting to be restored" } else { "it is no longer listed" }
+            );
+        }
+        // Nothing of its data is left, so a record retained from its restore
+        // (see `register_from_record`) can go. A crash before this line
+        // leaves a record with nothing behind it: the next start lists it as
+        // waiting, and its restore comes back as a torrent with nothing
+        // downloaded (the bitfield went with the delete), never as one that
+        // claims data.
         if is_persisted_info_hash(info_hash) {
             remove_file_strict(&record_path(&self.session_dir, info_hash)).with_context(|| {
                 format!("{info_hash} is removed, but its restore record is not: it will be listed as waiting at the next start")
             })?;
         }
-        let left: Vec<&PathBuf> = files.iter().filter(|path| path.is_file() && path.metadata().is_ok_and(|m| m.len() > 0)).collect();
-        if !left.is_empty() {
-            anyhow::bail!(
-                "{info_hash} is removed from the cache list, but {} of its files could not be deleted and are still on disk (first: {:?})",
-                left.len(),
-                left[0]
-            );
-        }
-        // Nothing of the torrent is left: what only described it goes last.
+        // The successful end of the removal: the ONE place a metadata copy
+        // is deleted.
         if is_persisted_info_hash(info_hash) {
             remove_file_logged(&metadata_copy_path(&self.session_dir, info_hash));
         }
@@ -2379,15 +2428,16 @@ impl Engine {
     }
 
     /// Stop and forget every torrent in the session (`POST /removeAll`): each
-    /// one through the same removal as a single torrent, under one hold of
-    /// the gate, so a restore cannot register a torrent behind its back.
-    /// Set-aside torrents are left alone (see [`Engine::remove_gated`]) and
+    /// one through the same removal as a single torrent. Set-aside torrents are left alone (see [`Engine::remove_gated`]) and
     /// reported as skipped; a removal that failed is reported with why.
+    ///
+    /// The gate is taken PER TORRENT, not for the batch: each removal is its
+    /// own transaction (see [`Engine::remove`]), and a play of something else
+    /// waits for one of them at most, not for the whole cache to be deleted.
     pub async fn remove_all(&self) -> RemoveAllReport {
-        let _gate = self.gate.lock().await;
         let mut report = RemoveAllReport::default();
         for ih in self.all().iter().map(Self::info_hash_hex) {
-            match self.remove_gated(&ih).await {
+            match self.remove(&ih).await {
                 Ok(_) => report.removed.push(ih),
                 Err(e) => {
                     tracing::error!("removeAll: {e:#}");

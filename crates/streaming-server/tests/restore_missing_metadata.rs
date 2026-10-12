@@ -871,6 +871,132 @@ async fn a_restored_torrent_whose_data_is_gone_does_not_claim_to_be_complete() {
     stop(engine).await;
 }
 
+/// The stale-fastresume check a restore runs must not throw away a HEALTHY
+/// bitfield: a torrent that was still downloading (a selected file with
+/// nothing of it yet), partly selected, and with its never-selected file
+/// absent from disk altogether keeps exactly the bytes it had.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_keeps_the_fastresume_of_a_partly_downloaded_partly_selected_torrent() {
+    let cache = seeded_cache("keep-bitv").await;
+    let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
+    let engine = cache.start().await;
+    wait_for(&engine, &cache.dir, "the pack live", |e| settled(e, &cache.pack)).await;
+    let (status, body) = post(
+        &engine,
+        &cache.dir,
+        "/cache/select",
+        serde_json::json!({ "infoHash": cache.pack, "fileIdx": 1, "selected": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    stop(engine).await;
+    // The never-selected episode 3: librqbit left an empty file; now not even that.
+    let _ = std::fs::remove_file(cache.dir.join(PACK).join(PACK_FILES[2]));
+    cache.poison_without_copy(&cache.pack);
+    stop(cache.start().await).await;
+
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+    let engine = cache.start().await;
+    let entries = wait_for(&engine, &cache.dir, "the pack restored", |e| settled(e, &cache.pack)).await;
+    let pack = entry(&entries, &cache.pack).unwrap();
+    assert_eq!(pack["fileCount"], 2, "{pack}");
+    assert_eq!(pack["total"], 4 * PIECE, "{pack}");
+    assert_eq!(pack["downloaded"], 2 * PIECE, "episode 1 is still counted, episode 2 still to come: {pack}");
+    assert!(pack.get("issue").is_none(), "{pack}");
+    stop(engine).await;
+}
+
+/// A removal is ONE transaction that owns the gate. The request behind it
+/// going away must not let the same hash register in the middle of it: a new
+/// registration made right after the cancelled request has to find the old
+/// torrent fully gone, and then stay intact (its session entry, its metadata
+/// file, our copy, its file on disk), not have them deleted from under it by
+/// the tail of the old removal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_removal_still_finishes_before_the_same_hash_registers_again() {
+    for round in 0..12u64 {
+        let cache = seeded_cache(&format!("cancel-{round}")).await;
+        let engine = cache.start().await;
+        wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
+
+        // The request is dropped somewhere inside the removal.
+        let _ = tokio::time::timeout(Duration::from_micros(round * 40), engine.remove(&cache.movie)).await;
+        let (blob, _) = movie_torrent();
+        engine.add_blob(blob, Pick::Files(vec![0])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let entries = list(&engine, &cache.dir).await;
+        assert!(entry(&entries, &cache.movie).is_some(), "round {round}: the new registration is listed: {entries:?}");
+        assert!(cache.session_entry(&cache.movie).is_some(), "round {round}: and in librqbit's index");
+        assert!(
+            std::fs::metadata(cache.saved(&cache.movie)).is_ok_and(|m| m.len() > 0),
+            "round {round}: with its metadata file"
+        );
+        assert!(cache.copy(&cache.movie).exists(), "round {round}: and our copy of it");
+        assert!(cache.dir.join(MOVIE).exists(), "round {round}: and its file on disk");
+        stop(engine).await;
+    }
+}
+
+/// Hold a file open the way a player does, so that it cannot be deleted.
+#[cfg(windows)]
+fn hold_undeletable(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ | FILE_SHARE_WRITE, and NOT FILE_SHARE_DELETE.
+    std::fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(path).unwrap()
+}
+
+/// librqbit drops a torrent from its index before it unlinks the files, and
+/// only logs a file it could not unlink. When the torrent still has the record
+/// from its restore, that record must NOT be deleted over data that is still
+/// there: the removal fails, the record stays, and the torrent is listed
+/// again as waiting, with its data.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_that_leaves_data_keeps_the_record_and_the_row() {
+    let cache = seeded_cache("left-record").await;
+    let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
+    cache.poison_without_copy(&cache.pack);
+    stop(cache.start().await).await;
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+    let engine = cache.start().await;
+    wait_for(&engine, &cache.dir, "the pack restored", |e| settled(e, &cache.pack)).await;
+    assert!(cache.record(&cache.pack).exists(), "the record from its restore is retained");
+
+    let data = cache.dir.join(PACK).join(PACK_FILES[0]);
+    let held = hold_undeletable(&data);
+    let (status, body) = delete(&engine, &cache, &cache.pack).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(std::fs::read(&data).unwrap(), file_data(0), "the data is still there");
+    assert!(cache.record(&cache.pack).exists(), "so its only index is too");
+    let entries = list(&engine, &cache.dir).await;
+    assert_eq!(entry(&entries, &cache.pack).expect("listed")["state"], "waiting");
+    drop(held);
+    stop(engine).await;
+}
+
+/// The same for a torrent that never had a record: there is nothing to fall
+/// back on (this is librqbit's behaviour, and v0.1.48's, where it was silent),
+/// so it is at least never reported as a success, the file is named, and a
+/// second delete of the hash that is now in neither index is not "ok" either.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_that_leaves_data_is_an_error_and_a_repeat_is_not_ok() {
+    let cache = seeded_cache("left-plain").await;
+    let engine = cache.start().await;
+    wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
+
+    let held = hold_undeletable(&cache.dir.join(MOVIE));
+    let (status, body) = delete(&engine, &cache, &cache.movie).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"].as_str().unwrap().contains(MOVIE), "the file left is named: {body}");
+    assert!(cache.dir.join(MOVIE).exists());
+    let (status, _) = delete(&engine, &cache, &cache.movie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not a success the second time either");
+    drop(held);
+    stop(engine).await;
+}
+
 /// A play of a set-aside hash racing its restore must leave ONE registration,
 /// in the record's folder, and the engine must keep looking for its files
 /// there (a wrong folder would show at once as "files missing").
