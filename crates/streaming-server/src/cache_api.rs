@@ -31,10 +31,17 @@ pub(crate) struct CacheEntry {
     pub downloaded: u64,
     /// Total size of the selected files.
     pub total: u64,
-    /// "initializing" | "live" | "paused" | "error".
+    /// "initializing" | "live" | "paused" | "error", or "waiting" for a torrent
+    /// that is in the cache but not in the engine (set aside until its
+    /// metadata is back; see `issue`).
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The ONE health value of the entry: absent when it is healthy, otherwise
+    /// what is wrong with it. Derived here (see [`derive_issue`]) so every
+    /// client reads the same verdict instead of re-deriving it from `state`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<Issue>,
     pub pinned: bool,
     /// Whether the player marked this stream watched (streaming mode): an
     /// un-pinned watched entry is scheduled for automatic cleanup.
@@ -60,6 +67,93 @@ pub(crate) struct CacheEntry {
     /// add; pre-existing caches are backfilled once from on-disk file times
     /// (see engine::added_at_stamped). Drives the Cache page's date sort.
     pub added_at: u64,
+}
+
+/// What is wrong with a cache entry. `kind` is for code (which actions make
+/// sense, whether it may be offered as playable: it may not), `reason` is for
+/// a person.
+#[derive(Serialize, Debug, PartialEq)]
+pub(crate) struct Issue {
+    /// "metadata-missing" | "engine-error" | "data-missing".
+    pub kind: &'static str,
+    pub reason: String,
+}
+
+/// What the engine knows about one torrent, reduced to what its health
+/// depends on.
+pub(crate) enum Observed<'a> {
+    /// Not in the engine: set aside at startup because its saved metadata was
+    /// unusable, waiting to be restored. Carries the last reason.
+    SetAside(&'a str),
+    /// In the engine. `error` is librqbit's message when it is in its error
+    /// state; `missing` names the selected files the engine counts bytes for
+    /// that are not on disk.
+    Managed { error: Option<&'a str>, missing: &'a [String] },
+}
+
+/// The health of a cache entry, from what was observed. One place, so the
+/// list, the tests and every client agree on what "has an issue" means.
+pub(crate) fn derive_issue(observed: Observed<'_>) -> Option<Issue> {
+    match observed {
+        Observed::SetAside(reason) => Some(Issue {
+            kind: "metadata-missing",
+            reason: if reason.is_empty() {
+                "its saved details were lost; waiting to get them again".to_owned()
+            } else {
+                reason.to_owned()
+            },
+        }),
+        Observed::Managed { error: Some(error), .. } => {
+            Some(Issue { kind: "engine-error", reason: error.to_owned() })
+        }
+        Observed::Managed { error: None, missing } if !missing.is_empty() => Some(Issue {
+            kind: "data-missing",
+            reason: match missing {
+                [one] => format!("{one} is no longer on disk"),
+                [first, rest @ ..] => format!("{first} and {} more files are no longer on disk", rest.len()),
+                [] => unreachable!("guarded above"),
+            },
+        }),
+        Observed::Managed { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod issue_tests {
+    use super::*;
+
+    #[test]
+    fn a_healthy_torrent_has_no_issue() {
+        assert_eq!(derive_issue(Observed::Managed { error: None, missing: &[] }), None);
+    }
+
+    #[test]
+    fn a_set_aside_torrent_is_metadata_missing_with_its_reason() {
+        let issue = derive_issue(Observed::SetAside("no peer delivered the metadata")).unwrap();
+        assert_eq!(issue.kind, "metadata-missing");
+        assert_eq!(issue.reason, "no peer delivered the metadata");
+        // A record with no reason yet still says something a person can read.
+        assert!(!derive_issue(Observed::SetAside("")).unwrap().reason.is_empty());
+    }
+
+    #[test]
+    fn the_engine_error_state_wins_and_carries_the_message() {
+        let missing = vec!["a.mkv".to_owned()];
+        let issue =
+            derive_issue(Observed::Managed { error: Some("disk full"), missing: &missing }).unwrap();
+        assert_eq!(issue, Issue { kind: "engine-error", reason: "disk full".into() });
+    }
+
+    #[test]
+    fn files_gone_from_disk_are_data_missing_and_named() {
+        let one = vec!["S01E01.mkv".to_owned()];
+        let issue = derive_issue(Observed::Managed { error: None, missing: &one }).unwrap();
+        assert_eq!(issue.kind, "data-missing");
+        assert_eq!(issue.reason, "S01E01.mkv is no longer on disk");
+        let three = vec!["a.mkv".to_owned(), "b.mkv".to_owned(), "c.mkv".to_owned()];
+        let issue = derive_issue(Observed::Managed { error: None, missing: &three }).unwrap();
+        assert_eq!(issue.reason, "a.mkv and 2 more files are no longer on disk");
+    }
 }
 
 /// Extensions we treat as playable video. Matches the container formats the
@@ -161,7 +255,28 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
                 Some(idx) => files[idx].name.clone(),
                 None => handle.name().unwrap_or_default(),
             };
+            // Selected files the engine counts bytes for that are not on disk
+            // (deleted behind its back while it runs). Only checked where a
+            // have-byte count exists, and only for files that claim some.
+            let missing: Vec<String> = match (&stats.state, engine.output_folder(&info_hash)) {
+                (TorrentStatsState::Live | TorrentStatsState::Paused, Some(folder)) => selected
+                    .iter()
+                    .filter(|&&i| stats.file_progress.get(i).copied().unwrap_or(0) > 0)
+                    .filter(|&&i| !folder.join(&files[i].path).exists())
+                    .map(|&i| files[i].name.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
             CacheEntry {
+                issue: derive_issue(Observed::Managed {
+                    error: match stats.state {
+                        TorrentStatsState::Error => {
+                            Some(stats.error.as_deref().unwrap_or("the torrent engine reported an error"))
+                        }
+                        _ => None,
+                    },
+                    missing: &missing,
+                }),
                 pinned: engine.is_pinned(&info_hash),
                 watched: engine.is_watched(&info_hash),
                 meta: engine.meta(&info_hash),
@@ -177,6 +292,32 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
             }
         })
         .collect();
+    // Torrents that are in the cache but not in the engine (set aside until
+    // their metadata is back) are rows like any other, with their issue. The
+    // sidecars are keyed by infohash, so a title identified before it was set
+    // aside keeps its name and artwork; without one the folder name stands in.
+    entries.extend(engine.unrestored().into_iter().map(|record| {
+        let info_hash = record.info_hash.clone();
+        CacheEntry {
+            name: record
+                .output_folder
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| info_hash.clone()),
+            downloaded: 0,
+            total: 0,
+            state: "waiting".to_owned(),
+            error: None,
+            issue: derive_issue(Observed::SetAside(&record.reason)),
+            pinned: engine.is_pinned(&info_hash),
+            watched: engine.is_watched(&info_hash),
+            meta: engine.meta(&info_hash),
+            file_count: 0,
+            file_idx: None,
+            added_at: engine.added_at(&info_hash).unwrap_or(0),
+            info_hash,
+        }
+    }));
     // Newest first as the wire order; the web re-sorts to whatever the user
     // picked, this is just a sensible default for any other consumer.
     entries.sort_by(|a, b| b.added_at.cmp(&a.added_at));
@@ -424,6 +565,34 @@ pub(crate) async fn pause(State(engine): State<Engine>, Json(body): Json<PauseBo
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
         Err(e) => {
             tracing::warn!("cache/pause {} paused={}: {e:#}", info_hash, body.paused);
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RefetchBody {
+    info_hash: String,
+}
+
+/// `POST /cache/refetch` - "fetch again": try now to get what a torrent with
+/// an issue is missing (see [`Engine::refetch`]). Answers once the attempt is
+/// over, which for lost metadata can take as long as the bounded wait for a
+/// peer; `409` with the reason when it did not work.
+pub(crate) async fn refetch(State(engine): State<Engine>, Json(body): Json<RefetchBody>) -> Response {
+    if !is_valid_infohash(&body.info_hash) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let info_hash = body.info_hash.to_lowercase();
+    match engine.refetch(&info_hash).await {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => {
+            tracing::warn!("cache/refetch {info_hash}: {e:#}");
             (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({ "error": format!("{e:#}") })),

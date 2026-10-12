@@ -109,6 +109,8 @@ pub fn router(config: Config, engine: Engine) -> Router {
         // What media a cached torrent actually is (addon metadata sidecar).
         .route("/cache/meta", post(cache_api::meta))
         .route("/cache/delete", post(cache_api::delete))
+        // "Fetch again" for an entry with an issue (see cache_api::Issue).
+        .route("/cache/refetch", post(cache_api::refetch))
         // M2 stats family (static segments; win over the {idx} stream param).
         .route("/stats.json", get(stats::stats_aggregate))
         .route("/{info_hash}/stats.json", get(stats::stats_torrent))
