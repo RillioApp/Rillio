@@ -335,6 +335,10 @@ pub struct Engine {
     /// changes on different torrents were serialized anyway. A per-infohash map
     /// would add entries to clean up on every remove for no real concurrency.
     selection: Arc<tokio::sync::Mutex<()>>,
+    /// Infohashes the startup guard kept out of the session because their
+    /// saved metadata was unusable (see [`set_aside_unrestorable`]). Fixed at
+    /// start; for the embedder's log.
+    set_aside_at_start: Arc<Vec<String>>,
 }
 
 /// Filename of the persisted pin set, under the cache root.
@@ -930,7 +934,9 @@ impl Engine {
         // a magnet nobody serves never finishes.
         let set_aside = set_aside_unrestorable(&session_dir);
         let session = Session::new_with_opts(cache_dir, opts).await?;
-        let engine = Self::from_session(session, cache_root);
+        let mut engine = Self::from_session(session, cache_root);
+        engine.set_aside_at_start =
+            Arc::new(set_aside.iter().map(|entry| entry.info_hash.clone()).collect());
         if !set_aside.is_empty() {
             let restorer = engine.clone();
             let stop = engine.session.cancellation_token().clone();
@@ -1021,7 +1027,15 @@ impl Engine {
             meta: Arc::new(Mutex::new(meta)),
             added: Arc::new(Mutex::new(added)),
             selection: Arc::new(tokio::sync::Mutex::new(())),
+            set_aside_at_start: Arc::new(Vec::new()),
         }
+    }
+
+    /// The torrents this start kept out of the session because their saved
+    /// metadata was unusable; they are being restored in the background. An
+    /// embedder with a durable log should write these down.
+    pub fn set_aside_at_start(&self) -> &[String] {
+        &self.set_aside_at_start
     }
 
     /// When this torrent entered the cache, as unix epoch milliseconds.

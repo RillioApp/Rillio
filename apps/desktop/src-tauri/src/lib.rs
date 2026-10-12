@@ -2331,10 +2331,14 @@ fn start_streaming_server(app: &tauri::AppHandle) {
         boot_journal_append(
             &identifier,
             &format!(
-                "server-up port={} attempt={attempt} after_ms={} torrents={}",
+                "server-up port={} attempt={attempt} after_ms={} torrents={} set_aside={:?}",
                 addr.port(),
                 started.elapsed().as_millis(),
-                engine.all().len()
+                engine.all().len(),
+                // Torrents whose saved metadata was unusable: kept out of the
+                // session so they cannot hold up the start, restored in the
+                // background (engine.rs, the unrestorable-entry guard).
+                engine.set_aside_at_start()
             ),
         );
         if advertised.set_port(Some(addr.port())).is_err() {

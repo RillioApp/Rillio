@@ -36,6 +36,7 @@ pub use tower;
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::FromRef;
@@ -205,17 +206,116 @@ pub async fn bind_and_serve(
         )));
     }
 
-    let engine = Engine::new(config.cache_root.clone())
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Serve the socket from NOW, before the engine exists. The listener is
+    // bound, so the kernel is already accepting connections into its backlog;
+    // with nothing serving them until `Engine::new` returned, a slow or stuck
+    // engine start left every request hanging with zero bytes until the
+    // client gave up (measured 2026-10-12: 12 to 25 s per request, for
+    // minutes). The gate answers 503 with the reason until the real router is
+    // in place, then forwards to it.
+    let slot: RouterSlot = Arc::new(OnceLock::new());
+    let serving = tokio::spawn({
+        let gate = gate_router(slot.clone());
+        async move { axum::serve(listener, gate).await }
+    });
+
+    let engine = match Engine::new(config.cache_root.clone()).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            // Stop serving and free the port, so a retry can bind it again.
+            serving.abort();
+            let _ = serving.await;
+            return Err(std::io::Error::other(format!("{e:#}")));
+        }
+    };
     spawn_cache_sweeper(&config, engine.clone());
     spawn_ephemeral_sweeper(engine.clone());
     let app = router(config, engine.clone());
+    slot.set(app.clone()).expect("the router slot is filled exactly once");
     tracing::info!(%addr, "streaming server listening");
 
-    let serving = app.clone();
-    let fut = async move { axum::serve(listener, serving).await };
+    let fut = async move {
+        match serving.await {
+            Ok(served) => served,
+            Err(e) => Err(std::io::Error::other(format!("the HTTP serve task ended: {e}"))),
+        }
+    };
     Ok((addr, engine, app, fut))
+}
+
+/// Where the real router goes once the engine exists (see [`gate_router`]).
+type RouterSlot = Arc<OnceLock<Router>>;
+
+/// What the socket serves from the moment it is bound: every request is
+/// forwarded to the real router once it is in `slot`, and until then answered
+/// `503` with a JSON reason, so a client always gets an answer and can tell
+/// "still starting" from "not there". The real router's own layers (origin
+/// guard, CORS) apply to everything forwarded; the 503 carries no state.
+fn gate_router(slot: RouterSlot) -> Router {
+    Router::new().fallback(move |req: axum::extract::Request| {
+        let slot = slot.clone();
+        async move {
+            use axum::response::IntoResponse;
+            use tower::ServiceExt;
+            match slot.get() {
+                Some(app) => match app.clone().oneshot(req).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                },
+                None => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [(axum::http::header::RETRY_AFTER, "2")],
+                    axum::Json(serde_json::json!({
+                        "error": "the streaming server is starting (restoring the torrent session)"
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn get(app: &Router, path: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Before the engine exists every request is answered at once, with the
+    /// reason; afterwards the very same service is the real router.
+    #[tokio::test]
+    async fn the_socket_answers_before_the_engine_exists_and_forwards_after() {
+        let slot: RouterSlot = Arc::new(OnceLock::new());
+        let gate = gate_router(slot.clone());
+
+        let (status, body) = get(&gate, "/cache/list").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("starting"), "the 503 says why: {body}");
+
+        let dir = std::env::temp_dir().join("rillio-gate-router");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::new(dir.clone()).await.unwrap();
+        slot.set(router(Config::local(dir), engine)).unwrap();
+
+        let (status, body) = get(&gate, "/cache/list").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]");
+        let (status, _) = get(&gate, "/no-such-route").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the real router's own 404");
+    }
 }
 
 /// Bind `requested`, falling back to an ephemeral port on the same IP when the

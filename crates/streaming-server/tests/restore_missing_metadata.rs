@@ -141,6 +141,21 @@ async fn a_missing_saved_torrent_file_does_not_block_startup() {
     engine.session().stop().await;
 }
 
+/// The other broken-entry shape, for the record: data files deleted behind the
+/// engine's back never blocked startup (the fastresume guard drops the stale
+/// bitfield and the torrent comes back empty). Pinned so it stays that way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_whose_data_files_are_gone_does_not_block_startup() {
+    let (dir, gone, healthy) = seeded_cache("data-gone").await;
+    std::fs::remove_file(dir.join("Broken.Movie.2019.1080p.mkv")).unwrap();
+
+    let engine = restart_must_come_up(&dir, &healthy).await;
+    let entries = wait_all_ready(&engine, &dir, 2).await;
+    let entry = entries.iter().find(|e| e["infoHash"] == gone).unwrap();
+    assert_eq!(entry["downloaded"], 0, "nothing of it is on disk any more: {entry}");
+    engine.session().stop().await;
+}
+
 /// The torrent set aside is not forgotten: it is recorded for a later start to
 /// try again, and it is restored (same files, no re-download) the moment its
 /// metadata is available again.
