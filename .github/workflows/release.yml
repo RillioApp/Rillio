@@ -85,6 +85,28 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-libmpv-windows.ps1
 
+      # The tauri CLI is PINNED. Left alone, tauri-action runs
+      # `npm install -g @tauri-apps/cli@v2`, the newest 2.x at build time, and
+      # the CLI carries the NSIS installer template: 0.1.44 was built with
+      # 2.11.4, 0.1.45/46 with 2.12.0, 0.1.47 with 2.12.2. That is how 2.12.0's
+      # Restart Manager app-running check arrived unannounced and silently
+      # aborted the 0.1.46 -> 0.1.47 update (see
+      # apps/desktop/src-tauri/windows/hooks.nsh). `tauriScript: tauri` below
+      # makes the action run this install instead of doing its own.
+      # When bumping (here AND in ci.yml): diff the new CLI's
+      # crates/tauri-bundler/src/bundle/windows/nsis/{installer.nsi,utils.nsh}
+      # against the pinned one, above all CheckIfAppIsRunning and the
+      # NSIS_HOOK_PREINSTALL call site, and keep hooks.nsh in step with it.
+      - name: Install the pinned tauri CLI
+        shell: pwsh
+        env:
+          TAURI_CLI_VERSION: 2.12.2
+        run: |
+          npm install -g "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "npm install of @tauri-apps/cli@$env:TAURI_CLI_VERSION failed" }
+          $got = (tauri --version)
+          if ("$got" -notmatch "(^|\s)$([regex]::Escape($env:TAURI_CLI_VERSION))$") { throw "expected tauri CLI $env:TAURI_CLI_VERSION, got '$got'" }
+
       - uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0 (latest; older pins fail release creation with "Resource not accessible")
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,6 +117,8 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
         with:
           projectPath: apps/desktop/src-tauri
+          # The pinned global CLI installed above (see the comment there).
+          tauriScript: tauri
           tagName: ${{ github.ref_name }}
           releaseName: 'Rillio ${{ github.ref_name }}'
           releaseBody: |
