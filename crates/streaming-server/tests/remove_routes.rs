@@ -46,7 +46,8 @@ async fn remove_all_on_empty_session() {
     let base = spawn("all").await;
     let (status, body) = post(&base, "/removeAll").await;
     assert_eq!(status, 200);
-    assert_eq!(body, serde_json::json!({}));
+    // The route reports what it did; on an empty session, nothing.
+    assert_eq!(body, serde_json::json!({ "removed": [], "skipped": [], "failed": [] }));
     // GET (the `<img>`/navigation vector) must not drive this mutation.
     assert_eq!(get_status(&base, "/removeAll").await, 405);
 }

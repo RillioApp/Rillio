@@ -583,31 +583,6 @@ async fn a_stale_record_of_a_torrent_in_the_session_is_dropped_at_start() {
     stop(engine).await;
 }
 
-/// A set-aside torrent is removable from the Cache window like any other row:
-/// its record, its session leftovers and its data folder all go.
-#[tokio::test(flavor = "multi_thread")]
-async fn removing_a_set_aside_torrent_deletes_its_data_and_its_record() {
-    let cache = seeded_cache("remove").await;
-    cache.poison_without_copy(&cache.pack);
-    let engine = cache.start().await;
-    wait_for(&engine, &cache.dir, "the pack waiting", |e| entry(e, &cache.pack).is_some()).await;
-
-    let (status, _) = post(&engine, &cache.dir, "/cache/delete", serde_json::json!({ "infoHash": cache.pack })).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(entry(&list(&engine, &cache.dir).await, &cache.pack).is_none());
-    assert!(!cache.record(&cache.pack).exists());
-    assert!(!cache.saved(&cache.pack).exists());
-    assert!(!cache.session().join(format!("{}.bitv", cache.pack)).exists());
-    assert!(!cache.dir.join(PACK).exists(), "its data folder is deleted");
-    assert!(cache.dir.join(MOVIE).exists(), "nobody else's data is touched");
-    stop(engine).await;
-
-    let engine = cache.start().await;
-    let entries = wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
-    assert!(entry(&entries, &cache.pack).is_none());
-    stop(engine).await;
-}
-
 /// Neither sweeper may delete the data of a set-aside torrent just because
 /// the session does not hold it.
 #[tokio::test(flavor = "multi_thread")]
@@ -737,18 +712,6 @@ impl Cache {
         }
         std::fs::write(&db_path, serde_json::to_vec(&db).unwrap()).unwrap();
     }
-    fn set_record_folder(&self, ih: &str, folder: &Path) {
-        let mut record: Value = serde_json::from_slice(&std::fs::read(self.record(ih)).unwrap()).unwrap();
-        record["output_folder"] = Value::String(folder.to_string_lossy().into_owned());
-        std::fs::write(self.record(ih), serde_json::to_vec(&record).unwrap()).unwrap();
-    }
-    /// A refused removal changed nothing: the row, the record and the data.
-    async fn assert_pack_untouched(&self, engine: &Engine, data: &Path) {
-        let entries = list(engine, &self.dir).await;
-        assert_eq!(entry(&entries, &self.pack).expect("still listed")["state"], "waiting");
-        assert!(self.record(&self.pack).exists(), "its record still points at the data");
-        assert_eq!(std::fs::read(data).unwrap(), file_data(0), "its data is untouched");
-    }
 }
 
 async fn delete(engine: &Engine, cache: &Cache, ih: &str) -> (StatusCode, Value) {
@@ -782,135 +745,163 @@ async fn playing_a_set_aside_hash_restores_it_from_its_record_not_into_the_defau
     stop(engine).await;
 }
 
-/// A single-file torrent's data sits in the cache root among everyone else's.
-/// Set aside, its file cannot be told apart, so the removal is refused, says
-/// so up front in the list, and leaves the record pointing at the file.
+/// A torrent waiting to be restored is NEVER removed, and nothing of it is
+/// touched: without its metadata the server cannot list its files, and it
+/// deletes no data it cannot list. The list says so up front, the removal
+/// answers 409 with a plain reason, and once the torrent is restored the
+/// ordinary removal applies.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_set_aside_single_file_torrent_cannot_be_removed_and_keeps_its_index() {
-    let cache = seeded_cache("single").await;
-    cache.poison_without_copy(&cache.movie);
-    let engine = cache.start().await;
-    let entries = wait_for(&engine, &cache.dir, "the pack live", |e| settled(e, &cache.pack)).await;
-    let movie = entry(&entries, &cache.movie).unwrap();
-    assert!(movie["cannotRemove"].as_str().is_some_and(|why| !why.is_empty()), "said up front: {movie}");
-    assert!(entry(&entries, &cache.pack).unwrap().get("cannotRemove").is_none());
-
-    let (status, body) = delete(&engine, &cache, &cache.movie).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
-    assert!(entry(&list(&engine, &cache.dir).await, &cache.movie).is_some(), "still listed");
-    assert!(cache.record(&cache.movie).exists(), "the file still has its index");
-    assert!(cache.dir.join(MOVIE).exists(), "and is untouched");
-    assert!(cache.session().join(format!("{}.bitv", cache.movie)).exists());
-    stop(engine).await;
-}
-
-/// Recursive deletion needs proof the folder is this torrent's alone. Another
-/// torrent keeping a file inside it defeats the proof.
-#[tokio::test(flavor = "multi_thread")]
-async fn removal_is_refused_when_another_torrent_has_files_in_the_folder() {
-    let cache = seeded_cache("shared").await;
-    // The movie's one file now lives inside the pack's folder.
-    std::fs::rename(cache.dir.join(MOVIE), cache.dir.join(PACK).join(MOVIE)).unwrap();
-    cache.set_session_folder(&cache.movie, &cache.dir.join(PACK));
+async fn a_set_aside_torrent_cannot_be_removed_until_it_is_restored() {
+    let cache = seeded_cache("no-remove").await;
+    let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
     cache.poison_without_copy(&cache.pack);
     let engine = cache.start().await;
-    wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
+    let entries = wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
+    assert!(entry(&entries, &cache.pack).unwrap()["cannotRemove"].as_str().is_some_and(|why| !why.is_empty()));
+    assert!(entry(&entries, &cache.movie).unwrap().get("cannotRemove").is_none());
 
     let (status, body) = delete(&engine, &cache, &cache.pack).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    cache.assert_pack_untouched(&engine, &cache.dir.join(PACK).join(PACK_FILES[0])).await;
-    assert!(cache.dir.join(PACK).join(MOVIE).exists(), "the other torrent's file survives");
-    stop(engine).await;
-}
+    assert!(body["error"].as_str().unwrap().contains("it can be removed once it is restored"), "{body}");
+    assert_eq!(entry(&list(&engine, &cache.dir).await, &cache.pack).expect("still listed")["state"], "waiting");
+    assert!(cache.record(&cache.pack).exists(), "its record still points at the data");
+    assert_eq!(std::fs::read(cache.dir.join(PACK).join(PACK_FILES[0])).unwrap(), file_data(0));
+    assert!(cache.session().join(format!("{}.bitv", cache.pack)).exists());
 
-/// A wrong persisted folder inside Rillio's own session folder is never a
-/// deletion target.
-#[tokio::test(flavor = "multi_thread")]
-async fn removal_is_refused_for_a_folder_inside_the_session_folder() {
-    let cache = seeded_cache("session-folder").await;
-    cache.poison_without_copy(&cache.pack);
-    stop(cache.start().await).await;
-    cache.set_record_folder(&cache.pack, &cache.session().join("unrestored"));
-
-    let engine = cache.start().await;
-    wait_for(&engine, &cache.dir, "the pack waiting", |e| entry(e, &cache.pack).is_some()).await;
+    // Restored, it is an ordinary torrent and removes like one.
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+    let (status, _) = post(&engine, &cache.dir, "/cache/refetch", serde_json::json!({ "infoHash": cache.pack })).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for(&engine, &cache.dir, "the pack live", |e| settled(e, &cache.pack)).await;
     let (status, body) = delete(&engine, &cache, &cache.pack).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    cache.assert_pack_untouched(&engine, &cache.dir.join(PACK).join(PACK_FILES[0])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(entry(&list(&engine, &cache.dir).await, &cache.pack).is_none());
+    assert!(!cache.dir.join(PACK).join(PACK_FILES[0]).exists(), "librqbit deleted its file");
+    assert!(!cache.record(&cache.pack).exists(), "and the record it had kept went after it");
     stop(engine).await;
 }
 
-/// A folder that is really a junction to somewhere else is never followed.
-#[cfg(windows)]
+/// removeAll removes the torrents in the session, leaves the ones waiting to
+/// be restored alone, and SAYS which was which: it is not a 200 when it kept
+/// something.
 #[tokio::test(flavor = "multi_thread")]
-async fn removal_is_refused_through_a_junction() {
-    let cache = seeded_cache("junction").await;
-    let outside = std::env::temp_dir().join("rillio-restore-junction-outside");
-    let _ = std::fs::remove_dir_all(&outside);
-    std::fs::rename(cache.dir.join(PACK), &outside).unwrap();
-    let made = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(cache.dir.join(PACK))
-        .arg(&outside)
-        .output()
-        .unwrap();
-    assert!(made.status.success(), "mklink /J failed: {made:?}");
-    cache.poison_without_copy(&cache.pack);
-    let engine = cache.start().await;
-    wait_for(&engine, &cache.dir, "the pack waiting", |e| entry(e, &cache.pack).is_some()).await;
-
-    let (status, body) = delete(&engine, &cache, &cache.pack).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    cache.assert_pack_untouched(&engine, &outside.join(PACK_FILES[0])).await;
-    stop(engine).await;
-    // Remove the link itself (not what it points at), then the target.
-    std::fs::remove_dir(cache.dir.join(PACK)).unwrap();
-    std::fs::remove_dir_all(&outside).unwrap();
-}
-
-/// A record that cannot be deleted fails the removal BEFORE anything else is
-/// touched: the torrent is still in the session, listed, with its data.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_record_that_cannot_be_deleted_fails_the_removal_with_the_torrent_still_listed() {
-    let cache = seeded_cache("stuck-record").await;
-    let engine = cache.start().await;
-    wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
-    // Something undeletable where the movie's record would be (a file removal
-    // of a non-empty folder fails on every platform).
-    std::fs::create_dir_all(cache.record(&cache.movie).join("held")).unwrap();
-
-    let (status, body) = delete(&engine, &cache, &cache.movie).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(settled(&list(&engine, &cache.dir).await, &cache.movie), "still listed and running");
-    assert!(cache.dir.join(MOVIE).exists(), "its data is untouched");
-    assert!(cache.session_entry(&cache.movie).is_some());
-    stop(engine).await;
-}
-
-/// removeAll goes through the same removal: what can be removed is, a
-/// set-aside torrent included; what cannot stays listed with its index.
-#[tokio::test(flavor = "multi_thread")]
-async fn remove_all_clears_set_aside_torrents_too_and_keeps_what_it_cannot_remove() {
+async fn remove_all_reports_what_it_removed_and_what_it_left() {
     let cache = seeded_cache("remove-all").await;
     cache.poison_without_copy(&cache.pack);
     let engine = cache.start().await;
     wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
-    engine.remove_all().await;
-    assert!(list(&engine, &cache.dir).await.is_empty(), "the removable set-aside pack went with the rest");
-    assert!(!cache.record(&cache.pack).exists());
-    assert!(!cache.dir.join(PACK).exists());
+
+    let (status, body) = post(&engine, &cache.dir, "/removeAll", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "something was left: {body}");
+    assert_eq!(body["removed"], serde_json::json!([cache.movie]));
+    assert_eq!(body["skipped"], serde_json::json!([cache.pack]));
+    assert_eq!(body["failed"], serde_json::json!([]));
+    assert!(!cache.dir.join(MOVIE).exists());
+    assert!(cache.record(&cache.pack).exists(), "the skipped torrent keeps its index");
+    assert_eq!(std::fs::read(cache.dir.join(PACK).join(PACK_FILES[0])).unwrap(), file_data(0));
+    let entries = list(&engine, &cache.dir).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["infoHash"], cache.pack.as_str());
+
+    // Asked again, the waiting torrent is still skipped and still reported.
+    let (status, body) = post(&engine, &cache.dir, "/removeAll", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["removed"], serde_json::json!([]));
     stop(engine).await;
 
-    let cache = seeded_cache("remove-all-refused").await;
-    cache.poison_without_copy(&cache.movie);
+    let cache = seeded_cache("remove-all-clean").await;
     let engine = cache.start().await;
-    wait_for(&engine, &cache.dir, "the pack live", |e| settled(e, &cache.pack)).await;
-    engine.remove_all().await;
-    let entries = list(&engine, &cache.dir).await;
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["infoHash"], cache.movie.as_str());
-    assert!(cache.record(&cache.movie).exists() && cache.dir.join(MOVIE).exists());
+    wait_for(&engine, &cache.dir, "both live", |e| settled(e, &cache.pack) && settled(e, &cache.movie)).await;
+    let (status, body) = post(&engine, &cache.dir, "/removeAll", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removed"].as_array().unwrap().len(), 2);
+    assert!(list(&engine, &cache.dir).await.is_empty());
+    stop(engine).await;
+}
+
+/// What a crash between "librqbit deleted the torrent" and "its retained
+/// record was deleted" leaves: a record with nothing behind it. The next
+/// start lists it as waiting, and its restore comes back as a torrent with
+/// NOTHING downloaded, never as one that claims the data that is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_left_behind_by_a_removal_restores_as_an_empty_torrent() {
+    let cache = seeded_cache("ghost").await;
+    let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
+    cache.poison_without_copy(&cache.pack);
+    stop(cache.start().await).await;
+    let record = std::fs::read(cache.record(&cache.pack)).unwrap();
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+    let engine = cache.start().await;
+    wait_for(&engine, &cache.dir, "the pack restored", |e| settled(e, &cache.pack)).await;
+    let (status, body) = delete(&engine, &cache, &cache.pack).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    stop(engine).await;
+    // The crash: the record is still there, the torrent and its data are not.
+    std::fs::write(cache.record(&cache.pack), &record).unwrap();
+
+    let engine = cache.start().await;
+    let entries = wait_for(&engine, &cache.dir, "the movie live", |e| settled(e, &cache.movie)).await;
+    assert_eq!(entry(&entries, &cache.pack).expect("listed, honestly")["state"], "waiting");
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+    let (status, _) = post(&engine, &cache.dir, "/cache/refetch", serde_json::json!({ "infoHash": cache.pack })).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = wait_for(&engine, &cache.dir, "the pack live", |e| settled(e, &cache.pack)).await;
+    assert_eq!(entry(&entries, &cache.pack).unwrap()["downloaded"], 0);
+    stop(engine).await;
+}
+
+/// The same through the restore path with the fastresume bitfield RETAINED: a
+/// set-aside torrent whose data went missing while it waited must not come
+/// back complete on the strength of the old bitfield.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_torrent_whose_data_is_gone_does_not_claim_to_be_complete() {
+    let cache = seeded_cache("restore-gone").await;
+    let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
+    cache.poison_without_copy(&cache.pack);
+    stop(cache.start().await).await;
+    std::fs::remove_dir_all(cache.dir.join(PACK)).unwrap();
+    assert!(cache.session().join(format!("{}.bitv", cache.pack)).exists(), "the old bitfield is still there");
+
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+    let engine = cache.start().await;
+    let entries = wait_for(&engine, &cache.dir, "the pack restored", |e| settled(e, &cache.pack)).await;
+    let pack = entry(&entries, &cache.pack).unwrap();
+    assert_eq!(pack["downloaded"], 0, "{pack}");
+    assert!(pack.get("issue").is_none(), "{pack}");
+    stop(engine).await;
+}
+
+/// A play of a set-aside hash racing its restore must leave ONE registration,
+/// in the record's folder, and the engine must keep looking for its files
+/// there (a wrong folder would show at once as "files missing").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_play_racing_the_restore_leaves_the_torrent_in_its_recorded_folder() {
+    let cache = seeded_cache("race").await;
+    let saved = std::fs::read(cache.saved(&cache.pack)).unwrap();
+    let odd = cache.dir.join("older-layout").join("pack-23");
+    std::fs::create_dir_all(odd.parent().unwrap()).unwrap();
+    std::fs::rename(cache.dir.join(PACK), &odd).unwrap();
+    cache.set_session_folder(&cache.pack, &odd);
+    cache.poison_without_copy(&cache.pack);
+    let engine = cache.start().await;
+    wait_for(&engine, &cache.dir, "the pack waiting", |e| entry(e, &cache.pack).is_some()).await;
+    std::fs::write(cache.saved(&cache.pack), &saved).unwrap();
+
+    let (restored, played, played_again) = tokio::join!(
+        engine.refetch(&cache.pack),
+        engine.add_blob(pack_torrent(), Pick::Files(vec![1])),
+        engine.add_blob(pack_torrent(), Pick::Files(vec![2])),
+    );
+    restored.unwrap();
+    played.unwrap();
+    played_again.unwrap();
+    let entries = wait_for(&engine, &cache.dir, "the pack live", |e| settled(e, &cache.pack)).await;
+    assert_eq!(entries.iter().filter(|e| e["infoHash"] == cache.pack.as_str()).count(), 1);
+    let pack = entry(&entries, &cache.pack).unwrap();
+    assert_eq!(engine.output_folder(&cache.pack), Some(odd.clone()), "the folder it really uses");
+    assert!(pack.get("issue").is_none(), "its files are found where they are: {pack}");
+    assert_eq!(pack["downloaded"], 2 * PIECE);
+    assert!(!cache.dir.join(PACK).exists(), "nothing was created in the default folder");
     stop(engine).await;
 }
 

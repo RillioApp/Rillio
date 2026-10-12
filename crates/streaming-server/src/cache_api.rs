@@ -42,10 +42,9 @@ pub(crate) struct CacheEntry {
     /// client reads the same verdict instead of re-deriving it from `state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<Issue>,
-    /// Why this entry cannot be removed from here, when it cannot: a
-    /// set-aside torrent whose data is not provably its own (see
-    /// `Engine::exclusive_data_folder`). Absent means removable. A client
-    /// offers no remove action it cannot carry out, and says why.
+    /// Why this entry cannot be removed, when it cannot: a torrent waiting to
+    /// be restored (the server deletes no data it cannot list). Absent means
+    /// removable. A client offers no remove action it cannot carry out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cannot_remove: Option<String>,
     pub pinned: bool,
@@ -320,7 +319,8 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
             state: "waiting".to_owned(),
             error: None,
             issue: derive_issue(Observed::SetAside(&record.reason)),
-            cannot_remove: engine.removal_refusal(&record),
+            // Never removable while set aside (see Engine::remove_gated).
+            cannot_remove: Some(Engine::SET_ASIDE_REMOVAL_REFUSAL.to_owned()),
             pinned: engine.is_pinned(&info_hash),
             watched: engine.is_watched(&info_hash),
             meta: engine.meta(&info_hash),
