@@ -4,7 +4,7 @@ import { FileDropProvider, useFileDrop, onFileDrop } from './FileDrop';
 import { FullscreenProvider, useFullscreen } from './Fullscreen';
 import { PlatformProvider, usePlatform } from './Platform';
 import { ToastProvider, useToast } from './Toast';
-import { ShortcutsProvider, useShortcuts, onShortcut } from './Shortcuts';
+import { ShortcutsProvider, useShortcuts, onShortcut, useExclusiveKeyboard } from './Shortcuts';
 import { DiscordProvider, useDiscord, EMPTY_DISCORD_TIMESTAMPS, getPlaybackDiscordActivity } from './Discord';
 import * as CONSTANTS from './CONSTANTS';
 import { withCoreSuspender, useCoreSuspender } from './CoreSuspender';
@@ -42,6 +42,7 @@ export {
     ShortcutsProvider,
     useShortcuts,
     onShortcut,
+    useExclusiveKeyboard,
     ToastProvider,
     useToast,
     DiscordProvider,

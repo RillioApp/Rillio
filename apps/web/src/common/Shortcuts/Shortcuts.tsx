@@ -1,6 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef } from 'react';
 import shortcuts from './shortcuts.json';
 
+const { dispatchShortcut } = require('./dispatchShortcut');
+
 const SHORTCUTS = shortcuts.map(({ shortcuts }) => shortcuts).flat();
 
 export type ShortcutName = string;
@@ -10,6 +12,7 @@ interface ShortcutsContext {
     grouped: ShortcutGroup[],
     on: (name: ShortcutName, listener: ShortcutListener) => void,
     off: (name: ShortcutName, listener: ShortcutListener) => void,
+    claimKeyboard: () => () => void,
 }
 
 const ShortcutsContext = createContext<ShortcutsContext>({} as ShortcutsContext);
@@ -32,31 +35,33 @@ const isInputFocused = () => {
 const ShortcutsProvider = ({ children, onShortcut }: Props) => {
     const listeners = useRef<Map<ShortcutName, Set<ShortcutListener>>>(new Map());
     const lastRepeatTime = useRef<Map<string, number>>(new Map());
+    const keyboardClaims = useRef<Set<object>>(new Set());
 
-    const onKeyDown = useCallback(({ ctrlKey, shiftKey, altKey, metaKey, code, key, repeat }: KeyboardEvent) => {
+    const onKeyDown = useCallback((event: KeyboardEvent) => {
         if (isInputFocused()) return;
 
-        if (repeat) {
+        if (event.repeat) {
             const now = Date.now();
-            const last = lastRepeatTime.current.get(code) ?? 0;
+            const last = lastRepeatTime.current.get(event.code) ?? 0;
             if (now - last < REPEAT_THROTTLE_MS) return;
-            lastRepeatTime.current.set(code, now);
+            lastRepeatTime.current.set(event.code, now);
         }
 
-        SHORTCUTS.forEach(({ name, combos }) => combos.forEach((keys) => {
-            const modifers = (keys.includes('Ctrl') === ctrlKey)
-                && (keys.includes('Shift') === shiftKey)
-                && !altKey
-                && !metaKey;
-
-            if (modifers && (keys.includes(code) || keys.includes(key.toUpperCase()))) {
-                const combo = combos.indexOf(keys);
-                listeners.current.get(name)?.forEach((listener) => listener(combo, key));
-
-                onShortcut(name as ShortcutName, combo, key);
-            }
-        }));
+        dispatchShortcut(SHORTCUTS, event, {
+            listeners: listeners.current,
+            onShortcut,
+            exclusive: keyboardClaims.current.size > 0,
+        });
     }, [onShortcut]);
+
+    // See useExclusiveKeyboard. Returns the release.
+    const claimKeyboard = () => {
+        const claim = {};
+        keyboardClaims.current.add(claim);
+        return () => {
+            keyboardClaims.current.delete(claim);
+        };
+    };
 
     const on = (name: ShortcutName, listener: ShortcutListener) => {
         !listeners.current.has(name) && listeners.current.set(name, new Set());
@@ -73,7 +78,7 @@ const ShortcutsProvider = ({ children, onShortcut }: Props) => {
     }, [onKeyDown]);
 
     return (
-        <ShortcutsContext.Provider value={{ grouped: shortcuts, on, off }}>
+        <ShortcutsContext.Provider value={{ grouped: shortcuts, on, off, claimKeyboard }}>
             {children}
         </ShortcutsContext.Provider>
     );
