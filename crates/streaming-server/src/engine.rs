@@ -972,6 +972,22 @@ fn prepare_session(session_dir: &Path) -> anyhow::Result<Prepared> {
             set_aside.push(record);
         }
     }
+
+    // Copies nothing refers to any more (an add that was cancelled before
+    // librqbit registered it). Only when session.json was actually read: with
+    // no index in hand, "nothing refers to it" is not a fact.
+    if db.is_some() {
+        if let Ok(listing) = std::fs::read_dir(session_dir.join(METADATA_COPY_DIR)) {
+            for entry in listing.flatten() {
+                let path = entry.path();
+                let Some(ih) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+                // A record on disk counts even when it could not be read.
+                if !in_session.contains(ih) && !record_path(session_dir, ih).exists() {
+                    remove_file_logged(&path);
+                }
+            }
+        }
+    }
     Ok(Prepared { set_aside, folders })
 }
 
@@ -1857,7 +1873,18 @@ impl Engine {
         let folder = output_folder.unwrap_or(listed.output_folder);
         opts.output_folder =
             Some(folder.to_str().context("the output folder is not valid unicode")?.to_owned());
-        let torrent_bytes = listed.torrent_bytes.clone();
+        // Our own copy of the metadata, whole or not at all, written BEFORE
+        // librqbit hears of the torrent (see the unrestorable-entry guard). Its
+        // own `<hash>.torrent` is opened with truncate and written after an
+        // await: an add cancelled in between (the request behind it went away)
+        // leaves that file empty with the torrent already registered, and the
+        // next selection change persists the entry. Measured: 1 in 400 adds
+        // cancelled part-way. With the copy on disk first, any entry librqbit
+        // can ever persist is one the next start can heal offline. Not fatal
+        // if it fails: a start backfills copies from librqbit's files.
+        if let Err(e) = write_durably(&metadata_copy_path(&self.session_dir, &info_hash), &listed.torrent_bytes) {
+            tracing::error!("add {info_hash}: keeping a copy of its metadata failed: {e:#}");
+        }
         // Metadata in hand, so this add never waits on the swarm: it only
         // registers, persists and starts the torrent.
         let resp = self
@@ -1868,13 +1895,6 @@ impl Engine {
         self.reject_if_unconfined(&handle).await?;
         if let Ok(mut folders) = self.folders.lock() {
             folders.insert(info_hash.clone(), folder);
-        }
-        // Our own copy of the metadata, whole or not at all (see the
-        // unrestorable-entry guard): what a later start heals from when
-        // librqbit's own file is found empty. Not fatal: the torrent is added,
-        // and the next start backfills the copy from librqbit's file.
-        if let Err(e) = write_durably(&metadata_copy_path(&self.session_dir, &info_hash), &torrent_bytes) {
-            tracing::error!("add {info_hash}: keeping a copy of its metadata failed: {e:#}");
         }
         self.stamp_added_if_new(&Self::info_hash_hex(&handle));
         Ok(handle)

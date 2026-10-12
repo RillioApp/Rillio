@@ -243,6 +243,58 @@ async fn seed_a_dev_cache_in_the_field_entrys_state() {
     println!("seeded {target:?}: pack {} (poisoned), movie {}", cache.pack, cache.movie);
 }
 
+/// Measurement: can an add that is CANCELLED part-way (its future dropped, as
+/// when the HTTP client behind it goes away) leave librqbit's `<hash>.torrent`
+/// empty? librqbit opens that file with truncate and only then writes it, with
+/// an await in between. Prints how many of the cancelled adds left a 0-byte
+/// file, and how many of those torrents ended up in the session anyway.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "measurement of how the poisoned state gets created"]
+async fn measure_cancelled_adds_leaving_an_empty_saved_torrent() {
+    let dir = std::env::temp_dir().join("rillio-restore-cancelled-adds");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let engine = Engine::new(dir.clone()).await.unwrap();
+    let runs = 400u64;
+    for i in 0..runs {
+        let name = format!("Cancelled.Add.{i:04}.mkv");
+        let mut info = Vec::new();
+        info.extend_from_slice(format!("d6:lengthi{}e", PIECE).as_bytes());
+        info.extend_from_slice(format!("4:name{}:{name}", name.len()).as_bytes());
+        info.extend_from_slice(format!("12:piece lengthi{PIECE}e").as_bytes());
+        info.extend_from_slice(b"6:pieces20:");
+        info.extend_from_slice(&[0u8; 20]);
+        info.extend_from_slice(b"e");
+        let blob = bencode_torrent(info);
+        // Dropped after 0 to ~2 ms: somewhere inside the add.
+        let _ = tokio::time::timeout(
+            Duration::from_micros(i * 5),
+            engine.add_blob(blob, Pick::Files(vec![0])),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let managed: Vec<String> = engine.all().iter().map(Engine::info_hash_hex).collect();
+    let mut empty = 0;
+    let mut empty_and_managed = 0;
+    for entry in std::fs::read_dir(dir.join("session")).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("torrent") && entry.metadata().unwrap().len() == 0 {
+            empty += 1;
+            let ih = path.file_stem().unwrap().to_string_lossy().into_owned();
+            if managed.contains(&ih) {
+                empty_and_managed += 1;
+            }
+        }
+    }
+    println!(
+        "{runs} adds cancelled part-way: {empty} left a 0-byte <hash>.torrent; \
+         {empty_and_managed} of those torrents are in the session ({} managed in all)",
+        managed.len()
+    );
+    stop(engine).await;
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap().flatten() {
