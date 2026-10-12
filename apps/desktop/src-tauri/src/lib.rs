@@ -569,6 +569,7 @@ pub fn run() {
             restart_app,
             snapshot_storage,
             streaming_server_url,
+            streaming_server_problem,
             server_request,
             shell::shell_init,
             shell::shell_send,
@@ -1953,8 +1954,12 @@ pub struct ServerState {
 
 /// `None` until the bind completes. Every reader clones the `Arc` out and drops
 /// the lock immediately, so nothing ever holds it across an await.
+///
+/// The second field is WHY there is no server yet, once there is something to
+/// say (a failed start, a start that is taking long): the web shows it instead
+/// of a bare "not reachable" (see [`streaming_server_problem`]).
 #[derive(Default)]
-pub struct ServerHandle(Mutex<Option<std::sync::Arc<ServerState>>>);
+pub struct ServerHandle(Mutex<Option<std::sync::Arc<ServerState>>>, Mutex<Option<String>>);
 
 impl ServerHandle {
     pub fn get(&self) -> Option<std::sync::Arc<ServerState>> {
@@ -1963,7 +1968,25 @@ impl ServerHandle {
 
     fn set(&self, state: ServerState) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(state));
+        self.set_problem(None);
     }
+
+    pub fn problem(&self) -> Option<String> {
+        self.1.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_problem(&self, problem: Option<String>) {
+        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = problem;
+    }
+}
+
+/// Why the streaming server is not up, or `None` when it is up or simply still
+/// inside a normal start. The web asks this when its wait for
+/// [`streaming_server_url`] runs out, so the Cache window can say what is
+/// wrong rather than only that something is.
+#[tauri::command]
+fn streaming_server_problem(state: tauri::State<'_, ServerHandle>) -> Option<String> {
+    state.problem()
 }
 
 /// Where the streaming server actually is, or `None` while it is still binding.
@@ -2178,6 +2201,17 @@ fn is_raw_stream_path(path: &str) -> bool {
     )
 }
 
+/// How many times a failed streaming-server start is attempted in all (2, 4,
+/// 8 and 16 s apart).
+const SERVER_START_ATTEMPTS: u32 = 5;
+
+/// When a start that has not finished is journaled as slow.
+const SERVER_START_SLOW_AFTER: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(300),
+];
+
 /// Spawn the embedded streaming server on Tauri's async (tokio) runtime. It
 /// binds 127.0.0.1:11470 (an ephemeral port if that is refused) and owns the
 /// torrent cache (see `default_cache_dir`).
@@ -2213,21 +2247,96 @@ fn start_streaming_server(app: &tauri::AppHandle) {
     // advertised URL the same way here rather than assuming loopback.
     let mut advertised = config.base_url.clone();
     let app_handle = app.clone();
+    // The start is journaled end to end. tracing has no file sink in a release
+    // build, so before this a server that failed to start, or never finished
+    // starting, left NOTHING behind: the app just ran for its whole life with
+    // "The streaming service is not reachable" (2026-10-12). The boot journal
+    // is the shell's one durable log.
+    let identifier = app.config().identifier.clone();
+    let started = std::time::Instant::now();
+    boot_journal_append(
+        &identifier,
+        &format!("server-start pid={} cache={:?}", std::process::id(), config.cache_root),
+    );
+    // A start that is still running long after it should be done is worth a
+    // line (and a reason for the web) even though nothing has failed: the
+    // start awaits the torrent session's restore, which is the one step with
+    // no deadline of its own.
+    {
+        let app_handle = app.clone();
+        let identifier = identifier.clone();
+        tauri::async_runtime::spawn(async move {
+            for waited in SERVER_START_SLOW_AFTER {
+                tokio::time::sleep(waited.saturating_sub(started.elapsed())).await;
+                let handle = app_handle.state::<ServerHandle>();
+                if handle.get().is_some() {
+                    return;
+                }
+                boot_journal_append(
+                    &identifier,
+                    &format!("server-slow still starting after_ms={}", started.elapsed().as_millis()),
+                );
+                if handle.problem().is_none() {
+                    handle.set_problem(Some(format!(
+                        "the streaming server is still starting after {} s (restoring the torrent session)",
+                        started.elapsed().as_secs()
+                    )));
+                }
+            }
+        });
+    }
     tauri::async_runtime::spawn(async move {
         use tauri::Emitter;
-        // Contract: the web app listens for the Tauri event
-        // "streaming-server-error" (payload: the error string) so it can toast
-        // that the local streaming server failed. Without this the failure is
-        // only logged and invisible to the user.
-        let (addr, engine, router, serving) = match rillio_streaming_server::bind_and_serve(config).await {
-            Ok(parts) => parts,
-            Err(e) => {
-                let msg = e.to_string();
-                tracing::error!("embedded streaming server could not start: {msg}");
-                let _ = app_handle.emit("streaming-server-error", msg);
-                return;
+        // A failed start is retried a few times, spaced out: what fails here
+        // is the environment (a port, a socket, a file another process still
+        // holds while it exits), and that can clear. Every attempt is
+        // journaled; the last failure is final and says so.
+        let mut attempt = 1u32;
+        let (addr, engine, router, serving) = loop {
+            match rillio_streaming_server::bind_and_serve(config.clone()).await {
+                Ok(parts) => break parts,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let last = attempt == SERVER_START_ATTEMPTS;
+                    tracing::error!(
+                        "embedded streaming server could not start (attempt {attempt}/{SERVER_START_ATTEMPTS}): {msg}"
+                    );
+                    boot_journal_append(
+                        &identifier,
+                        &format!(
+                            "server-failed attempt={attempt}/{SERVER_START_ATTEMPTS} after_ms={} final={last} error={msg:?}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                    app_handle.state::<ServerHandle>().set_problem(Some(if last {
+                        format!("the streaming server could not start: {msg}")
+                    } else {
+                        format!("the streaming server could not start (trying again): {msg}")
+                    }));
+                    if last {
+                        // Contract: the web app listens for the Tauri event
+                        // "streaming-server-error" (payload: the error string)
+                        // so it can toast that the local streaming server
+                        // failed. The event is lost if the webview is not up
+                        // yet, which is why the reason is also kept for
+                        // `streaming_server_problem`.
+                        let _ = app_handle.emit("streaming-server-error", msg);
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                    attempt += 1;
+                }
             }
         };
+        boot_journal_append(
+            &identifier,
+            &format!(
+                "server-up port={} attempt={attempt} after_ms={} torrents={}",
+                addr.port(),
+                started.elapsed().as_millis(),
+                engine.all().len()
+            ),
+        );
         if advertised.set_port(Some(addr.port())).is_err() {
             tracing::error!("streaming server base url {advertised} cannot carry a port");
             let _ = app_handle.emit("streaming-server-error", "base url cannot carry a port");
