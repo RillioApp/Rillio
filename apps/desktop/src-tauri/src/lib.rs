@@ -2201,9 +2201,12 @@ fn is_raw_stream_path(path: &str) -> bool {
     )
 }
 
-/// How many times a failed streaming-server start is attempted in all (2, 4,
-/// 8 and 16 s apart).
+/// How many quick attempts a failed streaming-server start gets (2, 4, 8 and
+/// 16 s apart) before the user is told and the retry slows down.
 const SERVER_START_ATTEMPTS: u32 = 5;
+
+/// How often the start is tried again after the quick attempts are used up.
+const SERVER_START_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// When a start that has not finished is journaled as slow.
 const SERVER_START_SLOW_AFTER: [std::time::Duration; 3] = [
@@ -2287,33 +2290,36 @@ fn start_streaming_server(app: &tauri::AppHandle) {
     }
     tauri::async_runtime::spawn(async move {
         use tauri::Emitter;
-        // A failed start is retried a few times, spaced out: what fails here
-        // is the environment (a port, a socket, a file another process still
-        // holds while it exits), and that can clear. Every attempt is
-        // journaled; the last failure is final and says so.
+        // A failed start is retried: what fails here is the environment (a
+        // port, a socket, a file another process still holds while it exits),
+        // and that can clear. The first SERVER_START_ATTEMPTS come quickly (2,
+        // 4, 8, 16 s apart); after them the user is told once and the start
+        // keeps being tried every SERVER_START_RETRY_EVERY for as long as the
+        // app runs, so the server comes up on its own the moment whatever was
+        // in its way is gone. Every quick attempt is journaled, the slow ones
+        // when their error changes.
         let mut attempt = 1u32;
+        let mut journaled: Option<String> = None;
         let (addr, engine, router, serving) = loop {
             match rillio_streaming_server::bind_and_serve(config.clone()).await {
                 Ok(parts) => break parts,
                 Err(e) => {
                     let msg = e.to_string();
-                    let last = attempt == SERVER_START_ATTEMPTS;
-                    tracing::error!(
-                        "embedded streaming server could not start (attempt {attempt}/{SERVER_START_ATTEMPTS}): {msg}"
-                    );
-                    boot_journal_append(
-                        &identifier,
-                        &format!(
-                            "server-failed attempt={attempt}/{SERVER_START_ATTEMPTS} after_ms={} final={last} error={msg:?}",
-                            started.elapsed().as_millis()
-                        ),
-                    );
-                    app_handle.state::<ServerHandle>().set_problem(Some(if last {
-                        format!("the streaming server could not start: {msg}")
-                    } else {
-                        format!("the streaming server could not start (trying again): {msg}")
-                    }));
-                    if last {
+                    tracing::error!("embedded streaming server could not start (attempt {attempt}): {msg}");
+                    if attempt <= SERVER_START_ATTEMPTS || journaled.as_deref() != Some(msg.as_str()) {
+                        boot_journal_append(
+                            &identifier,
+                            &format!(
+                                "server-failed attempt={attempt} after_ms={} error={msg:?}",
+                                started.elapsed().as_millis()
+                            ),
+                        );
+                        journaled = Some(msg.clone());
+                    }
+                    app_handle
+                        .state::<ServerHandle>()
+                        .set_problem(Some(format!("the streaming server could not start (still trying): {msg}")));
+                    if attempt == SERVER_START_ATTEMPTS {
                         // Contract: the web app listens for the Tauri event
                         // "streaming-server-error" (payload: the error string)
                         // so it can toast that the local streaming server
@@ -2321,9 +2327,13 @@ fn start_streaming_server(app: &tauri::AppHandle) {
                         // yet, which is why the reason is also kept for
                         // `streaming_server_problem`.
                         let _ = app_handle.emit("streaming-server-error", msg);
-                        return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                    let wait = if attempt < SERVER_START_ATTEMPTS {
+                        std::time::Duration::from_secs(1 << attempt)
+                    } else {
+                        SERVER_START_RETRY_EVERY
+                    };
+                    tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
             }

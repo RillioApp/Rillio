@@ -98,7 +98,7 @@ pub(crate) fn derive_issue(observed: Observed<'_>) -> Option<Issue> {
         Observed::SetAside(reason) => Some(Issue {
             kind: "metadata-missing",
             reason: if reason.is_empty() {
-                "its saved details were lost; waiting to get them again".to_owned()
+                "Its saved details were lost. Waiting to get them again.".to_owned()
             } else {
                 reason.to_owned()
             },

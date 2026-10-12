@@ -938,7 +938,7 @@ fn prepare_session(session_dir: &Path) -> anyhow::Result<Prepared> {
                          ours; setting it aside so it cannot hold up the engine. Its files and \
                          progress on disk are kept and it is restored in the background."
                     );
-                    parsed.reason = "its saved details were lost; waiting to get them again from other peers".into();
+                    parsed.reason = "Its saved details were lost. Waiting to get them again from other peers.".into();
                     // Durable BEFORE the entry leaves session.json (below).
                     write_durably(&record_path(session_dir, &ih), &serde_json::to_vec(&parsed)?)
                         .with_context(|| format!("recording {ih} as set aside"))?;

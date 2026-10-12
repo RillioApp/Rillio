@@ -227,11 +227,15 @@ async fn seed_a_dev_cache_in_the_field_entrys_state() {
         })),
     );
     stop(engine).await;
+    let metadata = std::fs::read(cache.saved(&cache.pack)).unwrap();
     cache.poison_without_copy(&cache.pack);
 
     // The session stores absolute folders: rebase them onto the target.
     let _ = std::fs::remove_dir_all(&target);
     copy_tree(&cache.dir, &target);
+    // Beside the cache, for standing in for "a peer delivered it": copy this
+    // over session/<pack hash>.torrent and press Fetch again.
+    std::fs::write(target.with_extension("pack-metadata.torrent"), metadata).unwrap();
     let db_path = target.join("session").join("session.json");
     let (from, to) = (cache.dir.to_string_lossy().into_owned(), target.to_string_lossy().into_owned());
     let mut db: Value = serde_json::from_slice(&std::fs::read(&db_path).unwrap()).unwrap();

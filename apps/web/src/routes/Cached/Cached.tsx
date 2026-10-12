@@ -567,7 +567,7 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                     // under way) where the bytes and state would be: byte counts
                     // for a torrent the engine is not running would be invented.
                         issue !== undefined ?
-                            <div className="mt-1 truncate text-xs text-fg-muted" title={issue.reason}>
+                            <div className="mt-1 line-clamp-2 text-xs text-fg-muted first-letter:uppercase" title={issue.reason}>
                                 {refetching ? 'Fetching again, this can take a few minutes' : issue.reason}
                             </div>
                             :
@@ -627,7 +627,10 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                 {
                 // The two ways out of an issue, revealed on hover like the other
                 // row actions: try again to get what is missing, or go and pick
-                // another source for the same title.
+                // another source for the same title. Unlike the other hover
+                // actions these take no room until they show: two labeled pills
+                // reserved at rest would squeeze the title and the reason, which
+                // are the point of this row, into a few words.
                     issue !== undefined ?
                         <>
                             <Button
@@ -638,7 +641,7 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                                 title="Try now to get what this download is missing. What is already on disk is kept."
                                 className={cn(
                                     'shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg',
-                                    refetching ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                                    refetching ? 'inline-flex' : 'hidden group-hover:inline-flex',
                                 )}
                             >
                                 {refetching ? 'Fetching' : 'Fetch again'}
@@ -650,7 +653,7 @@ const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, o
                                         size="sm"
                                         onClick={() => onMoreInfo(similarLink)}
                                         title="Open this title and pick another source for it"
-                                        className="shrink-0 bg-surface px-3.5 text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100"
+                                        className="hidden shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg group-hover:inline-flex"
                                     >
                                         Find another source
                                     </Button>
