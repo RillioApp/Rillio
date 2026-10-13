@@ -74,6 +74,10 @@ pub mod upnp_server_adapter;
 #[cfg(feature = "watch")]
 pub mod watch;
 
+// RILLIO (vendor/README-RILLIO.md): the test hook that models a held connect().
+#[doc(hidden)]
+pub use stream_connect::test_hooks as rillio_test_hooks;
+
 pub use api::Api;
 pub use api_error::ApiError;
 pub use create_torrent_file::{create_torrent, CreateTorrentOptions};
