@@ -55,6 +55,23 @@ To inspect the running shell (its real DOM/console, the only way to settle bugs
 that do not reproduce in a browser), launch with `RILLIO_DEVTOOLS_PORT=9222` and
 drive CDP over `ws://127.0.0.1:9222`. Off unless the env var is set.
 
+**Two runtimes, on purpose.** The streaming engine runs on its own tokio runtime
+(`engine_runtime` in `src/lib.rs`, threads named `rillio-engine`); Tauri's runtime
+(threads `tokio-rt-worker`) runs every async command, which includes ALL window
+commands (drag, minimize, maximize, close). Nothing the engine does may run on
+Tauri's runtime: reach the engine through `server_request` (it hops) or
+`ServerState.runtime`. The reason is the 2026-10-13 incident: a socket filter
+(AdGuard's driver, service running) holds every non-blocking `connect()` for
+the whole TCP handshake, 20 s for a dead peer; the engine's dials parked all 28
+workers of the then shared runtime and the window took 20 s to react to its
+title bar. To reproduce that class without such a filter, launch a dev shell
+(or the standalone server) with `RILLIO_HOLD_CONNECT_MS=20000`: every outgoing
+peer dial is then held that long on the thread that issues it (off unless set;
+`crates/streaming-server/tests/held_connect.rs` is the automated form, and
+`crates/streaming-server/vendor/README-RILLIO.md` has the measurements). Held
+dials cannot be cancelled, so with such a filter a closed Rillio can stay in
+the process list for up to 20 s.
+
 ### Dev-loop gotcha: stale WebView2 cache (bites constantly)
 
 Webpack prefixes asset URLs with the **git commit hash**, so rebuilding at the

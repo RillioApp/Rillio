@@ -15,7 +15,7 @@ librqbit = { path = "vendor/librqbit" }
 name = "rillio-streaming-server"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89" # std::fs::File::try_lock (the one-engine-per-cache lock)
 license = "gpl-2.0"
 description = "Auditable Rust replacement for the Stremio streaming server (server.js)"
 

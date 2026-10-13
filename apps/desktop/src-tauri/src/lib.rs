@@ -2048,7 +2048,59 @@ async fn server_request(
         .get()
         .ok_or_else(|| "server_request: the streaming server has not bound yet".to_string())?;
     let router = server.router.clone();
-    dispatch_server_request(router, method, path, body).await
+    dispatch_on_engine_runtime(&server.runtime, router, method, path, body).await
+}
+
+/// The runtime the streaming engine lives on, and nothing else does.
+///
+/// The engine used to share Tauri's async runtime, which also runs every async
+/// command: `server_request`, and ALL of Tauri's window commands (drag,
+/// minimize, maximize, close are `async fn`s in tauri's window plugin). Then a
+/// user's machine showed what sharing costs (2026-10-13): AdGuard's socket
+/// driver held each non-blocking `connect()` for the whole handshake, 20 s for
+/// a dead address; the engine dials dead torrent peers constantly; all 28
+/// workers sat parked inside the kernel (28 threads in `Wait:Executive`, CPU
+/// near zero) and the window took seconds to react to its own title bar while
+/// its message loop answered in half a millisecond.
+///
+/// The engine no longer issues that call from a worker (vendored librqbit,
+/// `stream_connect`), but trackers, UPnP, the proxy and subtitle routes all
+/// make outgoing connections of their own, and the next thing to block a
+/// worker may not be a connect at all. So the boundary is structural: whatever
+/// the engine and its routes do, they do it here, and the runtime that serves
+/// the window cannot be starved by it.
+///
+/// Never dropped: the process exits through `std::process::exit`, and dropping
+/// a runtime would wait for whatever its threads are stuck in.
+pub(crate) fn engine_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("rillio-engine")
+            .build()
+            .expect("the streaming engine's runtime could not be built")
+    })
+}
+
+/// Run one control-plane request ON THE ENGINE'S RUNTIME and await its answer
+/// from wherever the caller is.
+///
+/// Dispatching into the router inline would run the route (and everything it
+/// spawns: an add spawns the torrent's tasks with `tokio::spawn`, which lands
+/// on the CURRENT runtime) on the caller's runtime, i.e. Tauri's. The hop is
+/// what keeps engine work on [`engine_runtime`].
+async fn dispatch_on_engine_runtime(
+    engine: &tokio::runtime::Handle,
+    router: rillio_streaming_server::axum::Router,
+    method: String,
+    path: String,
+    body: Option<String>,
+) -> Result<ServerResponse, String> {
+    engine
+        .spawn(dispatch_server_request(router, method, path, body))
+        .await
+        .map_err(|e| format!("server_request: the request's task on the engine runtime failed: {e}"))?
 }
 
 /// The body of [`server_request`], separated from Tauri's state extraction so
@@ -2288,7 +2340,10 @@ fn start_streaming_server(app: &tauri::AppHandle) {
             }
         });
     }
-    tauri::async_runtime::spawn(async move {
+    // On the engine's own runtime, NOT Tauri's (see `engine_runtime`): the
+    // engine, its sweepers, the socket and every task they spawn inherit the
+    // runtime this start runs on.
+    engine_runtime().spawn(async move {
         use tauri::Emitter;
         // A failed start is retried: what fails here is the environment (a
         // port, a socket, a file another process still holds while it exits),
@@ -2363,8 +2418,9 @@ fn start_streaming_server(app: &tauri::AppHandle) {
             router,
             base_url,
             port: addr.port(),
-            // The runtime this task is running on is the one the engine's
-            // background work lives on; the mpv byte plane blocks on it.
+            // The runtime this task is running on (`engine_runtime`) is the
+            // one the engine's background work lives on; the mpv byte plane
+            // blocks on it and `server_request` hops onto it.
             runtime: tokio::runtime::Handle::current(),
         });
 
@@ -2499,6 +2555,58 @@ mod tests {
             .expect("engine");
         let router = rillio_streaming_server::router(config, engine);
         (rt, router)
+    }
+
+    /// Whatever a route does to its thread, it does it to the ENGINE's
+    /// runtime, never to the runtime `server_request` was called on (Tauri's,
+    /// which also runs every window command). The route here holds its thread
+    /// the way a filtered `connect()` held the engine's workers (2026-10-13);
+    /// the caller's runtime has ONE worker, so a request dispatched inline
+    /// would freeze it for the whole hold.
+    #[test]
+    fn a_route_that_holds_its_thread_does_not_hold_the_callers_runtime() {
+        use rillio_streaming_server::axum::{routing::get, Router};
+        use std::time::{Duration, Instant};
+
+        const HOLD: Duration = Duration::from_millis(1_500);
+        let one_worker = || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build runtime")
+        };
+        let (ui, engine) = (one_worker(), one_worker());
+        let router = Router::new().route(
+            "/held",
+            get(|| async {
+                std::thread::sleep(HOLD);
+                "done"
+            }),
+        );
+        let engine_handle = engine.handle().clone();
+        let (worst, answer) = ui.block_on(async move {
+            let request = tokio::spawn(async move {
+                dispatch_on_engine_runtime(&engine_handle, router, "GET".into(), "/held".into(), None).await
+            });
+            // Stand-in for window commands arriving meanwhile: each is a task
+            // on the caller's runtime that must run promptly.
+            let started = Instant::now();
+            let mut worst = Duration::ZERO;
+            while started.elapsed() < HOLD {
+                let asked = Instant::now();
+                tokio::spawn(async {}).await.expect("the stand-in command ran");
+                worst = worst.max(asked.elapsed());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            (worst, request.await.expect("the request task"))
+        });
+        assert_eq!(answer.expect("GET /held").body, "done");
+        assert!(
+            worst < Duration::from_millis(300),
+            "a task on the caller's runtime waited {worst:?} while a route held its thread: \
+             the request ran on the caller's runtime instead of the engine's"
+        );
     }
 
     /// The IPC transport is a real request against the real router: same
