@@ -1216,6 +1216,22 @@ impl Engine {
     pub async fn new(cache_dir: PathBuf) -> anyhow::Result<Self> {
         let cache_root = storage::absolutize(&cache_dir)?;
 
+        // DIAGNOSIS AID, off unless RILLIO_HOLD_CONNECT_MS is a positive number:
+        // every outgoing peer dial then sleeps that many milliseconds on the
+        // thread that issues its connect(), which is what a kernel socket filter
+        // holding the call does to it (AdGuard's socket driver, 2026-10-13: 20 s
+        // per dead address). It lets a dev shell or the standalone server be
+        // measured under held dials on a machine that has no such filter. See
+        // tests/held_connect.rs for the automated form.
+        if let Some(ms) = std::env::var("RILLIO_HOLD_CONNECT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+        {
+            tracing::warn!("RILLIO_HOLD_CONNECT_MS={ms}: every outgoing peer dial is held {ms} ms (diagnosis aid)");
+            librqbit::rillio_test_hooks::hold_outgoing_connects(Duration::from_millis(ms));
+        }
+
         // Bring-your-own SOCKS5 proxy (privacy): peers see the proxy's IP, not
         // yours. Off unless RILLIO_SOCKS_PROXY is set. NOTE: we never ship a
         // curated proxy list - a stranger's free proxy sees your IP + all traffic
