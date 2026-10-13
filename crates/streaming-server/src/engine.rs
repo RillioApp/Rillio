@@ -426,6 +426,47 @@ pub struct Engine {
     /// in-memory reason of a failed restore (record files are written once and
     /// never rewritten, so there is no late write to race a removal).
     gate: Arc<tokio::sync::Mutex<()>>,
+    /// ONE ENGINE PER CACHE. The exclusive lock on `session/engine.lock`,
+    /// taken by [`Engine::new`] before it reads or rewrites anything and held
+    /// until the session is stopped (in practice: until the process is gone,
+    /// the operating system drops it with the handle).
+    ///
+    /// Two engines on one cache was not hypothetical (2026-10-13 18:14 and
+    /// 18:28, and earlier days): a relaunch while the previous process was
+    /// still exiting started a second full instance, whose engine restored
+    /// the same `session.json` on another port. Each engine rewrites that
+    /// index and the fastresume bitfields from its OWN memory, so the last
+    /// writer silently drops what the other added or removed, and both write
+    /// piece data into the same files. With the lock the second engine does
+    /// not start: `Engine::new` fails with the reason, and the embedder
+    /// retries until the first one has let go.
+    ///
+    /// `None` for an engine built around a session it did not open
+    /// ([`Engine::from_session`], tests).
+    cache_lock: Arc<Mutex<Option<std::fs::File>>>,
+}
+
+/// Take the cache's engine lock (see [`Engine::cache_lock`]), or say who has it.
+fn lock_cache(session_dir: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(session_dir).with_context(|| format!("creating {session_dir:?}"))?;
+    let path = session_dir.join("engine.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening the cache lock {path:?}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another Rillio is still using this cache ({}); the streaming engine starts once it has exited",
+            session_dir.parent().unwrap_or(session_dir).display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking the cache lock {path:?}"))
+        }
+    }
 }
 
 /// Filename of the persisted pin set, under the cache root.
@@ -1311,6 +1352,10 @@ impl Engine {
             ..Default::default()
         };
         let session_dir = cache_dir.join("session");
+        // Before ANYTHING below reads or rewrites the cache's index: the guards
+        // that follow already rewrite `session.json` and delete fastresume
+        // files, which must not happen under a running engine's feet.
+        let cache_lock = lock_cache(&session_dir)?;
         // Entries librqbit could only restore as a bare magnet must be out of
         // its sight BEFORE the session is built: it awaits every restore, and
         // a magnet nobody serves never finishes.
@@ -1326,6 +1371,19 @@ impl Engine {
         invalidate_stale_fastresume(&session_dir);
         let session = Session::new_with_opts(cache_dir, opts).await?;
         let mut engine = Self::from_session(session, cache_root);
+        engine.cache_lock = Arc::new(Mutex::new(Some(cache_lock)));
+        {
+            // The lock belongs to the running session, not to the last clone of
+            // this handle (the sweepers keep clones for good): a stopped
+            // session no longer touches the cache, so another engine may open
+            // it (a restart inside one process, as the tests do).
+            let held = engine.cache_lock.clone();
+            let stop = engine.session.cancellation_token().clone();
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                held.lock().unwrap_or_else(|e| e.into_inner()).take();
+            });
+        }
         engine.set_aside_at_start =
             Arc::new(prepared.set_aside.iter().map(|entry| entry.info_hash.clone()).collect());
         engine.unrestored = Arc::new(Mutex::new(
@@ -1594,6 +1652,7 @@ impl Engine {
             session_dir: Arc::new(cache_root_session),
             unrestored: Arc::new(Mutex::new(HashMap::new())),
             gate: Arc::new(tokio::sync::Mutex::new(())),
+            cache_lock: Arc::new(Mutex::new(None)),
         }
     }
 
