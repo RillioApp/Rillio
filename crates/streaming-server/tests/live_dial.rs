@@ -1,12 +1,12 @@
 //! An outgoing dial reaches a peer that IS there, and what arrives is a
 //! BitTorrent handshake.
 //!
-//! The engine's dials do not go through tokio's `TcpStream::connect` any more
-//! (vendor/README-RILLIO.md, change 2: on Windows an overlapped `ConnectEx`
-//! awaited on the blocking pool; elsewhere tokio's connect with its first poll
-//! on the blocking pool). `held_connect.rs` pins what that buys; this pins
-//! that the connection it produces still works end to end: connected, usable
-//! for writes from the runtime, and closed cleanly.
+//! The engine's dials do not simply await tokio's `TcpStream::connect` any more
+//! (vendor/README-RILLIO.md, change 2: the first poll of the connect future,
+//! the one that issues `connect()`, runs on the blocking pool and the future is
+//! then handed back). `held_connect.rs` pins what that buys; this pins that the
+//! connection it produces still works end to end: connected, and usable for
+//! writes from the runtime.
 
 use std::time::Duration;
 

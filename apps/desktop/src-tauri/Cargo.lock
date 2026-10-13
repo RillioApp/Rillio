@@ -2631,7 +2631,6 @@ dependencies = [
  "serde_urlencoded",
  "serde_with",
  "size_format",
- "socket2",
  "tokio",
  "tokio-socks",
  "tokio-stream",
@@ -2641,7 +2640,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
