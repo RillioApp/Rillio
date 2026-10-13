@@ -9,10 +9,15 @@ changes. `[patch.crates-io]` in `crates/streaming-server/Cargo.toml` and in
 ### Change 2: outgoing dials do not issue `connect()` from a runtime worker
 
 `src/stream_connect.rs`, `StreamConnector::connect` now goes through
-`dial_off_the_workers`: the first poll of tokio's connect future, the one that
-issues the non-blocking `connect()` system call, runs on the blocking pool
-(bounded by `DIAL_SLOTS`, a quarter of the pool); the future is then awaited
-on the worker as before. `src/lib.rs` re-exports `stream_connect::test_hooks`
+`dial_off_the_workers`, bounded by `DIAL_SLOTS` (half the blocking pool):
+
+- on Windows the dial is an overlapped `ConnectEx`, awaited on a blocking-pool
+  thread in an ordinary wait that the caller's timeout ends (`mod overlapped`);
+- elsewhere it is tokio's own connect, with its first poll (the one that
+  issues the non-blocking `connect()` call) run on the blocking pool.
+
+`Cargo.toml` gains `socket2` and `windows-sys` for Windows (both already in
+the tree through tokio). `src/lib.rs` re-exports `stream_connect::test_hooks`
 as `rillio_test_hooks` (hidden), which lets a test hold every dial the way a
 filter does.
 
@@ -26,8 +31,18 @@ all 28 workers of the runtime were parked inside the kernel
 answered, and in the desktop shell, where the engine shared Tauri's runtime,
 every window command waited too.
 
+Why `ConnectEx` on Windows and not just "off the workers": a thread inside the
+held call cannot be got out of it (`CancelSynchronousIo`, `CancelIoEx` and
+closing the socket from another thread all left it held the full 20 s), and a
+process does not finish exiting while it has such threads (8 held dials: gone
+20,088 ms after `ExitProcess`), which is how a closed Rillio stayed alive,
+holding its port and its WebView2 profile, when the next one was launched.
+The same filter does not hold `ConnectEx`: 1.2 ms to start a dial, and a
+process with 16 in flight exits at once (all measured 2026-10-13).
+
 `tests/held_connect.rs` fails (a timer 48 s late on a two-worker runtime) if
-the call goes back onto the workers.
+the call goes back onto the workers; `tests/live_dial.rs` pins that a dial
+still reaches a listening peer with a handshake.
 
 ### Change 1: the selection deadlock
 

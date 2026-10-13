@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -96,39 +97,235 @@ impl StreamConnector {
 /// default.
 const BLOCKING_POOL_THREADS: usize = 512;
 
-/// How many dials may have their `connect()` call in flight at once: a quarter
-/// of the blocking pool. Each one occupies a pool thread for as long as the
-/// call is held (nothing on a healthy machine, the whole handshake under a
-/// filter), and the pool is also what file I/O and DNS run on, so dials never
-/// get more than a fixed share of it. A dial that finds no slot waits for one
-/// inside its caller's connect timeout.
-const DIAL_SLOTS: usize = BLOCKING_POOL_THREADS / 4;
+/// How many dials may be in flight on the blocking pool at once: half of it.
+/// Each one occupies a pool thread (on Windows for the length of its
+/// handshake, elsewhere for the length of its `connect()` call), and the pool
+/// is also what file I/O and DNS run on, so dials never get more than a fixed
+/// share of it. A dial that finds no slot waits for one inside its caller's
+/// connect timeout.
+const DIAL_SLOTS: usize = BLOCKING_POOL_THREADS / 2;
 
 fn dial_slots() -> Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOTS.get_or_init(|| Arc::new(Semaphore::new(DIAL_SLOTS))).clone()
 }
 
-/// RILLIO (see vendor/README-RILLIO.md). `TcpStream::connect`, except that the
-/// `connect()` system call is not issued from a runtime worker thread.
+/// RILLIO (see vendor/README-RILLIO.md). An outgoing TCP connection whose
+/// `connect()` is never issued from a runtime worker thread, and on Windows is
+/// never the non-blocking `connect()` call at all.
 ///
-/// tokio issues the call on the first poll of the connect future, on whichever
-/// worker polls it, trusting a non-blocking `connect()` to return at once. A
-/// kernel socket filter can break that promise: with AdGuard's socket driver
-/// the call was held for the whole TCP handshake, 20 s for an address nobody
-/// answers (measured 2026-10-13: 20,007 ms then `WSAEWOULDBLOCK`, 0.1 ms with
-/// the filter off). A live torrent dials up to 128 peers, so every worker of
-/// the runtime ended up parked inside the kernel and nothing else on it ran.
+/// tokio issues that call on the first poll of its connect future, on
+/// whichever worker polls it, trusting a non-blocking `connect()` to return at
+/// once. A kernel socket filter can break that promise: with AdGuard's socket
+/// driver the call was held for the whole TCP handshake, 20 s for an address
+/// nobody answers (measured 2026-10-13: 20,007 ms then `WSAEWOULDBLOCK`,
+/// 0.1 ms with the filter off). A live torrent dials up to 128 peers, so every
+/// worker of the runtime ended up parked inside the kernel and nothing else on
+/// it ran. Worse, a thread inside that call cannot be got out of it:
+/// `CancelSynchronousIo`, `CancelIoEx` and closing the socket from another
+/// thread all left it held its full 20 s, and a process with such threads does
+/// not finish exiting until they return (8 held dials: gone 20,088 ms after
+/// `ExitProcess`).
 ///
-/// So the FIRST poll, the one that issues the call, runs on the blocking pool,
-/// and the future is then handed back and awaited here as usual. Polling it
-/// once with a waker nobody listens to is sound: the next poll (the `.await`
-/// below) registers the real one. Nothing else about connecting changes.
+/// The same filter does NOT hold an overlapped `ConnectEx` (measured the same
+/// day: 1.2 ms to start a dial, a process with 16 in flight exits at once).
+/// So on Windows the dial is a `ConnectEx`, awaited on a blocking-pool thread
+/// in an ordinary wait, which the caller's timeout can end. Elsewhere the dial
+/// is tokio's own, with the poll that issues `connect()` moved to the blocking
+/// pool.
 async fn dial_off_the_workers(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
     let slot = dial_slots()
         .acquire_owned()
         .await
         .map_err(|_| std::io::Error::other("the dial slots are closed"))?;
+    dial_with_slot(addr, slot).await
+}
+
+#[cfg(windows)]
+async fn dial_with_slot(
+    addr: SocketAddr,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let abandoned = Arc::new(overlapped::Event::new()?);
+    // Dropped when this future is (the caller's connect timeout, a cancelled
+    // peer task): that is what ends the wait on the pool thread.
+    let _give_up = overlapped::SetOnDrop(abandoned.clone());
+    let connected = tokio::task::spawn_blocking(move || {
+        // The slot counts the pool thread, so it is released by the thread.
+        let _slot = slot;
+        test_hooks::hold_like_a_filtered_connect();
+        overlapped::connect(addr, &abandoned)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("the dial's blocking task failed: {e}")))??;
+    tokio::net::TcpStream::from_std(connected)
+}
+
+/// `ConnectEx` with an event to wait on. Windows only.
+#[cfg(windows)]
+mod overlapped {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::os::windows::io::AsRawSocket;
+    use std::sync::Arc;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, LPFN_CONNECTEX,
+        SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKET, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
+        WSAID_CONNECTEX, WSA_IO_PENDING,
+    };
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+    /// A manual-reset event, closed on drop.
+    pub(super) struct Event(HANDLE);
+
+    // SAFETY: an event handle may be set, waited on and closed from any thread.
+    unsafe impl Send for Event {}
+    unsafe impl Sync for Event {}
+
+    impl Event {
+        pub(super) fn new() -> std::io::Result<Self> {
+            // SAFETY: no name, no security attributes; manual reset, not signalled.
+            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(handle))
+        }
+    }
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is ours and is closed exactly once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Signals the event when dropped.
+    pub(super) struct SetOnDrop(pub(super) Arc<Event>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: the Arc keeps the handle open.
+            unsafe { SetEvent(self.0 .0) };
+        }
+    }
+
+    fn last_wsa_error() -> std::io::Error {
+        // SAFETY: reads the calling thread's last WinSock error.
+        std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    /// The `ConnectEx` entry point, which WinSock only hands out at run time.
+    fn connect_ex(socket: SOCKET) -> std::io::Result<LPFN_CONNECTEX> {
+        let guid = WSAID_CONNECTEX;
+        let mut function: LPFN_CONNECTEX = None;
+        let mut returned = 0u32;
+        // SAFETY: in and out buffers are the sizes passed; no overlapped call.
+        let failed = unsafe {
+            WSAIoctl(
+                socket,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                &guid as *const _ as *const _,
+                std::mem::size_of_val(&guid) as u32,
+                &mut function as *mut _ as *mut _,
+                std::mem::size_of_val(&function) as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if failed != 0 {
+            return Err(last_wsa_error());
+        }
+        Ok(function)
+    }
+
+    /// Connect to `addr`, or stop trying when `abandoned` is signalled. Blocks
+    /// the calling thread in an ordinary wait. The returned stream is
+    /// non-blocking, ready for `tokio::net::TcpStream::from_std`.
+    pub(super) fn connect(addr: SocketAddr, abandoned: &Event) -> std::io::Result<std::net::TcpStream> {
+        let (domain, any): (_, SocketAddr) = match addr {
+            SocketAddr::V4(_) => (socket2::Domain::IPV4, (Ipv4Addr::UNSPECIFIED, 0).into()),
+            SocketAddr::V6(_) => (socket2::Domain::IPV6, (Ipv6Addr::UNSPECIFIED, 0).into()),
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        // ConnectEx requires a bound socket.
+        socket.bind(&any.into())?;
+        let raw = socket.as_raw_socket() as SOCKET;
+        let Some(connect_ex) = connect_ex(raw)? else {
+            return Err(std::io::Error::other("WinSock handed out no ConnectEx"));
+        };
+
+        let done = Event::new()?;
+        // SAFETY: OVERLAPPED is plain data; all zeroes is its documented initial state.
+        let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+        operation.hEvent = done.0;
+        let target = socket2::SockAddr::from(addr);
+        // SAFETY: `target` and `operation` live until the operation has
+        // finished: every path below waits for it before returning.
+        let started = unsafe {
+            connect_ex(
+                raw,
+                target.as_ptr() as *const SOCKADDR,
+                target.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut operation,
+            )
+        };
+        if started == 0 {
+            // SAFETY: as in `last_wsa_error`.
+            let error = unsafe { WSAGetLastError() };
+            if error != WSA_IO_PENDING {
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
+            let handles = [done.0, abandoned.0];
+            // SAFETY: two valid handles, both kept open by their owners here.
+            let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+            if woke != WAIT_OBJECT_0 {
+                // The caller gave up (or the wait itself failed): cancel, then
+                // wait until the operation has let go of `operation`.
+                let mut ignored = 0u32;
+                // SAFETY: the socket and `operation` are alive; the wait makes
+                // sure the kernel is done with `operation` before it is freed.
+                unsafe {
+                    CancelIoEx(raw as HANDLE, &operation);
+                    GetOverlappedResult(raw as HANDLE, &operation, &mut ignored, 1);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the dial was abandoned before the peer answered",
+                ));
+            }
+        }
+        let (mut transferred, mut flags) = (0u32, 0u32);
+        // SAFETY: the operation has completed; this only reads its result.
+        if unsafe { WSAGetOverlappedResult(raw, &operation, &mut transferred, 0, &mut flags) } == 0 {
+            return Err(last_wsa_error());
+        }
+        // Without this the socket is "connected" for send/recv only:
+        // getpeername, shutdown and friends fail on it.
+        // SAFETY: no option value is passed.
+        if unsafe { setsockopt(raw, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0) } != 0 {
+            return Err(last_wsa_error());
+        }
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+}
+
+/// Not Windows: tokio's own connect, with its FIRST poll, the one that issues
+/// `connect()`, run on the blocking pool; the future is then handed back and
+/// awaited on the worker as usual. Polling it once with a waker nobody listens
+/// to is sound: the next poll (the `.await` below) registers the real one.
+#[cfg(not(windows))]
+async fn dial_with_slot(
+    addr: SocketAddr,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) -> std::io::Result<tokio::net::TcpStream> {
     let runtime = tokio::runtime::Handle::current();
     let mut connecting = Box::pin(tokio::net::TcpStream::connect(addr));
     let (connecting, first) = tokio::task::spawn_blocking(move || {

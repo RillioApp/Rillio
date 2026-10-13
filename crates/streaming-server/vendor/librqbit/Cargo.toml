@@ -316,6 +316,22 @@ features = ["v4"]
 [dependencies.walkdir]
 version = "2.5.0"
 
+# RILLIO (vendor/README-RILLIO.md, change 2): outgoing dials on Windows are an
+# overlapped ConnectEx (src/stream_connect.rs). Both crates are already in the
+# dependency tree through tokio.
+[target."cfg(windows)".dependencies.socket2]
+version = "0.6"
+
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+]
+
 [dev-dependencies.tempfile]
 version = "3"
 
