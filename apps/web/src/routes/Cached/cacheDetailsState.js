@@ -24,18 +24,32 @@ const emptyBook = (server) => ({ server, generations: {}, lists: {}, signatures:
 const bookFor = (book, server) => (book !== null && book.server === server ? book : emptyBook(server));
 
 /**
- * Starts a request for `infoHash`: returns { book, generation } where only a
- * response carrying this generation may apply.
+ * Records a request for `infoHash` with `generation`, which the caller draws
+ * from ONE counter that never resets (so a hash deleted and re-added within a
+ * round trip can never see its old request's answer apply). Returns the new
+ * book, or null when `book` is not this server's (the request is not made).
  */
-const beginRequest = (book, infoHash) => {
-    const generation = (book.generations[infoHash] || 0) + 1;
-    return { book: { ...book, generations: { ...book.generations, [infoHash]: generation } }, generation };
+const beginRequest = (book, server, infoHash, generation) => {
+    if (book === null || book.server !== server) return null;
+    return { ...book, generations: { ...book.generations, [infoHash]: generation } };
 };
 
-/** Applies a response if it is the latest request for its hash on this server. */
+/**
+ * What a response does to the CURRENT book: the new book, or null to drop it.
+ * Dropped when the current book belongs to another server (a late answer from
+ * the old one must not wipe the new one's lists) or a newer request for the
+ * hash has been made since.
+ */
 const applyResponse = (book, server, infoHash, generation, list) => {
-    if (book.server !== server || book.generations[infoHash] !== generation) return book;
+    if (book === null || book.server !== server || book.generations[infoHash] !== generation) return null;
     return { ...book, lists: { ...book.lists, [infoHash]: list } };
+};
+
+/** A failed request: forget its signature so the next change retries; null to drop. */
+const applyFailure = (book, server, infoHash, generation) => {
+    if (book === null || book.server !== server || book.generations[infoHash] !== generation) return null;
+    const { [infoHash]: _forgotten, ...signatures } = book.signatures;
+    return { ...book, signatures };
 };
 
 /** Forgets everything about hashes no longer in the list (a re-add refetches). */
@@ -74,6 +88,6 @@ const retryInMs = (cached, now) => (cached.videos !== null ? null : Math.max(0, 
 const stillOpen = (openCard, entries) => (openCard !== null && Array.isArray(entries) && entries.some((entry) => entry.infoHash === openCard) ? openCard : null);
 
 module.exports = {
-    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, prune, fileSignature,
+    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, applyFailure, prune, fileSignature,
     videoKey, keepWanted, retryInMs, stillOpen,
 };

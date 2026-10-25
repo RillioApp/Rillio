@@ -22,8 +22,9 @@ import type { TorrentFile } from './TorrentFiles';
 
 const details = require('./cacheDetailsState') as {
     bookFor: (book: FileBook | null, server: string) => FileBook,
-    beginRequest: (book: FileBook, infoHash: string) => { book: FileBook, generation: number },
-    applyResponse: (book: FileBook, server: string, infoHash: string, generation: number, list: TorrentFile[]) => FileBook,
+    beginRequest: (book: FileBook | null, server: string, infoHash: string, generation: number) => FileBook | null,
+    applyResponse: (book: FileBook | null, server: string, infoHash: string, generation: number, list: TorrentFile[]) => FileBook | null,
+    applyFailure: (book: FileBook | null, server: string, infoHash: string, generation: number) => FileBook | null,
     prune: (book: FileBook, hashes: string[]) => FileBook,
     fileSignature: (entry: CacheEntry) => string,
     videoKey: (meta: CacheEntry['meta']) => string | null,
@@ -170,9 +171,10 @@ export const useTitleVideos = (entries: CacheEntry[] | null): Record<string, Met
  * infoHash -> the torrent's whole file list (absent until read), for the
  * current streaming server only. Re-read when an entry's numbers move (bytes,
  * selection size, state); `reload` re-reads one at once (after a selection
- * change). An older response never overwrites a newer one (a request
- * generation per hash), and a hash that leaves the list is forgotten, so a
- * re-add starts from scratch.
+ * change). An older response never overwrites a newer one (request
+ * generations from one counter that never resets), a late answer from a
+ * previous server is dropped, and a hash that leaves the list is forgotten,
+ * so a re-add starts from scratch.
  */
 export const useFileLists = (entries: CacheEntry[] | null, serverUrl: unknown) => {
     const server = typeof serverUrl === 'string' ? serverUrl : '';
@@ -182,24 +184,34 @@ export const useFileLists = (entries: CacheEntry[] | null, serverUrl: unknown) =
         book.current = next;
         setLists(next.lists);
     }, []);
+    // One counter for every request, never reset: a hash deleted and re-added
+    // within a round trip, or a server switched back and forth, can never see
+    // an old request's answer apply.
+    const generation = useRef(0);
     const load = useCallback((infoHash: string) => {
         if (server.length === 0) return Promise.resolve();
-        const started = details.beginRequest(details.bookFor(book.current, server), infoHash);
-        book.current = started.book;
+        generation.current += 1;
+        const mine = generation.current;
+        // Decided against the CURRENT book: none, or another server's, makes no request.
+        const started = details.beginRequest(book.current, server, infoHash, mine);
+        if (started === null) return Promise.resolve();
+        book.current = started;
         return serverFetch(new URL(`cache/files/${infoHash}`, server))
             .then((resp) => {
                 if (!resp.ok) throw new Error(`cache/files responded ${resp.status}`);
                 return resp.json();
             })
             .then((list: TorrentFile[]) => {
-                commit(details.applyResponse(details.bookFor(book.current, server), server, infoHash, started.generation, list));
+                // Null: the window moved to another server, or a newer request
+                // for this hash was made. Either way this answer is dropped.
+                const next = details.applyResponse(book.current, server, infoHash, mine, list);
+                if (next !== null) commit(next);
             })
             .catch((error: unknown) => {
                 // The row falls back to what /cache/list says; the next change retries.
                 console.error('Cached: listing a torrent failed', infoHash, error);
-                const current = details.bookFor(book.current, server);
-                const { [infoHash]: _forgotten, ...signatures } = current.signatures;
-                book.current = { ...current, signatures };
+                const next = details.applyFailure(book.current, server, infoHash, mine);
+                if (next !== null) book.current = next;
             });
     }, [server, commit]);
     useEffect(() => {

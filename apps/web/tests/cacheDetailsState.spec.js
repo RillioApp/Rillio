@@ -2,44 +2,64 @@
 // removed hashes, per-addon episode lists, retries, the open card.
 
 const {
-    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, prune,
+    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, applyFailure, prune,
     videoKey, keepWanted, retryInMs, stillOpen,
 } = require('../src/routes/Cached/cacheDetailsState');
 
 describe('file lists', () => {
+    // The hook's own path: requests and responses are decided against the
+    // CURRENT book (book.current), with generations from one counter.
+    let counter = 0;
+    const next = () => { counter += 1; return counter; };
+
     test('an older response never overwrites a newer one', () => {
         let book = emptyBook('http://a');
-        const first = beginRequest(book, 'h');
-        book = first.book;
-        const second = beginRequest(book, 'h');
-        book = second.book;
-        book = applyResponse(book, 'http://a', 'h', second.generation, ['new']);
-        book = applyResponse(book, 'http://a', 'h', first.generation, ['old']);
+        const first = next();
+        book = beginRequest(book, 'http://a', 'h', first);
+        const second = next();
+        book = beginRequest(book, 'http://a', 'h', second);
+        book = applyResponse(book, 'http://a', 'h', second, ['new']);
+        expect(applyResponse(book, 'http://a', 'h', first, ['old'])).toBeNull();
         expect(book.lists.h).toEqual(['new']);
     });
 
-    test('a response from another server does not apply, and a server change starts over', () => {
+    test('a late response from the old server after a server change is dropped, the new lists kept', () => {
         let book = emptyBook('http://a');
-        const request = beginRequest(book, 'h');
-        book = request.book;
-        expect(applyResponse(book, 'http://b', 'h', request.generation, ['x']).lists).toEqual({});
-        book = applyResponse(book, 'http://a', 'h', request.generation, ['x']);
-        expect(bookFor(book, 'http://a')).toBe(book);
-        expect(bookFor(book, 'http://b').lists).toEqual({});
+        const old = next();
+        book = beginRequest(book, 'http://a', 'h', old);
+        // The server changes; the new server's lists arrive first.
+        book = bookFor(book, 'http://b');
+        const fresh = next();
+        book = beginRequest(book, 'http://b', 'h', fresh);
+        book = applyResponse(book, 'http://b', 'h', fresh, ['from b']);
+        // The old server's answer lands now: the callback gets null and commits nothing.
+        expect(applyResponse(book, 'http://a', 'h', old, ['from a'])).toBeNull();
+        expect(applyFailure(book, 'http://a', 'h', old)).toBeNull();
+        expect(book.lists.h).toEqual(['from b']);
+        // And no request is recorded against a book of another server.
+        expect(beginRequest(book, 'http://a', 'h', next())).toBeNull();
+    });
+
+    test('a hash deleted and re-added within one round trip never gets the deleted list', () => {
+        let book = emptyBook('http://a');
+        const before = next();
+        book = beginRequest(book, 'http://a', 'h', before);
+        book = prune(book, []);
+        const after = next();
+        book = beginRequest(book, 'http://a', 'h', after);
+        expect(applyResponse(book, 'http://a', 'h', before, ['deleted'])).toBeNull();
+        expect(applyResponse(book, 'http://a', 'h', after, ['re-added']).lists.h).toEqual(['re-added']);
     });
 
     test('a removed hash is forgotten, so a re-add refetches', () => {
-        let book = emptyBook('http://a');
-        const request = beginRequest(book, 'gone');
-        book = applyResponse(request.book, 'http://a', 'gone', request.generation, ['x']);
-        book = { ...book, signatures: { gone: '1|2|3|live' } };
+        let book = beginRequest(emptyBook('http://a'), 'http://a', 'gone', next());
+        book = { ...book, lists: { gone: ['x'] }, signatures: { gone: '1|2|3|live' } };
         book = prune(book, ['other']);
         expect(book.lists).toEqual({});
         expect(book.signatures).toEqual({});
         expect(book.generations).toEqual({});
     });
 });
-
 describe('episode lists', () => {
     test('keyed by addon, type and id; movies and addon-less titles have none', () => {
         expect(videoKey({ metaId: 'tt1', type: 'series', metaTransportUrl: 'https://a/manifest.json' })).toBe('https://a/manifest.json|series|tt1');
