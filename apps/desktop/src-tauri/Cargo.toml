@@ -130,6 +130,11 @@ windows = { version = "0.61", features = [
     # takes SECURITY_ATTRIBUTES, hence Win32_Security), never a posted message.
     "Win32_Security",
     "Win32_System_Threading",
+    # "View location": SHOpenFolderAndSelectItems selects a cached file in
+    # Explorer by its item ID list (no command line, nothing opened).
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
 ] }
 # WebView2 COM interfaces (same 0.38.x wry already pins, so the types unify
 # with what PlatformWebview::controller() returns). Used solely to set the

@@ -21,6 +21,7 @@ mod torrent;
 
 pub mod config;
 pub mod engine;
+pub mod location;
 pub mod storage;
 pub mod types;
 
