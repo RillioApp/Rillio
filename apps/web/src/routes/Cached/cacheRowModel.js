@@ -498,7 +498,99 @@ const primaryAction = ({ entry, kind, rows, view }) => {
     return { label: view && view.state === 'partial' ? 'Resume' : 'Play', fileIdx: entry.fileIdx, row: null };
 };
 
+/** "about 4 min left" for the hero. */
+const etaText = (seconds) => {
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    if (seconds < 60) return 'under a minute left';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `about ${minutes} min left`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest > 0 ? `about ${hours} h ${rest} min left` : `about ${hours} h left`;
+};
+
+// metahub poster art for an IMDb id (the CDN the catalogs already use).
+const posterOf = (meta) => {
+    if (meta === undefined) return null;
+    if (typeof meta.poster === 'string' && meta.poster.length > 0) return meta.poster;
+    return /^tt\d+$/.test(meta.metaId) ? `https://images.metahub.space/poster/small/${meta.metaId}/img` : null;
+};
+
+/**
+ * Everything one row shows, from its entry and what is known around it.
+ * files: /cache/files rows or null (not read yet); videos: the title's
+ * episode list, null (could not be fetched) or undefined (loading); library:
+ * the title's ctx.library entry or undefined; addonNames: transport url ->
+ * addon name. The copy note (copyNotes) needs the display order and is
+ * attached by the caller.
+ */
+const rowFacts = ({ entry, files, videos, library, addonNames, now }) => {
+    const videoList = Array.isArray(videos) ? videos : null;
+    const described = describeEntry({ entry, files, videos: videoList });
+    const split = splitFiles(files);
+    const isPack = described.kind === 'pack';
+    const rows = isPack && Array.isArray(files) ? episodeRows({ episodes: split.episodes, videos: videoList, library }) : null;
+    const view = isPack ? null : itemView({ entry, described, videos: videoList, library });
+    const labels = {};
+    (rows || []).forEach((row) => { if (row.videoId) labels[row.videoId] = row.label; });
+    const videoIds = rowVideoIds({ entry, described, rows, videos: videoList });
+    const recency = recencyOf({ entry, videoIds, library, labels });
+    const strip = rows !== null && rows.length >= 2 ? packStrip(rows) : null;
+    const summary = rows !== null ? packSummary(rows) : null;
+    const meta = entry.meta;
+
+    const totalLength = Array.isArray(files) ? files.reduce((sum, file) => sum + file.length, 0) : entry.total;
+    const totalHere = Array.isArray(files) ? files.reduce((sum, file) => sum + file.downloaded, 0) : entry.downloaded;
+    const source = meta !== undefined && typeof meta.streamTransportUrl === 'string' ? addonNames[meta.streamTransportUrl] : undefined;
+    const details = [
+        source ? `From ${source}` : null,
+        isNumber(entry.addedAt) && entry.addedAt > 0 ? `Added ${exactTime(entry.addedAt)}` : null,
+        recency.kind === 'played' ? `Last played ${exactTime(recency.at)}` : null,
+        entry.watched && isNumber(entry.watchedAt) ? `Marked watched ${exactTime(entry.watchedAt)}` : null,
+        totalLength > 0 ? `${totalHere >= totalLength ? formatSize(totalHere) : formatOf(totalHere, totalLength)} on disk` : null,
+    ].filter(Boolean).join(' · ');
+
+    const viewLine = viewText({ view, recency }, now);
+
+    return {
+        entry,
+        described,
+        kind: described.kind,
+        files: Array.isArray(files) ? files : null,
+        other: split.other,
+        rows,
+        view,
+        recency,
+        strip,
+        summary,
+        disk: diskText(entry, isPack && Array.isArray(files) ? split.episodes : null),
+        viewLine,
+        watchedTone: view !== null && view.state === 'watched',
+        action: primaryAction({ entry, kind: described.kind, rows, view }),
+        poster: posterOf(meta),
+        fullName: entry.name,
+        details,
+        // For copyNotes.
+        copyKey: {
+            infoHash: entry.infoHash,
+            kind: described.kind,
+            metaId: meta !== undefined ? meta.metaId : null,
+            season: described.season,
+            episode: described.episode,
+            covers: split.episodes.flatMap((row) => {
+                const out = [];
+                for (let e = row.episode; e <= row.lastEpisode; e += 1) out.push([isNumber(row.season) ? row.season : 1, e]);
+                return out;
+            }),
+            label: described.packLabel,
+        },
+        // "Recent" ranks by the latest of added and played.
+        recencyAt: Math.max(isNumber(entry.addedAt) ? entry.addedAt : 0, recency.kind === 'played' ? recency.at : 0),
+    };
+};
+
 module.exports = {
+    rowFacts, etaText,
     splitFiles, describeEntry, episodeRows, itemView, rowVideoIds, packStrip, packSummary,
     diskText, viewText, minutesOf, copyNotes, primaryAction, recencyOf,
     formatSize, formatOf, relativeTime, exactTime, clockTime, basename, onDisk,

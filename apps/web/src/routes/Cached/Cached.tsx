@@ -1,30 +1,35 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Play, Info, Trash2, X, ChevronRight, Search } from 'lucide-react';
+import { Play, Info, Trash2, X, Search, FolderOpen } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { toPath } from 'rillio-router';
 import { useCore } from 'rillio/core';
 import { useProfile } from 'rillio/common';
+import useToast from 'rillio/common/Toast/useToast';
+import { useTauriApi } from 'rillio/common/Platform/shell/isShell';
 import { fetchStreamingModeEnabled, postStreamingModeEnabled } from 'rillio/common/streamingMode';
-import { playerDeepLink } from 'rillio/common/cacheMetadata';
+import { playerDeepLink, type CacheMeta } from 'rillio/common/cacheMetadata';
 import { Button, IconButton, ModalRoute, Switch, cn } from 'rillio/components/ui';
 import AnimatedPercentage from 'rillio/components/ui/animated-percentage';
-import SpeedChart from 'rillio/components/ui/speed-chart';
 import useCachedTorrents, { CacheEntry } from './useCachedTorrents';
 import TorrentFiles from './TorrentFiles';
+import CacheRow from './CacheRow';
 import useMetadataMatcher from './useMetadataMatcher';
+import { useFileLists, useLibraryMap, useTitleVideos } from './useCacheDetails';
+import type { EpisodeRowModel, RowFacts, RowModel } from './cacheRowTypes';
 import UpdateFailureNotice from 'rillio/routes/Settings/General/UpdateFailureNotice';
 
-// What to call an entry: the matched title (with the episode tag for a series)
-// when the torrent has been identified, otherwise the scene filename it came
-// with. See common/cacheMetadata.
-const displayName = (entry: CacheEntry): string => {
-    const meta = entry.meta;
-    if (meta === undefined) return entry.name || entry.infoHash;
-    const episode = typeof meta.season === 'number' && typeof meta.episode === 'number' ?
-        ` S${String(meta.season).padStart(2, '0')}E${String(meta.episode).padStart(2, '0')}`
-        :
-        '';
-    return `${meta.name}${episode}`;
+// Every line a row or the hero shows is decided in cacheRowModel (pure,
+// jest-covered); this file wires data and actions to it.
+const { rowFacts, copyNotes, etaText, formatSize, formatOf, relativeTime } = require('./cacheRowModel') as {
+    rowFacts: (args: object) => RowFacts,
+    copyNotes: (rows: RowFacts['copyKey'][]) => Record<string, string>,
+    etaText: (seconds: number) => string | null,
+    formatSize: (bytes: number) => string,
+    formatOf: (done: number, total: number) => string,
+    relativeTime: (now: number, at: number) => string,
+};
+const { parseReleaseInfo } = require('rillio/common/releaseInfo') as {
+    parseReleaseInfo: (name: string) => { resolution: string | null, source: string | null, service: string | null, hdrLabel: string | null, group: string | null },
 };
 
 // Identified entries can deep link to their title directly, no continue-watching
@@ -48,71 +53,21 @@ const streamsPageLink = (entry: CacheEntry): string | null => {
     return `#/metadetails/${encodeURIComponent(meta.type)}/${encodeURIComponent(meta.metaId)}${video}`;
 };
 
-// The tag a row with an issue carries, by the server's issue kind. A kind this
-// build does not know still gets a tag: the reason beside it says the rest.
-const ISSUE_LABELS: Record<string, string> = {
-    'metadata-missing': 'Waiting to restore',
-    'engine-error': 'Stopped on an error',
-    'data-missing': 'Files missing',
-};
-const issueLabel = (kind: string): string => ISSUE_LABELS[kind] ?? 'Needs attention';
-
-// What the row says about its issue, in plain words. The server's own reason
-// is technical (an engine error, a path, a timeout): it is never put on the
-// row, it goes to the clipboard through "Copy details" for a report.
-const ISSUE_TEXT: Record<string, string> = {
-    'metadata-missing': 'Rillio lost the details of this download and is getting them again. What is on disk is kept.',
-    'engine-error': 'This download stopped on an error.',
-    'data-missing': 'Some of its files are no longer on disk.',
-};
-const issueText = (kind: string): string => ISSUE_TEXT[kind] ?? 'Something is wrong with this download.';
-
-// The issues "Fetch again" can do something about (see the server's
-// Engine::refetch): getting lost details again, and starting a stopped
-// download again. For anything else the way out is another source.
-const FETCHABLE_ISSUES = ['metadata-missing', 'engine-error'];
-
-// Clipboard API first; where it is refused, the legacy copy from an off-screen
-// textarea. Resolves to whether the text was copied.
-const copyText = (text: string): Promise<boolean> => {
-    const legacy = (): boolean => {
-        const area = document.createElement('textarea');
-        area.value = text;
-        area.setAttribute('readonly', '');
-        area.style.position = 'fixed';
-        area.style.left = '-9999px';
-        document.body.appendChild(area);
-        area.select();
-        let ok = false;
-        try { ok = document.execCommand('copy'); } catch { ok = false; }
-        document.body.removeChild(area);
-        return ok;
-    };
-    return navigator.clipboard?.writeText ?
-        navigator.clipboard.writeText(text).then(() => true, legacy)
-        :
-        Promise.resolve(legacy());
-};
-
-// Same parser the stream cards use: quality/HDR/languages are encoded in the
-// entry name (the selected file's name for single-file selections, e.g. an
-// episode filename, otherwise the torrent name - both carry the same tokens).
+// Same parser the stream cards use, for the toolbar's quality filters and sort.
 const { parseStream } = require('rillio/routes/MetaDetails/StreamsList/streamQuality');
 
 // The toolbar's decision logic (sort orders, filter facets, search), pure and
-// jest-covered in cacheListOps; quality parsing and naming are injected from
-// here so there is exactly one tokenizer and one naming rule.
+// jest-covered in cacheListOps.
 const { SORTS, FILTERS, sortEntries, filterEntries } = require('./cacheListOps');
 
 const SORT_LABELS: Record<string, string> = {
-    date: 'Newest',
+    date: 'Recent',
     size: 'Largest',
     quality: 'Quality',
 };
 
-// Short labels: the whole toolbar is ONE quiet row, and "Downloading" alone
-// would eat a chip row's worth of it. Active = an unfinished transfer, Done =
-// complete on disk.
+// Short labels: the whole toolbar is ONE quiet row. Active = an unfinished
+// transfer, Done = complete on disk.
 const FILTER_LABELS: Record<string, string> = {
     '4k': '4K',
     '1080p': '1080p',
@@ -122,79 +77,10 @@ const FILTER_LABELS: Record<string, string> = {
     kept: 'Kept',
 };
 
-// "3w ago" for the row subline: at a glance is all the date sort needs to be
-// verifiable; exact timestamps would just be noise at this size.
-const formatAge = (addedAt: number | undefined): string | null => {
-    if (typeof addedAt !== 'number' || addedAt <= 0) return null;
-    const seconds = Math.max(0, (Date.now() - addedAt) / 1000);
-    if (seconds < 3600) return 'just now';
-    if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
-    if (seconds < 86400 * 7) return `${Math.round(seconds / 86400)}d ago`;
-    if (seconds < 86400 * 30) return `${Math.round(seconds / (86400 * 7))}w ago`;
-    return `${Math.round(seconds / (86400 * 30))}mo ago`;
-};
-
 type ParsedQuality = {
     resolution: number,
     hdr: boolean,
     flags: string[],
-};
-
-const GB = 1024 ** 3;
-const MB = 1024 ** 2;
-
-const formatBytes = (bytes: number): string => {
-    if (bytes >= GB) return `${(bytes / GB).toFixed(2)} GB`;
-    if (bytes >= MB) return `${(bytes / MB).toFixed(1)} MB`;
-    return `${Math.max(0, Math.round(bytes / 1024))} KB`;
-};
-
-const stateLabel = (entry: CacheEntry): string => {
-    if (entry.state === 'error') return entry.error ? `Error: ${entry.error}` : 'Error';
-    if (entry.state === 'paused') return 'Paused';
-    if (entry.total > 0 && entry.downloaded >= entry.total) return 'Complete';
-    if (entry.state === 'live') return 'Downloading';
-    return 'Preparing';
-};
-
-// One tag treatment: a fixed-height pill that can never wrap or be squeezed, with
-// the small-caps typography a two-letter label needs to read as deliberate.
-const BADGE = 'inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-md bg-surface px-2 text-[0.625rem] font-semibold uppercase leading-none tracking-wider text-fg-muted';
-
-// Quality badges parsed from the torrent name, mirroring the stream cards.
-const QualityBadges = ({ name }: { name: string }) => {
-    const quality: ParsedQuality = useMemo(() => parseStream({ name, description: '' }), [name]);
-    const resolution = quality.resolution >= 2160 ? '4K' :
-        quality.resolution > 0 ? `${quality.resolution}p` : null;
-    if (resolution === null && !quality.hdr && quality.flags.length === 0) {
-        return null;
-    }
-    return (
-        // shrink-0 all the way down: this sits next to a truncating title in a flex
-        // row, and without it the row squeezes the badges until their labels wrap
-        // mid-word ("HD R"). Fixed height + leading-none centers the glyphs; uppercase
-        // + wide tracking is what makes a two-letter tag read as a tag.
-        <span className="inline-flex shrink-0 items-center gap-1.5">
-            {
-                resolution !== null ?
-                    <span className={BADGE}>{resolution}</span>
-                    :
-                    null
-            }
-            {
-                quality.hdr ?
-                    <span className={BADGE}>HDR</span>
-                    :
-                    null
-            }
-            {
-                quality.flags.length > 0 ?
-                    <span className="shrink-0 whitespace-nowrap text-[0.6875rem] font-medium tracking-wide text-fg-subtle">{quality.flags.slice(0, 4).join(' ')}</span>
-                    :
-                    null
-            }
-        </span>
-    );
 };
 
 // Best-effort infoHash -> library deep links, mined from continue watching
@@ -301,95 +187,93 @@ const useStreamingModeSetting = () => {
     return { enabled, toggle };
 };
 
-// Speed telemetry for the hero: samples the byte delta between cache polls
-// (~3s apart). A poll that brings no new bytes records an honest 0 so the
-// chart shows stalls instead of freezing on the last good bar.
-const HISTORY_LENGTH = 48;
-const useSpeedHistory = (entry: CacheEntry | null) => {
-    const [speeds, setSpeeds] = useState<number[]>([]);
-    const peakRef = useRef(0);
+// Download speed for the hero: the byte delta between cache polls (~3s apart).
+// A poll that brings no new bytes is an honest 0.
+const useDownloadSpeed = (entry: CacheEntry | null): number => {
+    const [speed, setSpeed] = useState(0);
     const lastRef = useRef<{ hash: string, t: number, bytes: number } | null>(null);
     useEffect(() => {
         if (entry === null) {
             lastRef.current = null;
-            peakRef.current = 0;
-            setSpeeds([]);
+            setSpeed(0);
             return;
         }
         const now = performance.now();
         const last = lastRef.current;
         if (last === null || last.hash !== entry.infoHash) {
             lastRef.current = { hash: entry.infoHash, t: now, bytes: entry.downloaded };
-            peakRef.current = 0;
-            setSpeeds([]);
+            setSpeed(0);
             return;
         }
         const dt = (now - last.t) / 1000;
         // The poll interval is 3s; anything much faster is a state echo (a
-        // mutation re-poll), not a fresh sample worth charting.
+        // mutation re-poll), not a fresh sample.
         if (dt < 1) return;
-        const speed = Math.max(0, (entry.downloaded - last.bytes) / dt);
+        setSpeed(Math.max(0, (entry.downloaded - last.bytes) / dt));
         lastRef.current = { hash: entry.infoHash, t: now, bytes: entry.downloaded };
-        peakRef.current = Math.max(peakRef.current, speed);
-        setSpeeds((h) => [...h, speed].slice(-HISTORY_LENGTH));
     }, [entry]);
-    return { speeds, peak: peakRef.current, speed: speeds.length > 0 ? speeds[speeds.length - 1] : 0 };
+    return speed;
 };
 
-const formatSpeed = (bytesPerSec: number): string => `${formatBytes(bytesPerSec)}/s`;
-
-const formatEta = (seconds: number): string => {
-    if (!Number.isFinite(seconds) || seconds <= 0) return '-';
-    if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
-    const m = Math.floor(seconds / 60);
-    const s = Math.round(seconds % 60);
-    return m > 0 ? `${m}m ${s}s` : `${s}s`;
-};
-
-// Over-artwork glass (white-alpha family: these sit on the backdrop image, not
-// on a panel, so the house surface tokens would read muddy here).
-const GLASS_BTN = 'h-9 shrink-0 rounded-full border border-white/15 bg-white/10 px-4 text-[0.8rem] font-medium text-white backdrop-blur-md transition hover:bg-white/20';
+// Buttons over the hero's artwork: the house surface tint plus a blur, so
+// they read on any backdrop.
+const HERO_BTN = 'h-10 shrink-0 rounded-full bg-surface-hover px-4 text-[0.8125rem] font-bold text-fg backdrop-blur-md hover:brightness-110';
+const HERO_ICON = 'size-10 shrink-0 rounded-full bg-surface-hover text-fg-muted backdrop-blur-md hover:text-fg';
+const HERO_PILL = 'inline-flex h-5 shrink-0 items-center rounded-full px-2 text-[0.6875rem] font-extrabold uppercase leading-none tracking-wide';
 
 /**
- * The download hero: the active download presented like a title, not a row -
- * backdrop artwork under a gradient, the title logo (or clean name), the
- * slot-machine percentage, a live speed chart and glass stats. The layout is
- * hydralauncher/hydra's downloads hero (MIT) rebuilt on the house tokens, with
- * metahub artwork standing in for their game art.
+ * The download hero: the active download presented like a title, not a row.
+ * The title logo (or clean name) and, under it ALWAYS, what exactly this is
+ * (the episode and its title, or the pack) and which copy (resolution, HDR
+ * kind, source, group): two downloads of one show used to look identical here
+ * apart from the percentage, because the logo replaced the whole text line.
  */
-const HeroDownload = ({ entry, links, metaLink, streamingMode, onPlay, onPlayFile, onMoreInfo, onSetPaused, onSetPinned, onSetFileSelected, onDelete }: {
-    entry: CacheEntry,
+const HeroDownload = ({ row, links, streamingMode, onPlay, onPlayEpisode, onPlayFile, onMoreInfo, onSetPaused, onSetPinned, onSetFileSelected, onDelete, onReveal }: {
+    row: RowModel,
     links: LibraryLinks | undefined,
-    metaLink: string | null,
     streamingMode: boolean | null,
     onPlay: (entry: CacheEntry) => void,
+    onPlayEpisode: (entry: CacheEntry, episode: EpisodeRowModel) => void,
     onPlayFile: (infoHash: string, fileIdx: number, name: string) => void,
     onMoreInfo: (link: string) => void,
     onSetPaused: (infoHash: string, paused: boolean) => void,
     onSetPinned: (infoHash: string, pinned: boolean) => void,
     onSetFileSelected: (infoHash: string, fileIdx: number, selected: boolean) => Promise<void> | void,
     onDelete: (infoHash: string) => void,
+    onReveal: ((infoHash: string, fileIdx?: number) => void) | null,
 }) => {
-    const { speeds, peak, speed } = useSpeedHistory(entry);
+    const { entry, described } = row;
+    const speed = useDownloadSpeed(entry);
     const [filesOpen, setFilesOpen] = useState(false);
     const paused = entry.state === 'paused';
     const progress = entry.total > 0 ? Math.min(1, entry.downloaded / entry.total) : 0;
     const pct = Math.floor(progress * 100);
-    const etaSeconds = speed > 0 ? (entry.total - entry.downloaded) / speed : NaN;
+    const eta = !paused && speed > 0 ? etaText((entry.total - entry.downloaded) / speed) : null;
+    const release = useMemo(() => parseReleaseInfo(entry.name), [entry.name]);
 
     // The matched metadata is the best source (it carries the addon's own
     // artwork urls and works for any identified torrent); the continue-watching
     // bridge + metahub stay as the fallback for anything not yet identified.
     const metaId = entry.meta?.metaId ?? links?.metaId ?? null;
-    const title = entry.meta !== undefined ? displayName(entry) : (links?.itemName ?? entry.name);
+    const title = entry.meta !== undefined ? described.title : (links?.itemName ?? described.title);
     const backgroundUrl = entry.meta?.background ?? metahubBackground(metaId);
     const logoUrl = entry.meta?.logo ?? metahubLogo(metaId);
     const [backgroundFailed, setBackgroundFailed] = useState(false);
     const [logoFailed, setLogoFailed] = useState(false);
     useEffect(() => { setBackgroundFailed(false); setLogoFailed(false); }, [metaId]);
 
+    // "S02E03 · Who Is Alive?": the tag strong, the episode title plain.
+    const [tag, ...rest] = (described.subtitle ?? '').split(' · ');
+    const stats = [
+        entry.total > 0 ? formatOf(entry.downloaded, entry.total) : null,
+        paused ? 'Paused' : `${formatSize(speed)}/s`,
+        eta,
+        typeof entry.addedAt === 'number' && entry.addedAt > 0 ? `Added ${relativeTime(Date.now(), entry.addedAt)}` : null,
+    ].filter(Boolean).join(' · ');
+    const action = row.action;
+
     return (
-        <div className="relative overflow-hidden">
+        <div className="relative mx-6 mb-2 mt-1 overflow-hidden rounded-[1.125rem] bg-surface">
             {
                 backgroundUrl !== null && !backgroundFailed ?
                     <img
@@ -401,46 +285,66 @@ const HeroDownload = ({ entry, links, metaLink, streamingMode, onPlay, onPlayFil
                     :
                     null
             }
-            {/* Melts the artwork into the list below; also carries the whole hero
-                when there is no artwork (non-IMDb ids). */}
-            <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-bg/80 to-bg" />
+            <div className="absolute inset-0 bg-gradient-to-r from-bg/90 via-bg/70 to-bg/30" />
 
-            <div className="relative flex flex-col gap-4 px-6 pb-5 pt-6">
-                <div className="flex min-h-14 items-center">
+            <div className="relative flex flex-col gap-3.5 px-6 py-5">
+                <div className="flex flex-col gap-1.5">
                     {
                         logoUrl !== null && !logoFailed ?
                             <img
                                 src={logoUrl}
                                 alt={title}
                                 onError={() => setLogoFailed(true)}
-                                className="max-h-16 max-w-[55%] object-contain object-left drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)]"
+                                className="max-h-14 max-w-[55%] self-start object-contain object-left drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)]"
                             />
                             :
-                            <div className="flex min-w-0 items-center gap-2.5">
-                                <div className="truncate text-2xl font-bold text-white [text-shadow:0_2px_12px_rgba(0,0,0,0.9)]" title={title}>{title}</div>
-                                <QualityBadges name={entry.name} />
-                            </div>
+                            <div className="truncate text-2xl font-extrabold text-fg" title={entry.name}>{title}</div>
                     }
+                    {/* Always there, logo or not: what exactly this is, and which copy. */}
+                    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm text-fg">
+                        {tag ? <span className="font-bold">{tag}</span> : null}
+                        {rest.length > 0 ? <><span className="text-fg-subtle">·</span><span>{rest.join(' · ')}</span></> : null}
+                        {described.unmatched ? <span className="rounded-full bg-surface px-2 py-0.5 text-[0.6875rem] font-bold text-fg-subtle">Not matched to a title</span> : null}
+                        {release.resolution ? <span className={cn(HERO_PILL, 'bg-accent text-bg')}>{release.resolution}</span> : null}
+                        {release.hdrLabel ? <span className={cn(HERO_PILL, 'bg-surface-hover text-fg')}>{release.hdrLabel}</span> : null}
+                        {release.source ? <span className={cn(HERO_PILL, 'bg-surface-hover text-fg')}>{[release.service, release.source].filter(Boolean).join(' ')}</span> : null}
+                        {release.group ? <span className="text-fg-muted">{release.group}</span> : null}
+                        {row.note !== null ? <span className="rounded-full bg-surface-hover px-2 py-0.5 text-[0.6875rem] font-bold text-fg-muted">{row.note}</span> : null}
+                    </div>
                 </div>
 
-                <div className="flex items-end justify-between gap-4">
-                    <div className="flex flex-col gap-1">
-                        <div className="text-[0.68rem] font-semibold uppercase tracking-wider text-white/70">
-                            {paused ? 'Paused' : 'Downloading'}
+                <div className="flex flex-wrap items-end justify-between gap-4">
+                    <div className="flex min-w-[18rem] flex-1 flex-col gap-1.5">
+                        <div className="flex items-baseline gap-2.5">
+                            <span className="text-[0.6875rem] font-extrabold uppercase tracking-widest text-fg-muted">{paused ? 'Paused' : 'Downloading'}</span>
+                            <span className="text-[1.875rem] font-extrabold leading-none text-fg"><AnimatedPercentage text={`${pct}%`} /></span>
                         </div>
-                        <div className="text-[1.9rem] font-bold leading-none tracking-[-0.02em] text-white">
-                            <AnimatedPercentage text={`${pct}%`} />
+                        <div className="h-1 w-full overflow-hidden rounded-full bg-surface-hover">
+                            <div className="h-full rounded-full bg-accent transition-[width] duration-700" style={{ width: `${Math.round(progress * 100)}%` }} />
                         </div>
+                        <span className="text-[0.8125rem] tabular-nums text-fg-muted">{stats}</span>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                         {
-                            // Keep only matters while auto-clean can delete things;
-                            // with streaming mode off nothing is ever cleaned up, so
-                            // the control would be a no-op and reads as noise.
+                            // Streaming DURING the download is the point of a streaming
+                            // server, so Play is offered as soon as there is a file to
+                            // play.
+                            action !== null ?
+                                <Button onClick={() => (action.row !== null ? onPlayEpisode(entry, action.row) : onPlay(entry))} className="h-10 px-[1.125rem] text-[0.8125rem] font-bold" title="Play (streams while it downloads)">
+                                    <Play className="size-4" />{action.label}
+                                </Button>
+                                :
+                                null
+                        }
+                        <Button variant="ghost" className={HERO_BTN} onClick={() => onSetPaused(entry.infoHash, !paused)} title={paused ? 'Resume this download' : 'Pause this download'}>
+                            {paused ? 'Resume' : 'Pause'}
+                        </Button>
+                        {
+                            // Keep only matters while auto-clean can delete things.
                             streamingMode === true ?
                                 <Button
                                     variant="ghost"
-                                    className={cn(GLASS_BTN, entry.pinned && 'border-accent/40 bg-accent/20 text-accent')}
+                                    className={cn(HERO_BTN, entry.pinned && 'bg-accent-soft text-accent')}
                                     onClick={() => onSetPinned(entry.infoHash, !entry.pinned)}
                                     title={entry.pinned ? 'Kept: never cleaned up automatically. Click to allow cleanup' : 'Keep this title in the cache (never cleaned up automatically)'}
                                 >
@@ -449,65 +353,28 @@ const HeroDownload = ({ entry, links, metaLink, streamingMode, onPlay, onPlayFil
                                 :
                                 null
                         }
-                        <Button variant="ghost" className={GLASS_BTN} onClick={() => onSetPaused(entry.infoHash, !paused)} title={paused ? 'Resume this download' : 'Pause this download'}>
-                            {paused ? 'Resume' : 'Pause'}
+                        <Button variant="ghost" className={cn(HERO_BTN, filesOpen && 'bg-accent-soft text-accent')} onClick={() => setFilesOpen((open) => !open)} title="Show the files in this torrent">
+                            Files
                         </Button>
                         {
-                            // Streaming DURING the download is the point of a streaming
-                            // server, so Play is offered as soon as there is a file to
-                            // play. When the torrent holds several videos there is no
-                            // single answer, so the Files button below is the way in.
-                            typeof entry.fileIdx === 'number' ?
-                                <IconButton onClick={() => onPlay(entry)} title="Play (streams while it downloads)" className="size-9 text-accent hover:brightness-110">
-                                    <Play className="size-5" />
-                                </IconButton>
-                                :
-                                <Button
-                                    variant="ghost"
-                                    className={cn(GLASS_BTN, filesOpen && 'bg-white/20')}
-                                    onClick={() => setFilesOpen((open) => !open)}
-                                    title="Show the files in this torrent"
-                                >
-                                    Files
-                                </Button>
-                        }
-                        {
-                            typeof metaLink === 'string' ?
-                                <IconButton onClick={() => onMoreInfo(metaLink)} title="More info" className="size-9 text-white/70 hover:text-white">
-                                    <Info className="size-5" />
+                            onReveal !== null ?
+                                <IconButton onClick={() => onReveal(entry.infoHash)} title="View location: show this download in its folder" className={HERO_ICON}>
+                                    <FolderOpen className="size-4" />
                                 </IconButton>
                                 :
                                 null
                         }
-                        <IconButton onClick={() => onDelete(entry.infoHash)} title="Delete from cache (frees disk space; can be re-downloaded)" className="size-9 text-white/70 hover:text-danger">
-                            <Trash2 className="size-5" />
+                        {
+                            row.metaLink !== null ?
+                                <IconButton onClick={() => onMoreInfo(row.metaLink as string)} title="More info" className={HERO_ICON}>
+                                    <Info className="size-4" />
+                                </IconButton>
+                                :
+                                null
+                        }
+                        <IconButton onClick={() => onDelete(entry.infoHash)} title="Delete from cache (frees disk space; can be re-downloaded)" className={cn(HERO_ICON, 'hover:text-danger')}>
+                            <Trash2 className="size-4" />
                         </IconButton>
-                    </div>
-                </div>
-
-                <div className="h-1 w-full overflow-hidden rounded-full bg-white/10">
-                    <div className="h-full rounded-full bg-accent transition-[width] duration-700" style={{ width: `${Math.round(progress * 100)}%` }} />
-                </div>
-
-                {/* Same glass-and-bars treatment, a third of the height: the chart
-                    keeps its own row (the accent bars ARE the look) but a short one,
-                    and the three stats sit on ONE line instead of stacking. */}
-                <div className="flex flex-col gap-1.5 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 backdrop-blur-md">
-                    <SpeedChart speeds={speeds} peakSpeed={peak} height={26} />
-                    <div className="flex items-baseline justify-between gap-4 text-[0.8rem] tabular-nums">
-                        <span className="text-white/90">
-                            <span className="mr-1.5 text-[0.6rem] font-semibold uppercase tracking-wider text-white/50">Speed</span>
-                            <span className="font-semibold">{formatSpeed(speed)}</span>
-                        </span>
-                        <span className="text-white/90">
-                            <span className="mr-1.5 text-[0.6rem] font-semibold uppercase tracking-wider text-white/50">Done</span>
-                            <span className="font-semibold">{formatBytes(entry.downloaded)}</span>
-                            <span className="text-white/45">{` / ${formatBytes(entry.total)}`}</span>
-                        </span>
-                        <span className="text-white/90">
-                            <span className="mr-1.5 text-[0.6rem] font-semibold uppercase tracking-wider text-white/50">Left</span>
-                            <span className="font-semibold">{paused ? '-' : formatEta(etaSeconds)}</span>
-                        </span>
                     </div>
                 </div>
             </div>
@@ -521,312 +388,9 @@ const HeroDownload = ({ entry, links, metaLink, streamingMode, onPlay, onPlayFil
                             initializing={entry.state === 'initializing'}
                             onPlayFile={onPlayFile}
                             onSetFileSelected={onSetFileSelected}
+                            onReveal={onReveal}
                         />
                     </div>
-                    :
-                    null
-            }
-        </div>
-    );
-};
-
-const Row = ({ entry, metaLink, streamingMode, refetching, onPlay, onPlayFile, onMoreInfo, onSetPaused, onSetPinned, onSetFileSelected, onDelete, onRefetch }: {
-    entry: CacheEntry,
-    metaLink: string | null,
-    streamingMode: boolean | null,
-    // A "Fetch again" for this row is under way.
-    refetching: boolean,
-    onRefetch: (infoHash: string) => void,
-    onPlay: (entry: CacheEntry) => void,
-    onPlayFile: (infoHash: string, fileIdx: number, name: string) => void,
-    onMoreInfo: (link: string) => void,
-    onSetPaused: (infoHash: string, paused: boolean) => void,
-    onSetPinned: (infoHash: string, pinned: boolean) => void,
-    onSetFileSelected: (infoHash: string, fileIdx: number, selected: boolean) => Promise<void> | void,
-    onDelete: (infoHash: string) => void,
-}) => {
-    const [filesOpen, setFilesOpen] = useState(false);
-    const progress = entry.total > 0 ? Math.min(1, entry.downloaded / entry.total) : 0;
-    const complete = entry.total > 0 && entry.downloaded >= entry.total;
-    const paused = entry.state === 'paused';
-    // While initializing there is no have-byte count to show: librqbit has not
-    // built the chunk tracker yet, and its torrent-level counter means the HASH
-    // CHECK's scan there, not data we hold. Showing "0 KB / 9.29 GB" next to a
-    // half-downloaded file reads as lost progress, and a progress bar at 0% says
-    // the same thing louder. Show the size alone until the real count exists.
-    const preparing = entry.state === 'initializing';
-    // Pause/resume only makes sense mid-download: live-and-incomplete or paused.
-    // NOT while initializing - librqbit hard-refuses that ("torrent is
-    // initializing, can't pause"), so offering the button only produced a pause
-    // that reported success and did nothing. Delete still works there.
-    // The server's verdict (see CacheEntry.issue). A row with an issue is still
-    // a normal row: it carries a tag and its reason, offers "Fetch again" and
-    // "Find another source", and is never offered as playable.
-    const issue = entry.issue;
-    // In the cache but not in the engine: there is no file list to open yet.
-    const waiting = entry.state === 'waiting';
-    const similarLink = streamsPageLink(entry);
-    // "Copy details": the server's technical reason, for a report. The pill
-    // says whether the copy happened; it never claims one that did not.
-    const [copied, setCopied] = useState<'idle' | 'copied' | 'failed'>('idle');
-    const copyDetails = useCallback(() => {
-        if (issue === undefined) return;
-        const details = [
-            `Rillio cache entry ${entry.infoHash}`,
-            `name: ${entry.name}`,
-            `issue: ${issue.kind}`,
-            `reason: ${issue.reason}`,
-            typeof entry.cannotRemove === 'string' ? `cannot be removed: ${entry.cannotRemove}` : null,
-        ].filter((line) => line !== null).join('\n');
-        copyText(details).then((ok) => {
-            setCopied(ok ? 'copied' : 'failed');
-            setTimeout(() => setCopied('idle'), 1500);
-        });
-    }, [entry.infoHash, entry.name, entry.cannotRemove, issue]);
-    const pausable = issue === undefined && !complete && (entry.state === 'live' || paused);
-    return (
-        <div>
-            <div className="group flex items-center gap-4 px-6 py-4 transition hover:bg-white/5">
-                {/* The advanced affordance: a torrent is a directory, and this opens it.
-                Quiet by default (a chevron, not a button) so the row still reads as
-                one title, which is what it is for almost everyone. */}
-                <IconButton
-                    onClick={() => setFilesOpen((open) => !open)}
-                    title={filesOpen ? 'Hide the files in this torrent' : 'Show all files in this torrent'}
-                    className={cn('-ml-2 size-6 shrink-0 text-fg-subtle hover:text-fg', waiting && 'invisible')}
-                >
-                    <ChevronRight className={cn('size-4 transition-transform', filesOpen && 'rotate-90')} />
-                </IconButton>
-                <div className="min-w-0 flex-1">
-                    <div className="flex min-w-0 items-center gap-2.5">
-                        <div className="truncate text-sm font-medium text-fg" title={entry.name}>
-                            {displayName(entry)}
-                        </div>
-                        <QualityBadges name={entry.name} />
-                        {
-                        // The issue tag: a quiet status-coloured word, not a badge.
-                            issue !== undefined ?
-                                <span className="shrink-0 whitespace-nowrap text-[0.6875rem] font-medium text-warning">
-                                    {issueLabel(issue.kind)}
-                                </span>
-                                :
-                                null
-                        }
-                    </div>
-                    {/* danger, not warning: this row FAILED, it is not a caution. The rest
-                    of the app already draws that line (warning = the slow-source and
-                    oversized-library notices; danger = every error and every
-                    destructive control), and this file was the last holdout. */}
-                    {
-                    // A row with an issue says what is wrong (or that a fetch is
-                    // under way) where the bytes and state would be: byte counts
-                    // for a torrent the engine is not running would be invented.
-                        issue !== undefined ?
-                            <div className="mt-1 line-clamp-2 text-xs text-fg-muted">
-                                {
-                                    refetching ?
-                                        'Fetching again, this can take a few minutes'
-                                        :
-                                        `${issueText(issue.kind)}${typeof entry.cannotRemove === 'string' ? ' It cannot be removed from here until it is restored.' : ''}`
-                                }
-                            </div>
-                            :
-                            null
-                    }
-                    <div className={cn('mt-1 text-xs tabular-nums', entry.state === 'error' ? 'text-danger' : 'text-fg-muted', issue !== undefined && 'hidden')}>
-                        {
-                            complete ?
-                                formatBytes(entry.downloaded)
-                                :
-                                preparing ?
-                                    (entry.total > 0 ? formatBytes(entry.total) : null)
-                                    :
-                                    <>
-                                        {formatBytes(entry.downloaded)}
-                                        {entry.total > 0 ? <span className="text-fg-subtle">{` / ${formatBytes(entry.total)}`}</span> : null}
-                                    </>
-                        }
-                        <span className="text-fg-subtle">{' · '}</span>
-                        {stateLabel(entry)}
-                        {
-                        // Only for a genuine pack. A movie shipping a .nfo beside it
-                        // resolves to one playable video, and calling that "2 files"
-                        // read as "this is a season pack" when it is not.
-                            entry.fileCount > 1 && typeof entry.fileIdx !== 'number' ?
-                                <><span className="text-fg-subtle">{' · '}</span>{`${entry.fileCount} files`}</>
-                                :
-                                null
-                        }
-                        {
-                        // Honest about the pending cleanup: with streaming mode on, a
-                        // watched un-kept stream is on the sweeper's list.
-                            streamingMode === true && entry.watched && !entry.pinned ?
-                                <><span className="text-fg-subtle">{' · '}</span>Watched, cleans up soon</>
-                                :
-                                null
-                        }
-                        {
-                        // The age makes the (default) newest-first order legible.
-                        // Finished rows only: an active row's subline already
-                        // carries progress and state.
-                            complete && formatAge(entry.addedAt) !== null ?
-                                <span className="text-fg-subtle">{` · ${formatAge(entry.addedAt)}`}</span>
-                                :
-                                null
-                        }
-                    </div>
-                    {
-                        issue === undefined && !complete && !preparing && entry.total > 0 ?
-                            <div className="mt-2.5 h-0.5 w-full overflow-hidden rounded-full bg-surface">
-                                <div className="h-full rounded-full bg-accent transition-[width] duration-700" style={{ width: `${Math.round(progress * 100)}%` }} />
-                            </div>
-                            :
-                            null
-                    }
-                </div>
-                {
-                // The two ways out of an issue, revealed on hover like the other
-                // row actions: try again to get what is missing, or go and pick
-                // another source for the same title. Unlike the other hover
-                // actions these take no room until they show: two labeled pills
-                // reserved at rest would squeeze the title and the reason, which
-                // are the point of this row, into a few words.
-                    issue !== undefined ?
-                        <>
-                            {
-                                FETCHABLE_ISSUES.includes(issue.kind) ?
-                                    <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={refetching}
-                                        onClick={() => onRefetch(entry.infoHash)}
-                                        title="Try now to get what this download is missing. What is already on disk is kept."
-                                        className={cn(
-                                            'shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg',
-                                            refetching ? 'inline-flex' : 'hidden group-hover:inline-flex',
-                                        )}
-                                    >
-                                        {refetching ? 'Fetching' : 'Fetch again'}
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={copyDetails}
-                                title="Copy the technical details of this problem, for a report"
-                                className="hidden shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg group-hover:inline-flex"
-                            >
-                                {copied === 'copied' ? 'Copied' : copied === 'failed' ? 'Couldn\'t copy' : 'Copy details'}
-                            </Button>
-                            {
-                                similarLink !== null ?
-                                    <Button
-                                        variant="outline"
-                                        size="sm"
-                                        onClick={() => onMoreInfo(similarLink)}
-                                        title="Open this title and pick another source for it"
-                                        className="hidden shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg group-hover:inline-flex"
-                                    >
-                                        Find another source
-                                    </Button>
-                                    :
-                                    null
-                            }
-                        </>
-                        :
-                        null
-                }
-                {/* Same labeled-pill treatment as Pause. Kept state stays visible
-                (it is standing information, not just an action); the un-kept
-                affordance appears on hover like Info/Delete. Hidden entirely
-                while auto-clean is off: nothing deletes, so Keep is a no-op. */}
-                {
-                    streamingMode === true ?
-                        <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => onSetPinned(entry.infoHash, !entry.pinned)}
-                            title={entry.pinned ? 'Kept: never cleaned up automatically. Click to allow cleanup' : 'Keep this title in the cache (never cleaned up automatically)'}
-                            className={cn(
-                                'shrink-0 bg-surface px-3.5',
-                                entry.pinned ?
-                                    'border-accent/40 text-accent opacity-100 hover:brightness-110'
-                                    :
-                                    'text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100',
-                            )}
-                        >
-                            {entry.pinned ? 'Kept' : 'Keep'}
-                        </Button>
-                        :
-                        null
-                }
-                {
-                // A labeled pill (not an icon): a pause/resume TRIANGLE would be
-                // confusable with the media Play button, and inline status text
-                // did not read as clickable. Always visible while transferring.
-                    pausable ?
-                        <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => onSetPaused(entry.infoHash, !paused)}
-                            title={paused ? 'Resume this download' : 'Pause this download'}
-                            className="shrink-0 bg-surface px-3.5 text-fg-muted hover:text-fg"
-                        >
-                            {paused ? 'Resume' : 'Pause'}
-                        </Button>
-                        :
-                        null
-                }
-                {
-                // Never for a row with an issue: what it would play is in doubt.
-                    issue === undefined && typeof entry.fileIdx === 'number' ?
-                        <IconButton
-                            onClick={() => onPlay(entry)}
-                            title="Play"
-                            className="size-9 text-accent opacity-100 hover:brightness-110"
-                        >
-                            <Play className="size-5" />
-                        </IconButton>
-                        :
-                        null
-                }
-                {
-                    typeof metaLink === 'string' ?
-                        <IconButton
-                            onClick={() => onMoreInfo(metaLink)}
-                            title="More info"
-                            className="size-9 text-fg-muted opacity-0 hover:text-fg group-hover:opacity-100"
-                        >
-                            <Info className="size-5" />
-                        </IconButton>
-                        :
-                        null
-                }
-                {
-                    // No remove action the server has said it cannot carry out
-                    // (see CacheEntry.cannotRemove); the row says so instead.
-                    typeof entry.cannotRemove !== 'string' ?
-                        <IconButton
-                            onClick={() => onDelete(entry.infoHash)}
-                            title="Delete from cache (frees disk space; can be re-downloaded)"
-                            className="size-9 text-fg-muted opacity-0 hover:text-danger group-hover:opacity-100"
-                        >
-                            <Trash2 className="size-5" />
-                        </IconButton>
-                        :
-                        null
-                }
-            </div>
-            {
-                filesOpen ?
-                    <TorrentFiles
-                        infoHash={entry.infoHash}
-                        initializing={preparing}
-                        onPlayFile={onPlayFile}
-                        onSetFileSelected={onSetFileSelected}
-                    />
                     :
                     null
             }
@@ -846,6 +410,8 @@ const Cached = ({ onClose }: Props) => {
     const closeCached = onClose;
     const navigate = useNavigate();
     const core = useCore();
+    const toast = useToast();
+    const profile = useProfile();
     const { entries, failed, error, refresh, setPinned, setPaused, setFileSelected, remove, refetch, refetching } = useCachedTorrents();
     // The load failure in the shape the shared failure notice takes: plain
     // words on screen, the technical text only in what "Copy error" copies.
@@ -862,6 +428,29 @@ const Cached = ({ onClose }: Props) => {
     const streamingMode = useStreamingModeSetting();
     // Identify anything the Player never got to write metadata for.
     useMetadataMatcher(entries, refresh);
+    const library = useLibraryMap();
+    const videosByMeta = useTitleVideos(entries);
+    const { lists: filesByHash, reload: reloadFiles } = useFileLists(entries, profile.settings.streamingServerUrl);
+    // The addon each title was streamed from, by transport url ("From Torrentio").
+    const addonNames = useMemo(() => {
+        const addons = (profile as unknown as { addons?: { transportUrl?: string, manifest?: { name?: string } }[] }).addons ?? [];
+        return addons.reduce<Record<string, string>>((names, addon) => {
+            if (typeof addon.transportUrl === 'string' && typeof addon.manifest?.name === 'string') names[addon.transportUrl] = addon.manifest.name;
+            return names;
+        }, {});
+    }, [profile]);
+
+    // "View location": the shell resolves the path from the engine itself
+    // (reveal_cache_item); only where there is a file manager to show.
+    const tauri = useTauriApi();
+    const canReveal = tauri !== undefined && !/android/i.test(navigator.userAgent);
+    const reveal = useCallback((infoHash: string, fileIdx?: number) => {
+        tauri.core.invoke('reveal_cache_item', { infoHash, fileIdx: typeof fileIdx === 'number' ? fileIdx : null })
+            .catch((reason: unknown) => {
+                console.error('Cached: reveal_cache_item failed', infoHash, fileIdx, reason);
+                toast.show({ type: 'error', title: 'Could not show the folder', message: typeof reason === 'string' ? reason : 'Rillio could not open the folder.' });
+            });
+    }, [tauri, toast]);
 
     // Prefer the FULL player deep link mined from continue watching (stream +
     // transport urls + type/id/videoId): it restores the title logo on the
@@ -898,7 +487,7 @@ const Cached = ({ onClose }: Props) => {
             .catch((error) => console.error('Cached: encoding the stream failed', error));
     }, [navigate, libraryLinks, closeCached]);
 
-    // Play one specific file out of the torrent (the file browser). Always the
+    // Play one specific file out of the torrent (the file lists). Always the
     // stream-only path: the library deep link points at the title's own file,
     // which is precisely not what was clicked here.
     const playFile = useCallback((infoHash: string, fileIdx: number, name: string) => {
@@ -914,6 +503,34 @@ const Cached = ({ onClose }: Props) => {
             .catch((error) => console.error('Cached: encoding the file stream failed', error));
     }, [navigate, closeCached]);
 
+    // Play one episode of a pack as THAT episode: the deep link carries its
+    // video id, so the player shows the right title and records progress on
+    // the right episode. An episode the title's list does not hold (or an
+    // unidentified pack) plays as a plain file.
+    const playEpisode = useCallback((entry: CacheEntry, episode: EpisodeRowModel) => {
+        if (entry.meta === undefined || episode.videoId === null) {
+            playFile(entry.infoHash, episode.file.index, episode.file.path);
+            return;
+        }
+        const meta: CacheMeta = {
+            ...entry.meta,
+            videoId: episode.videoId,
+            season: episode.season ?? 1,
+            episode: episode.episode,
+            fileIdx: episode.file.index,
+        };
+        core.transport.encodeStream({ name: episode.file.path, description: '', infoHash: entry.infoHash, fileIdx: episode.file.index })
+            .then((encoded) => {
+                if (typeof encoded === 'string') {
+                    closeCached();
+                    navigate(playerDeepLink(encoded, meta));
+                } else {
+                    console.error('Cached: the core could not encode a stream for', entry.infoHash, episode.file.index);
+                }
+            })
+            .catch((error) => console.error('Cached: encoding the episode stream failed', error));
+    }, [navigate, closeCached, playFile]);
+
     const openMetaDetails = useCallback((link: string) => {
         closeCached();
         navigate(toPath(link));
@@ -924,8 +541,8 @@ const Cached = ({ onClose }: Props) => {
         [entries],
     );
 
-    // Toolbar state. Newest-first is the default order; filters are toggle
-    // chips that AND together; the search box matches titles and filenames.
+    // Toolbar state. "Recent" is the default order; filters are toggle chips
+    // that AND together; the search box matches titles and filenames.
     const [sort, setSort] = useState<string>('date');
     const [filters, setFilters] = useState<string[]>([]);
     const [query, setQuery] = useState('');
@@ -947,14 +564,37 @@ const Cached = ({ onClose }: Props) => {
         return parsed;
     }, []);
 
+    // What every row says, decided once per change of anything it reads.
+    const facts = useMemo(() => {
+        const now = Date.now();
+        const map = new Map<string, RowFacts>();
+        (entries ?? []).forEach((entry) => {
+            map.set(entry.infoHash, rowFacts({
+                entry,
+                files: filesByHash[entry.infoHash] ?? null,
+                videos: entry.meta !== undefined ? videosByMeta[entry.meta.metaId] : undefined,
+                library: entry.meta !== undefined ? library[entry.meta.metaId] : undefined,
+                addonNames,
+                now,
+            }));
+        });
+        return map;
+    }, [entries, filesByHash, videosByMeta, library, addonNames]);
+    const searchName = useCallback((entry: CacheEntry): string => {
+        const described = facts.get(entry.infoHash)?.described;
+        return described !== undefined ? `${described.title} ${described.subtitle ?? ''}` : entry.name;
+    }, [facts]);
+    const getRecency = useCallback((entry: CacheEntry): number => facts.get(entry.infoHash)?.recencyAt ?? entry.addedAt ?? 0, [facts]);
+
     // What the list actually shows: filters + search, then the chosen order.
     const visible = useMemo(
         () => sortEntries(
-            filterEntries(entries ?? [], filters, query, getQuality, displayName),
+            filterEntries(entries ?? [], filters, query, getQuality, searchName),
             sort,
             getQuality,
+            getRecency,
         ) as CacheEntry[],
-        [entries, filters, query, sort, getQuality],
+        [entries, filters, query, sort, getQuality, searchName, getRecency],
     );
 
     // The hero: the first ACTIVE download (live or paused mid-transfer - paused
@@ -970,6 +610,22 @@ const Cached = ({ onClose }: Props) => {
         [visible],
     );
 
+    // The rows in display order (hero first), with the copy notes that need
+    // that order ("Another copy of the download above").
+    const models = useMemo((): RowModel[] => {
+        const ordered = heroEntry !== null ? [heroEntry, ...visible.filter((entry) => entry !== heroEntry)] : visible;
+        const rowFactsList = ordered.map((entry) => facts.get(entry.infoHash)).filter((row): row is RowFacts => row !== undefined);
+        const notes = copyNotes(rowFactsList.map((row) => row.copyKey));
+        return rowFactsList.map((row) => ({
+            ...row,
+            note: notes[row.entry.infoHash] ?? null,
+            metaLink: metaDetailsLink(row.entry) ?? libraryLinks[row.entry.infoHash]?.metaLink ?? null,
+            streamsLink: streamsPageLink(row.entry),
+        }));
+    }, [visible, heroEntry, facts, libraryLinks]);
+    const heroModel = heroEntry !== null ? models[0] ?? null : null;
+    const rowModels = heroModel !== null ? models.slice(1) : models;
+
     return (
         <ModalRoute
             open
@@ -977,20 +633,20 @@ const Cached = ({ onClose }: Props) => {
             title="Cache"
             hideHeader
             showClose={false}
-            className="flex h-[min(42rem,calc(100vh-6rem))] w-[min(52rem,calc(100vw-4rem))] max-w-[min(52rem,calc(100vw-4rem))] flex-col gap-0 overflow-hidden border border-line p-0"
+            className="flex h-[min(46rem,calc(100vh-6rem))] w-[min(62rem,calc(100vw-4rem))] max-w-[min(62rem,calc(100vw-4rem))] flex-col gap-0 overflow-hidden border border-line p-0"
         >
-            <div className="flex items-start gap-3 px-6 pb-3 pt-5">
+            <div className="flex items-start gap-3 px-7 pb-3.5 pt-6">
                 <div className="min-w-0">
-                    <div className="flex items-baseline gap-3">
-                        <h1 className="text-xl font-semibold text-fg">Cache</h1>
+                    <div className="flex items-baseline gap-2.5">
+                        <h1 className="text-[1.375rem] font-extrabold text-fg">Cache</h1>
                         {
                             entries !== null && entries.length > 0 ?
-                                <div className="text-sm tabular-nums text-fg-muted">{formatBytes(totalBytes)} on disk</div>
+                                <div className="text-sm tabular-nums text-fg-muted">{formatSize(totalBytes)} on disk</div>
                                 :
                                 null
                         }
                     </div>
-                    <div className="mt-1 text-xs text-fg-subtle">
+                    <div className="mt-1 text-[0.8125rem] text-fg-subtle">
                         {
                             streamingMode.enabled === true ?
                                 'Streams are cleaned up a while after you watch them. Kept titles stay until you delete them.'
@@ -1017,25 +673,24 @@ const Cached = ({ onClose }: Props) => {
                 <IconButton
                     onClick={closeCached}
                     title="Close"
-                    className={cn('size-9 text-fg-muted', streamingMode.enabled === null && 'ml-auto')}
+                    className={cn('size-10 text-fg-muted', streamingMode.enabled === null && 'ml-auto')}
                 >
                     <X className="size-5" />
                 </IconButton>
             </div>
             {
-                // The toolbar: ONE quiet hairline row - a bare inline search, the
-                // filter facets as text chips (accent when active), and the sort
-                // behind a thin divider. No pills, no boxes: the flat list below
-                // is the surface, this is just its caption.
+                // The toolbar: ONE quiet row - a bare inline search, the filter
+                // facets as text chips (accent when active), and the sort behind
+                // a thin divider.
                 entries !== null && entries.length > 0 ?
-                    <div className="flex h-10 shrink-0 items-center gap-3 border-b border-line px-6">
+                    <div className="flex h-10 shrink-0 flex-wrap items-center gap-2 px-7 pb-3.5">
                         <Search className="size-3.5 shrink-0 text-fg-subtle" />
                         <input
                             type="text"
                             value={query}
                             onChange={(event) => setQuery(event.target.value)}
                             placeholder="Search the cache"
-                            className="min-w-0 flex-1 bg-transparent text-xs text-fg outline-none placeholder:text-fg-subtle"
+                            className="min-w-0 flex-1 bg-transparent text-[0.8125rem] text-fg outline-none placeholder:text-fg-subtle"
                         />
                         {
                             query.length > 0 ?
@@ -1055,9 +710,9 @@ const Cached = ({ onClose }: Props) => {
                                             type="button"
                                             onClick={() => toggleFilter(filter)}
                                             className={cn(
-                                                'h-6 rounded-full px-2.5 text-[0.6875rem] font-medium transition',
+                                                'h-7 rounded-full px-3 text-xs font-bold transition',
                                                 active ?
-                                                    'bg-accent/15 text-accent'
+                                                    'bg-accent-soft text-accent'
                                                     :
                                                     'text-fg-muted hover:bg-surface hover:text-fg',
                                             )}
@@ -1068,7 +723,7 @@ const Cached = ({ onClose }: Props) => {
                                 })
                             }
                         </div>
-                        <div className="h-3.5 w-px shrink-0 bg-line" />
+                        <div className="h-4 w-px shrink-0 bg-line" />
                         <div className="flex shrink-0 items-center gap-1">
                             {
                                 (SORTS as string[]).map((value) => (
@@ -1077,9 +732,9 @@ const Cached = ({ onClose }: Props) => {
                                         type="button"
                                         onClick={() => setSort(value)}
                                         className={cn(
-                                            'h-6 rounded-full px-2.5 text-[0.6875rem] font-medium transition',
+                                            'h-7 rounded-full px-3 text-xs font-bold transition',
                                             sort === value ?
-                                                'bg-accent/15 text-accent'
+                                                'bg-accent-soft text-accent'
                                                 :
                                                 'text-fg-muted hover:bg-surface hover:text-fg',
                                         )}
@@ -1093,14 +748,12 @@ const Cached = ({ onClose }: Props) => {
                     :
                     null
             }
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <div className="min-h-0 flex-1 overflow-y-auto pb-4">
                 {
                     failed ?
                         // Same treatment as a failed update (UpdateFailureNotice):
                         // what happened in plain words, "Try again", and "Copy
-                        // error" for the technical text. Nothing technical and
-                        // nothing red on screen. The list keeps re-checking on its
-                        // own every few seconds; the button is for right now.
+                        // error" for the technical text.
                         <div className="px-6 py-10">
                             <UpdateFailureNotice title="The cache could not be loaded" failure={loadFailure} onRetry={refresh} />
                         </div>
@@ -1120,39 +773,42 @@ const Cached = ({ onClose }: Props) => {
                                     :
                                     <>
                                         {
-                                            heroEntry !== null ?
+                                            heroModel !== null ?
                                                 <HeroDownload
-                                                    entry={heroEntry}
-                                                    links={libraryLinks[heroEntry.infoHash]}
-                                                    metaLink={metaDetailsLink(heroEntry) ?? libraryLinks[heroEntry.infoHash]?.metaLink ?? null}
+                                                    row={heroModel}
+                                                    links={libraryLinks[heroModel.entry.infoHash]}
                                                     streamingMode={streamingMode.enabled}
                                                     onPlay={play}
+                                                    onPlayEpisode={playEpisode}
                                                     onPlayFile={playFile}
                                                     onMoreInfo={openMetaDetails}
                                                     onSetPaused={setPaused}
                                                     onSetPinned={setPinned}
                                                     onSetFileSelected={setFileSelected}
                                                     onDelete={remove}
+                                                    onReveal={canReveal ? reveal : null}
                                                 />
                                                 :
                                                 null
                                         }
-                                        <div className="divide-y divide-surface">
-                                            {visible.filter((entry) => entry.infoHash !== heroEntry?.infoHash).map((entry) => (
-                                                <Row
-                                                    key={entry.infoHash}
-                                                    entry={entry}
-                                                    metaLink={metaDetailsLink(entry) ?? libraryLinks[entry.infoHash]?.metaLink ?? null}
+                                        <div className="flex flex-col divide-y divide-line px-3 pt-1">
+                                            {rowModels.map((row) => (
+                                                <CacheRow
+                                                    key={row.entry.infoHash}
+                                                    row={row}
                                                     streamingMode={streamingMode.enabled}
-                                                    refetching={refetching.includes(entry.infoHash)}
+                                                    refetching={refetching.includes(row.entry.infoHash)}
                                                     onRefetch={refetch}
                                                     onPlay={play}
+                                                    onPlayEpisode={playEpisode}
                                                     onPlayFile={playFile}
                                                     onMoreInfo={openMetaDetails}
                                                     onSetPaused={setPaused}
                                                     onSetPinned={setPinned}
                                                     onSetFileSelected={setFileSelected}
+                                                    onReloadFiles={reloadFiles}
                                                     onDelete={remove}
+                                                    onReveal={canReveal ? reveal : null}
                                                 />
                                             ))}
                                         </div>
