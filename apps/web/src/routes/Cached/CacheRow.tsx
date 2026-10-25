@@ -114,7 +114,7 @@ const BAR_WORDS: Record<string, string> = {
     watched: 'watched',
     partial: 'in progress',
     partly: 'partly watched',
-    unwatched: 'not started',
+    unwatched: 'not watched',
     disk: 'on disk',
     missing: 'not downloaded',
 };
@@ -137,7 +137,7 @@ const viewedText = (row: EpisodeRowModel): { text: string, tone: 'accent' | 'mut
     if (view !== null && view.state === 'partial') return { text: model.minutesOf(view as { offset: number, duration: number }), tone: 'muted' };
     if (view !== null && view.state === 'partly') return { text: 'Partly watched', tone: 'muted' };
     if (!model.onDisk(row.file)) return { text: '-', tone: 'subtle' };
-    if (view !== null) return { text: 'Not started', tone: 'subtle' };
+    if (view !== null) return { text: 'Not watched', tone: 'subtle' };
     return { text: '', tone: 'subtle' };
 };
 

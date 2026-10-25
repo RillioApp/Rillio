@@ -394,7 +394,11 @@ describe('the right-hand lines', () => {
         expect(viewText({ view: { state: 'partial', offset: 432000, duration: 1440000 }, recency: { kind: 'added', at: NOW - 5 * DAY }, noun: 'Episode' }, NOW))
             .toBe('Episode stopped at 7:12 of 24:00 · Added 5 days ago');
         expect(viewText({ view: { state: 'unwatched' }, recency: { kind: 'added', at: NOW - 40 * 60 * 1000 }, noun: 'Episode' }, NOW))
-            .toBe('Added 40 min ago · Episode not started');
+            .toBe('Added 40 min ago · Not watched');
+        // A false bit only means "not marked watched", and the library keeps an
+        // offset for ONE video per title: never claim "not started".
+        expect(viewText({ view: { state: 'unwatched' }, recency: { kind: 'added', at: NOW - 3 * DAY }, noun: 'Movie' }, NOW))
+            .toBe('Added 3 days ago · Not watched');
         expect(viewText({ view: null, recency: { kind: 'added', at: NOW - 5 * DAY } }, NOW)).toBe('Added 5 days ago');
         // The player marked THIS torrent watched: about this copy.
         expect(viewText({ view: { state: 'watched', source: 'cache', at: NOW - 20 * 60 * 1000 }, recency: { kind: 'watched', at: NOW - 20 * 60 * 1000 } }, NOW))

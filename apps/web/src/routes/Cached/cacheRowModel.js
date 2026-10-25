@@ -208,7 +208,7 @@ const episodeRows = ({ episodes, videos, library }) => {
         const first = covered[0];
         const states = covered.map((video) => (video === null ? null : videoState(video.id, library, watchedFlags, orderedIds)));
         // A combined file: watched when every episode it covers is, partly
-        // watched when some are, not started only when none is; any unknown
+        // watched when some are, not watched only when none is; any unknown
         // episode leaves it unknown (an in-progress one still shows).
         let view = null;
         const partial = states.find((state) => state !== null && state.state === 'partial');
@@ -252,7 +252,7 @@ const itemView = ({ entry, described, videos, library }) => {
     if (described.kind === 'movie') {
         if (library === undefined || library === null) return cacheWatched(entry);
         if (library.watched === true) return { state: 'watched' };
-        // "Not started" needs the playback fields to say so: an entry from
+        // "Not watched" needs the playback fields to say so: an entry from
         // before they were sent (or a partial one) says nothing.
         if (!isNumber(library.timeOffset) || !isNumber(library.duration) || library.watched !== false) return cacheWatched(entry);
         if (library.timeOffset >= MIN_OFFSET_MS && library.duration > 0) {
@@ -501,7 +501,9 @@ const viewText = ({ view, recency, noun }, now) => {
     }
     if (view.state === 'partial') return withCopy(`${subject} stopped at ${clockTime(view.offset)} of ${clockTime(view.duration)}`);
     if (view.state === 'partly') return withCopy('Partly watched');
-    return copy !== null ? `${copy} · ${subject} not started` : `${subject} not started`;
+    // "Not watched", never "not started": a false bit only means not marked
+    // watched, and the library keeps an offset for one video per title.
+    return copy !== null ? `${copy} · Not watched` : 'Not watched';
 };
 /** "28 of 54 min" for the episode table. */
 const minutesOf = (view) => `${Math.round(view.offset / 60000)} of ${Math.round(view.duration / 60000)} min`;
