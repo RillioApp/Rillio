@@ -320,7 +320,21 @@ pub fn run() {
             .map(|v| v.trim() == "1")
             .unwrap_or(false);
         if !shared {
-            ctx.config_mut().identifier = "com.rillio.desktop.dev".into();
+            // RILLIO_DEV_PROFILE=<name> gives a dev shell a profile (and a
+            // single-instance mutex) of its own, com.rillio.desktop.dev.<name>:
+            // two worktrees' dev shells on one machine otherwise share
+            // com.rillio.desktop.dev, and the second launch is either handed to
+            // the first by single-instance or contends for its WebView2 profile.
+            let identifier = match std::env::var("RILLIO_DEV_PROFILE") {
+                Ok(name) if !name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') => {
+                    format!("com.rillio.desktop.dev.{name}")
+                }
+                Ok(name) if !name.is_empty() => {
+                    panic!("RILLIO_DEV_PROFILE={name:?}: use 1 to 32 of a-z, 0-9 and -")
+                }
+                _ => "com.rillio.desktop.dev".to_owned(),
+            };
+            ctx.config_mut().identifier = identifier;
         }
         ctx
     };

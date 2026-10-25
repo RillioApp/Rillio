@@ -150,13 +150,13 @@ export const FileRow = ({ infoHash, file, busy, initializing, onPlayFile, onTogg
     onReveal?: ((infoHash: string, fileIdx?: number) => void) | null,
     className?: string,
 }) => (
-    <div className={cn('flex items-center gap-3 py-2', className)}>
+    <div className={cn('flex items-center gap-3 py-2.5', className)}>
         <div className="min-w-0 flex-1">
             <div className="truncate text-xs text-fg-muted" title={file.path}>{file.path}</div>
-            <div className="mt-0.5 flex items-center gap-2 text-[0.6875rem] tabular-nums text-fg-subtle">
-                <span>{formatSize(file.length)}</span>
-                <span>·</span>
-                <span>{fileState(file)}</span>
+            <div className="mt-1 flex items-center gap-2 text-[0.6875rem] tabular-nums text-fg-subtle">
+                <span className="text-[0.6875rem]">{formatSize(file.length)}</span>
+                <span className="text-[0.6875rem]">·</span>
+                <span className="text-[0.6875rem]">{fileState(file)}</span>
                 <FileProgress file={file} />
             </div>
         </div>

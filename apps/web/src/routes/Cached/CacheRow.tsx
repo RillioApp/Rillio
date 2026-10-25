@@ -19,7 +19,7 @@
  * Every word on it comes from cacheRowModel (jest-covered).
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Play, Info, Trash2, FolderOpen } from 'lucide-react';
 import { Button, IconButton, cn } from 'rillio/components/ui';
 import type { CacheEntry } from './useCachedTorrents';
@@ -80,8 +80,8 @@ export const ReleaseLine = ({ parts, className }: { parts: ReleasePart[], classN
         <div className={cn('flex min-w-0 flex-wrap items-center gap-x-1.5 text-xs text-fg-muted', className)}>
             {parts.map((part, index) => (
                 <React.Fragment key={`${part.text}-${index}`}>
-                    {index > 0 ? <span className="text-fg-subtle">·</span> : null}
-                    <span className={cn('whitespace-nowrap', part.strong && 'font-bold text-fg')}>{part.text}</span>
+                    {index > 0 ? <span className="text-xs text-fg-subtle">·</span> : null}
+                    <span className={cn('whitespace-nowrap text-xs', part.strong && 'font-bold text-fg')}>{part.text}</span>
                 </React.Fragment>
             ))}
         </div>
@@ -89,17 +89,17 @@ export const ReleaseLine = ({ parts, className }: { parts: ReleasePart[], classN
 
 /** One bar per episode of a pack. */
 const PackStrip = ({ bars, summary }: { bars: StripBar[], summary: string | null }) => (
-    <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+    <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1">
         {bars.map((bar) => (
             <span
                 key={bar.label}
                 title={`${bar.label}: ${BAR_WORDS[bar.state]}`}
                 className={cn(
-                    'h-1.5 w-[1.125rem] shrink-0 rounded-full',
+                    'h-1.5 w-4.5 shrink-0 rounded-full',
                     bar.state === 'watched' && 'bg-accent',
                     bar.state === 'unwatched' && 'bg-surface-hover',
                     bar.state === 'disk' && 'bg-fg-subtle/60',
-                    bar.state === 'missing' && 'border border-dashed border-fg-subtle/60',
+                    bar.state === 'missing' && 'border border-dashed border-fg-subtle',
                 )}
                 style={bar.state === 'partial' ?
                     { background: `linear-gradient(90deg, var(--color-accent) ${Math.round((bar.fraction ?? 0) * 100)}%, var(--color-surface-hover) ${Math.round((bar.fraction ?? 0) * 100)}%)` }
@@ -123,9 +123,9 @@ export const Poster = ({ url, className }: { url: string | null, className?: str
     const [failed, setFailed] = useState(false);
     useEffect(() => setFailed(false), [url]);
     return url !== null && !failed ?
-        <img src={url} alt="" onError={() => setFailed(true)} className={cn('h-16 w-[2.875rem] shrink-0 rounded-lg object-cover', className)} />
+        <img src={url} alt="" onError={() => setFailed(true)} className={cn('h-16 w-12 shrink-0 rounded-lg object-cover', className)} />
         :
-        <div className={cn('flex h-16 w-[2.875rem] shrink-0 items-center justify-center rounded-lg bg-surface text-lg font-extrabold text-fg-subtle', className)}>
+        <div className={cn('flex h-16 w-12 shrink-0 items-center justify-center rounded-lg bg-surface text-lg font-extrabold text-fg-subtle', className)}>
             {url === null ? '?' : ''}
         </div>;
 };
@@ -149,9 +149,11 @@ const EpisodeTable = ({ infoHash, rows, pending, initializing, onPlayEpisode, on
     onToggle: (file: TorrentFile) => void,
     onReveal: ((infoHash: string, fileIdx?: number) => void) | null,
 }) => (
-    <div className="flex flex-col">
-        <div className="grid grid-cols-[4.5rem_minmax(0,1fr)_5rem_9rem_7.5rem_6.5rem] items-center gap-3 py-1.5 text-[0.6875rem] font-extrabold uppercase tracking-wider text-fg-subtle">
-            <span>Ep</span><span>Title</span><span>Size</span><span>On disk</span><span>Viewed</span><span />
+    // A container query, not a viewport one: in a narrow window the size and
+    // on-disk columns fold into a line under the title.
+    <div className="@container flex flex-col">
+        <div className="grid grid-cols-[3rem_minmax(0,1fr)_8rem_6.5rem] @2xl:grid-cols-[4.5rem_minmax(0,1fr)_5rem_9rem_7.5rem_6.5rem] items-center gap-3 pb-2 text-[0.6875rem] font-extrabold uppercase tracking-wider text-fg-subtle">
+            <span className="text-[0.6875rem]">Ep</span><span className="text-[0.6875rem]">Title</span><span className="hidden text-[0.6875rem] @2xl:block">Size</span><span className="hidden text-[0.6875rem] @2xl:block">On disk</span><span className="text-[0.6875rem]">Viewed</span><span />
         </div>
         {rows.map((row) => {
             const here = model.onDisk(row.file);
@@ -160,16 +162,20 @@ const EpisodeTable = ({ infoHash, rows, pending, initializing, onPlayEpisode, on
                 <div
                     key={row.file.index}
                     className={cn(
-                        'grid grid-cols-[4.5rem_minmax(0,1fr)_5rem_9rem_7.5rem_6.5rem] items-center gap-3 border-t border-line py-1.5 text-[0.8125rem]',
+                        'grid grid-cols-[3rem_minmax(0,1fr)_8rem_6.5rem] @2xl:grid-cols-[4.5rem_minmax(0,1fr)_5rem_9rem_7.5rem_6.5rem] items-center gap-3 border-t border-line py-2.5 text-[0.8125rem]',
                         !here && 'text-fg-subtle',
                     )}
                 >
-                    <span className="font-bold">{row.label}</span>
-                    <span className="truncate" title={row.file.path}>{row.title ?? model.basename(row.file.path)}</span>
-                    <span className="tabular-nums text-fg-muted">{model.formatSize(row.file.length)}</span>
-                    <span className="flex min-w-0 items-center gap-2 tabular-nums text-fg-muted">
+                    <span className="text-[0.8125rem] font-bold">{row.label}</span>
+                    <span className="flex min-w-0 flex-col gap-0.5" title={row.file.path}>
+                        <span className="truncate text-[0.8125rem]">{row.title ?? model.basename(row.file.path)}</span>
+                        {/* Narrow: size and what is on disk move under the title. */}
+                        <span className="truncate text-[0.6875rem] tabular-nums text-fg-subtle @2xl:hidden">{`${model.formatSize(row.file.length)} · ${fileState(row.file)}`}</span>
+                    </span>
+                    <span className="hidden text-[0.8125rem] tabular-nums text-fg-muted @2xl:block">{model.formatSize(row.file.length)}</span>
+                    <span className="hidden min-w-0 items-center gap-2 tabular-nums text-fg-muted @2xl:flex">
                         <FileProgress file={row.file} className="w-10" />
-                        <span className="truncate">{fileState(row.file)}</span>
+                        <span className="truncate text-[0.8125rem]">{fileState(row.file)}</span>
                     </span>
                     <span className="flex min-w-0 items-center gap-2">
                         {
@@ -180,7 +186,7 @@ const EpisodeTable = ({ infoHash, rows, pending, initializing, onPlayEpisode, on
                                 :
                                 null
                         }
-                        <span className={cn('truncate', viewed.tone === 'accent' ? 'text-accent' : viewed.tone === 'muted' ? 'text-fg-muted' : 'text-fg-subtle')}>{viewed.text}</span>
+                        <span className={cn('truncate text-[0.8125rem]', viewed.tone === 'accent' ? 'text-accent' : viewed.tone === 'muted' ? 'text-fg-muted' : 'text-fg-subtle')}>{viewed.text}</span>
                     </span>
                     <FileActions
                         infoHash={infoHash}
@@ -212,36 +218,28 @@ type Handlers = {
     onReveal: ((infoHash: string, fileIdx?: number) => void) | null,
 };
 
-// How long the pointer must rest on a row before it opens: sweeping across
-// the list to reach a row further down must not open every row on the way.
-const HOVER_INTENT_MS = 160;
-
-const CacheRow = ({ row, streamingMode, refetching, ...handlers }: {
+const CacheRow = ({ row, open, onToggleOpen, streamingMode, refetching, ...handlers }: {
     row: RowModel,
+    // Which card is open is the window's (one at a time, for this visit).
+    open: boolean,
+    onToggleOpen: (infoHash: string) => void,
     streamingMode: boolean | null,
     refetching: boolean,
 } & Handlers) => {
     const { entry, described } = row;
-    const [hovered, setHovered] = useState(false);
-    const [focused, setFocused] = useState(false);
-    const [pinnedOpen, setPinnedOpen] = useState(false);
-    const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const open = hovered || focused || pinnedOpen;
-    useEffect(() => () => { if (timer.current !== null) clearTimeout(timer.current); }, []);
-
-    const onPointerEnter = useCallback((event: React.PointerEvent) => {
-        if (event.pointerType === 'touch') return;
-        timer.current = setTimeout(() => setHovered(true), HOVER_INTENT_MS);
-    }, []);
-    const onPointerLeave = useCallback(() => {
-        if (timer.current !== null) clearTimeout(timer.current);
-        timer.current = null;
-        setHovered(false);
-    }, []);
-    const onSummaryClick = useCallback((event: React.MouseEvent) => {
-        if ((event.target as Element).closest('[data-row-action]')) return;
-        setPinnedOpen((current) => !current);
-    }, []);
+    // The details mount on first open and stay mounted, so closing can
+    // animate (the height morphs back to zero instead of the content vanishing).
+    const [mounted, setMounted] = useState(open);
+    useEffect(() => { if (open) setMounted(true); }, [open]);
+    const toggleOpen = useCallback(() => onToggleOpen(entry.infoHash), [onToggleOpen, entry.infoHash]);
+    const onKeyDown = useCallback((event: React.KeyboardEvent) => {
+        // Only the card itself: Enter on a focused button is that button's.
+        if (event.target !== event.currentTarget) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            toggleOpen();
+        }
+    }, [toggleOpen]);
 
     const issue = entry.issue;
     const complete = entry.total > 0 && entry.downloaded >= entry.total;
@@ -277,26 +275,26 @@ const CacheRow = ({ row, streamingMode, refetching, ...handlers }: {
     const otherFiles = row.kind === 'pack' ? row.other : (files ?? []);
     const downloadBar = issue === undefined && !complete && !preparing && entry.total > 0 && row.kind !== 'pack';
     const viewBar = !downloadBar && row.view !== null && row.view.state === 'partial';
+    const PILL = 'h-9 bg-surface-hover px-4 text-[0.8125rem] text-fg hover:brightness-110';
+    const ICON = 'size-9 bg-surface-hover text-fg-muted hover:text-fg';
 
     return (
-        <div
-            role="group"
-            aria-expanded={open}
-            aria-label={`${described.title}${described.subtitle ? `, ${described.subtitle}` : ''}`}
-            tabIndex={0}
-            onPointerEnter={onPointerEnter}
-            onPointerLeave={onPointerLeave}
-            onFocus={() => setFocused(true)}
-            onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocused(false); }}
-            className={cn(
-                'outline-none transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-highlight',
-                open ? 'rounded-2xl bg-surface' : 'hover:bg-surface',
-            )}
-        >
-            <div className="flex cursor-pointer items-center gap-4 px-4 py-3.5" onClick={onSummaryClick}>
+        <div className={cn('rounded-2xl transition-colors duration-200', open ? 'bg-surface' : 'hover:bg-surface')}>
+            {/* The card's summary is its toggle: at rest it IS the whole card.
+                The open details below are not, so managing files there never
+                folds the list away, and their buttons are not nested in it. */}
+            <div
+                role="button"
+                aria-expanded={open}
+                aria-label={`${described.title}${described.subtitle ? `, ${described.subtitle}` : ''}. ${open ? 'Hide' : 'Show'} details and files`}
+                tabIndex={0}
+                onClick={toggleOpen}
+                onKeyDown={onKeyDown}
+                className="flex cursor-pointer items-center gap-4 rounded-2xl px-5 py-4 outline-none focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-highlight"
+            >
                 <Poster url={row.poster} />
-                <div className="flex min-w-0 flex-1 flex-col gap-1">
-                    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                         <span className="truncate text-[0.9375rem] font-bold text-fg" title={entry.name}>{described.title}</span>
                         {described.subtitle !== null ? <span className="text-[0.8125rem] text-fg-muted">{described.subtitle}</span> : null}
                         {
@@ -344,7 +342,7 @@ const CacheRow = ({ row, streamingMode, refetching, ...handlers }: {
                     {row.strip !== null ? <PackStrip bars={row.strip} summary={row.summary} /> : null}
                     {
                         downloadBar ?
-                            <div className="mt-1 h-[3px] w-60 max-w-full overflow-hidden rounded-full bg-surface-hover">
+                            <div className="mt-1.5 h-0.75 w-60 max-w-full overflow-hidden rounded-full bg-surface-hover">
                                 <div
                                     className={cn('h-full rounded-full transition-[width] duration-700', paused ? 'bg-fg-subtle' : 'bg-accent')}
                                     style={{ width: `${Math.round(Math.min(1, entry.downloaded / entry.total) * 100)}%` }}
@@ -352,159 +350,167 @@ const CacheRow = ({ row, streamingMode, refetching, ...handlers }: {
                             </div>
                             :
                             viewBar && row.view !== null ?
-                                <div className="mt-1 h-[3px] w-60 max-w-full overflow-hidden rounded-full bg-surface-hover">
+                                <div className="mt-1.5 h-0.75 w-60 max-w-full overflow-hidden rounded-full bg-surface-hover">
                                     <div className="h-full rounded-full bg-accent" style={{ width: `${Math.round(((row.view.offset ?? 0) / (row.view.duration || 1)) * 100)}%` }} />
                                 </div>
                                 :
                                 null
                     }
                 </div>
-                {
-                    open ?
-                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2" data-row-action>
-                            {
-                                action !== null ?
-                                    <Button size="sm" onClick={play} className="h-[2.125rem] px-3.5" title={action.row !== null ? `Play ${action.row.title ?? action.row.label}` : 'Play (streams while it downloads)'}>
-                                        <Play className="size-3.5" />{action.label}
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            {
-                                issue !== undefined && FETCHABLE_ISSUES.includes(issue.kind) ?
-                                    <Button variant="ghost" size="sm" disabled={refetching} onClick={() => handlers.onRefetch(entry.infoHash)} className="h-[2.125rem] bg-surface-hover px-3.5 text-fg" title="Try now to get what this download is missing. What is already on disk is kept.">
-                                        {refetching ? 'Fetching' : 'Fetch again'}
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            {
-                                issue !== undefined ?
-                                    <Button variant="ghost" size="sm" onClick={copyDetails} className="h-[2.125rem] bg-surface-hover px-3.5 text-fg" title="Copy the technical details of this problem, for a report">
-                                        {copied === 'copied' ? 'Copied' : copied === 'failed' ? 'Couldn\'t copy' : 'Copy details'}
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            {
-                                row.streamsLink !== null ?
-                                    <Button variant="ghost" size="sm" onClick={() => handlers.onMoreInfo(row.streamsLink as string)} className="h-[2.125rem] bg-surface-hover px-3.5 text-fg" title="Open this title and pick another source for it">
-                                        Find another source
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            {
-                                pausable ?
-                                    <Button variant="ghost" size="sm" onClick={() => handlers.onSetPaused(entry.infoHash, !paused)} className="h-[2.125rem] bg-surface-hover px-3.5 text-fg" title={paused ? 'Resume this download' : 'Pause this download'}>
-                                        {paused ? 'Resume download' : 'Pause'}
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            {
-                                // Keep only matters while auto-clean can delete things.
-                                streamingMode === true ?
-                                    <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        onClick={() => handlers.onSetPinned(entry.infoHash, !entry.pinned)}
-                                        className={cn('h-[2.125rem] px-3.5', entry.pinned ? 'bg-accent-soft text-accent' : 'bg-surface-hover text-fg')}
-                                        title={entry.pinned ? 'Kept: never cleaned up automatically. Click to allow cleanup' : 'Keep this title in the cache (never cleaned up automatically)'}
-                                    >
-                                        {entry.pinned ? 'Kept' : 'Keep'}
-                                    </Button>
-                                    :
-                                    null
-                            }
-                            {
-                                handlers.onReveal !== null && entry.state !== 'waiting' ?
-                                    <IconButton onClick={() => (handlers.onReveal as (h: string) => void)(entry.infoHash)} title="View location: show this download in its folder" className="size-[2.125rem] bg-surface-hover text-fg-muted hover:text-fg">
-                                        <FolderOpen className="size-4" />
-                                    </IconButton>
-                                    :
-                                    null
-                            }
-                            {
-                                row.metaLink !== null ?
-                                    <IconButton onClick={() => handlers.onMoreInfo(row.metaLink as string)} title="More info" className="size-[2.125rem] bg-surface-hover text-fg-muted hover:text-fg">
-                                        <Info className="size-4" />
-                                    </IconButton>
-                                    :
-                                    null
-                            }
-                            {
-                                // No remove action the server has said it cannot carry out.
-                                typeof entry.cannotRemove !== 'string' ?
-                                    <IconButton onClick={() => handlers.onDelete(entry.infoHash)} title="Delete from cache (frees disk space; can be re-downloaded)" className="size-[2.125rem] bg-surface-hover text-fg-muted hover:text-danger">
-                                        <Trash2 className="size-4" />
-                                    </IconButton>
-                                    :
-                                    null
-                            }
-                        </div>
-                        :
-                        <div className="flex shrink-0 flex-col items-end gap-1 text-right">
-                            <span className={cn('text-[0.8125rem] tabular-nums', entry.state === 'error' ? 'text-danger' : 'text-fg')}>{row.disk}</span>
-                            {row.viewLine !== null ? <span className={cn('text-xs', row.watchedTone ? 'text-accent' : 'text-fg-subtle')}>{row.viewLine}</span> : null}
-                        </div>
-                }
+                <div className="flex shrink-0 flex-col items-end gap-1.5 text-right">
+                    <span className={cn('text-[0.8125rem] tabular-nums', entry.state === 'error' ? 'text-danger' : 'text-fg')}>{row.disk}</span>
+                    {row.viewLine !== null ? <span className={cn('text-xs', row.watchedTone ? 'text-accent' : 'text-fg-subtle')}>{row.viewLine}</span> : null}
+                </div>
             </div>
-            {
-                open ?
-                    <div className="flex flex-col gap-3.5 pb-4 pl-[4.875rem] pr-4">
-                        <div className="flex flex-col gap-0.5 text-xs text-fg-subtle">
-                            <span className="break-all text-fg-muted">{row.fullName}</span>
-                            <span>{row.details}</span>
-                        </div>
-                        {
-                            row.kind === 'pack' && row.rows !== null ?
-                                <EpisodeTable
-                                    infoHash={entry.infoHash}
-                                    rows={row.rows}
-                                    pending={pending}
-                                    initializing={preparing}
-                                    onPlayEpisode={(episode) => handlers.onPlayEpisode(entry, episode)}
-                                    onToggle={toggle}
-                                    onReveal={handlers.onReveal}
-                                />
-                                :
-                                null
-                        }
-                        {
-                            files === null ?
-                                (entry.state === 'waiting' ? null : <div className="text-xs text-fg-subtle">Reading the files...</div>)
-                                :
-                                otherFiles.length > 0 ?
-                                    <div className="flex flex-col">
-                                        {
-                                            row.kind === 'pack' ?
-                                                <div className="py-1.5 text-[0.6875rem] font-extrabold uppercase tracking-wider text-fg-subtle">Other files</div>
-                                                :
-                                                null
-                                        }
-                                        <div className="divide-y divide-line border-t border-line">
-                                            {otherFiles.map((file) => (
-                                                <FileRow
-                                                    key={file.index}
-                                                    infoHash={entry.infoHash}
-                                                    file={file}
-                                                    busy={pending.includes(file.index)}
-                                                    initializing={preparing}
-                                                    onPlayFile={handlers.onPlayFile}
-                                                    onToggle={toggle}
-                                                    onReveal={handlers.onReveal}
-                                                />
-                                            ))}
-                                        </div>
-                                    </div>
-                                    :
-                                    null
-                        }
-                    </div>
-                    :
-                    null
-            }
+            {/* The details morph open: a grid row animating from 0fr to 1fr is
+                a height transition to the content's own height. */}
+            <div
+                className={cn(
+                    'grid transition-[grid-template-rows,opacity] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]',
+                    open ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                )}
+                aria-hidden={!open}
+                // Closed details take no focus (React 18 has no typed `inert` prop).
+                {...(open ? {} : { inert: '' })}
+            >
+                <div className="min-h-0">
+                    {
+                        mounted ?
+                            <div className="flex flex-col gap-5 px-5 pb-5 md:pl-21">
+                                <div className="flex flex-col gap-1.5">
+                                    <span className="break-all text-xs text-fg-muted">{row.fullName}</span>
+                                    {row.details.length > 0 ? <span className="text-xs text-fg-subtle">{row.details}</span> : null}
+                                </div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    {
+                                        action !== null ?
+                                            <Button size="sm" onClick={play} className="h-9 px-4 text-[0.8125rem]" title={action.row !== null ? `Play ${action.row.title ?? action.row.label}` : 'Play (streams while it downloads)'}>
+                                                <Play className="size-3.5" />{action.label}
+                                            </Button>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        issue !== undefined && FETCHABLE_ISSUES.includes(issue.kind) ?
+                                            <Button variant="ghost" size="sm" disabled={refetching} onClick={() => handlers.onRefetch(entry.infoHash)} className={PILL} title="Try now to get what this download is missing. What is already on disk is kept.">
+                                                {refetching ? 'Fetching' : 'Fetch again'}
+                                            </Button>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        issue !== undefined ?
+                                            <Button variant="ghost" size="sm" onClick={copyDetails} className={PILL} title="Copy the technical details of this problem, for a report">
+                                                {copied === 'copied' ? 'Copied' : copied === 'failed' ? 'Couldn\'t copy' : 'Copy details'}
+                                            </Button>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        row.streamsLink !== null ?
+                                            <Button variant="ghost" size="sm" onClick={() => handlers.onMoreInfo(row.streamsLink as string)} className={PILL} title="Open this title and pick another source for it">
+                                                Find another source
+                                            </Button>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        pausable ?
+                                            <Button variant="ghost" size="sm" onClick={() => handlers.onSetPaused(entry.infoHash, !paused)} className={PILL} title={paused ? 'Resume this download' : 'Pause this download'}>
+                                                {paused ? 'Resume download' : 'Pause download'}
+                                            </Button>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        // Keep only matters while auto-clean can delete things.
+                                        streamingMode === true ?
+                                            <Button
+                                                variant="ghost"
+                                                size="sm"
+                                                onClick={() => handlers.onSetPinned(entry.infoHash, !entry.pinned)}
+                                                className={cn(PILL, entry.pinned && 'bg-accent-soft text-accent')}
+                                                title={entry.pinned ? 'Kept: never cleaned up automatically. Click to allow cleanup' : 'Keep this title in the cache (never cleaned up automatically)'}
+                                            >
+                                                {entry.pinned ? 'Kept' : 'Keep'}
+                                            </Button>
+                                            :
+                                            null
+                                    }
+                                    <span className="mx-1 hidden h-5 w-px shrink-0 bg-line md:block" />
+                                    {
+                                        handlers.onReveal !== null && entry.state !== 'waiting' ?
+                                            <IconButton onClick={() => (handlers.onReveal as (h: string) => void)(entry.infoHash)} title="View location: show this download in its folder" className={ICON}>
+                                                <FolderOpen className="size-4" />
+                                            </IconButton>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        row.metaLink !== null ?
+                                            <IconButton onClick={() => handlers.onMoreInfo(row.metaLink as string)} title="More info" className={ICON}>
+                                                <Info className="size-4" />
+                                            </IconButton>
+                                            :
+                                            null
+                                    }
+                                    {
+                                        // No remove action the server has said it cannot carry out.
+                                        typeof entry.cannotRemove !== 'string' ?
+                                            <IconButton onClick={() => handlers.onDelete(entry.infoHash)} title="Delete from cache (frees disk space; can be re-downloaded)" className={cn(ICON, 'hover:text-danger')}>
+                                                <Trash2 className="size-4" />
+                                            </IconButton>
+                                            :
+                                            null
+                                    }
+                                </div>
+                                {
+                                    row.kind === 'pack' && row.rows !== null ?
+                                        <EpisodeTable
+                                            infoHash={entry.infoHash}
+                                            rows={row.rows}
+                                            pending={pending}
+                                            initializing={preparing}
+                                            onPlayEpisode={(episode) => handlers.onPlayEpisode(entry, episode)}
+                                            onToggle={toggle}
+                                            onReveal={handlers.onReveal}
+                                        />
+                                        :
+                                        null
+                                }
+                                {
+                                    files === null ?
+                                        (entry.state === 'waiting' ? null : <div className="text-xs text-fg-subtle">Reading the files...</div>)
+                                        :
+                                        otherFiles.length > 0 ?
+                                            <div className="flex flex-col">
+                                                <div className="pb-2 text-[0.6875rem] font-extrabold uppercase tracking-wider text-fg-subtle">
+                                                    {row.kind === 'pack' ? 'Other files' : 'Files'}
+                                                </div>
+                                                <div className="divide-y divide-line border-t border-line">
+                                                    {otherFiles.map((file) => (
+                                                        <FileRow
+                                                            key={file.index}
+                                                            infoHash={entry.infoHash}
+                                                            file={file}
+                                                            busy={pending.includes(file.index)}
+                                                            initializing={preparing}
+                                                            onPlayFile={handlers.onPlayFile}
+                                                            onToggle={toggle}
+                                                            onReveal={handlers.onReveal}
+                                                        />
+                                                    ))}
+                                                </div>
+                                            </div>
+                                            :
+                                            null
+                                }
+                            </div>
+                            :
+                            null
+                    }
+                </div>
+            </div>
         </div>
     );
 };

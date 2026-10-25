@@ -223,6 +223,13 @@ const episodeRows = ({ episodes, videos, library }) => {
     });
 };
 
+// The player's own watched mark on the cache entry (it reports a stream
+// watched at ~90%), with its time when the server sends it.
+const cacheWatched = (entry) => {
+    if (!entry.watched) return null;
+    return isNumber(entry.watchedAt) ? { state: 'watched', source: 'cache', at: entry.watchedAt } : { state: 'watched', source: 'cache' };
+};
+
 /**
  * The viewing state of a single-item row (one episode, a movie), or null.
  * An unidentified torrent only knows the player's own watched mark on the
@@ -231,10 +238,10 @@ const episodeRows = ({ episodes, videos, library }) => {
 const itemView = ({ entry, described, videos, library }) => {
     const meta = entry.meta;
     if (described.kind === 'unidentified' || meta === undefined) {
-        return entry.watched ? { state: 'watched', source: 'cache' } : null;
+        return cacheWatched(entry);
     }
     if (described.kind === 'movie') {
-        if (library === undefined || library === null) return entry.watched ? { state: 'watched', source: 'cache' } : null;
+        if (library === undefined || library === null) return cacheWatched(entry);
         if (library.watched) return { state: 'watched' };
         if (library.timeOffset >= MIN_OFFSET_MS && library.duration > 0) {
             return { state: 'partial', offset: library.timeOffset, duration: library.duration };
@@ -249,7 +256,7 @@ const itemView = ({ entry, described, videos, library }) => {
         meta.season === described.season && meta.episode === described.episode && typeof meta.videoId === 'string' ? meta.videoId : null;
     const { orderedIds, watchedFlags } = librarySetup(videos, library);
     const state = videoState(videoId, library, watchedFlags, orderedIds);
-    if (state === null && entry.watched) return { state: 'watched', source: 'cache' };
+    if (state === null) return cacheWatched(entry);
     return state;
 };
 
@@ -332,7 +339,7 @@ const MB = KB * 1024;
 const GB = MB * 1024;
 const sizeNumber = (bytes, unit) => {
     const value = bytes / unit;
-    return value >= 100 || Number.isInteger(value) ? String(Math.round(value)) : value.toFixed(1);
+    return value >= 100 ? String(Math.round(value)) : value.toFixed(1).replace(/\.0$/, '');
 };
 const unitOf = (bytes) => (bytes >= GB ? [GB, 'GB'] : bytes >= MB ? [MB, 'MB'] : [KB, 'KB']);
 
@@ -432,6 +439,7 @@ const viewText = ({ view, recency }, now) => {
         return added;
     }
     if (view.state === 'watched') {
+        if (view.source === 'cache' && isNumber(view.at)) return `Watched ${relativeTime(now, view.at)}`;
         if (played !== null) return `Watched · Played ${played}`;
         return added !== null ? `Watched · ${added}` : 'Watched';
     }

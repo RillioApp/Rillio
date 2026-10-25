@@ -6,7 +6,7 @@
 
 const {
     splitFiles, describeEntry, episodeRows, itemView, packStrip, packSummary,
-    diskText, viewText, copyNotes, relativeTime, exactTime, clockTime, recencyOf, primaryAction,
+    diskText, viewText, copyNotes, relativeTime, exactTime, clockTime, recencyOf, primaryAction, rowFacts, etaText,
 } = require('../src/routes/Cached/cacheRowModel');
 
 const NOW = Date.parse('2026-10-25T14:00:00');
@@ -271,7 +271,9 @@ describe('itemView: one episode or a movie', () => {
 
     test('an unidentified torrent only knows the player\'s watched mark', () => {
         const described = describeEntry({ entry: animeEntry, files: null, videos: null });
-        expect(itemView({ entry: animeEntry, described, videos: null, library: undefined })).toEqual({ state: 'watched', source: 'cache' });
+        expect(itemView({ entry: animeEntry, described, videos: null, library: undefined })).toEqual({ state: 'watched', source: 'cache', at: NOW - 2 * DAY });
+        // ...and says when (the server's watchedAt), not when it was added.
+        expect(viewText({ view: itemView({ entry: animeEntry, described, videos: null, library: undefined }), recency: { kind: 'added', at: animeEntry.addedAt } }, NOW)).toBe('Watched 2 days ago');
         const orphan = describeEntry({ entry: orphanEntry, files: null, videos: null });
         expect(itemView({ entry: orphanEntry, described: orphan, videos: null, library: undefined })).toBeNull();
     });
@@ -360,5 +362,53 @@ describe('times', () => {
         expect(exactTime(Date.parse('2026-10-23T21:14:00'))).toBe('23 Oct, 21:14');
         expect(clockTime(432000)).toBe('7:12');
         expect(clockTime(3 * HOUR + 5 * 60 * 1000 + 9000)).toBe('3:05:09');
+    });
+});
+
+describe('rowFacts: everything one row shows', () => {
+    test('the pack: label, strip, on disk, action, details, copy key', () => {
+        const facts = rowFacts({
+            entry: { ...packEntry, meta: { ...packEntry.meta, streamTransportUrl: 'https://torrentio/manifest.json' } },
+            files: packFiles,
+            videos: VIDEOS,
+            library: libraryWith({ watchedField: WATCHED_E1_E2 }),
+            addonNames: { 'https://torrentio/manifest.json': 'Torrentio' },
+            now: NOW,
+        });
+        expect(facts.kind).toBe('pack');
+        expect(facts.described.subtitle).toBe('Season 2 pack · 5 episodes');
+        expect(facts.disk).toBe('3 of 5 on disk · 33 MB');
+        expect(facts.strip.map((bar) => bar.state)).toEqual(['watched', 'watched', 'partial', 'missing', 'missing']);
+        expect(facts.summary).toBe('E01 to E02 watched, E03 halfway');
+        expect(facts.action.label).toBe('Resume E03');
+        expect(facts.viewLine).toBe('Played E03 yesterday');
+        expect(facts.details).toBe(`From Torrentio · Added ${exactTime(packEntry.addedAt)} · Last played ${exactTime(NOW - DAY)} · 33 of 70 MB on disk`);
+        expect(facts.other.map((file) => file.path)).toEqual(['NTb.nfo']);
+        expect(facts.copyKey.covers).toEqual([[2, 1], [2, 2], [2, 3], [2, 4], [2, 5]]);
+        expect(facts.recencyAt).toBe(NOW - DAY);
+    });
+
+    test('an unidentified torrent: cleaned name, no viewing claims, added recency', () => {
+        const facts = rowFacts({ entry: orphanEntry, files: null, videos: undefined, library: undefined, addonNames: {}, now: NOW });
+        expect(facts.described).toMatchObject({ title: 'Some Indie Thing', unmatched: true });
+        expect(facts.view).toBeNull();
+        expect(facts.viewLine).toBe('Added 40 min ago');
+        expect(facts.poster).toBeNull();
+    });
+
+    test('an identified movie gets metahub poster art', () => {
+        const facts = rowFacts({ entry: duneEntry, files: null, videos: undefined, library: undefined, addonNames: {}, now: NOW });
+        expect(facts.poster).toBe('https://images.metahub.space/poster/small/tt15239678/img');
+        expect(facts.disk).toBe('Complete · 40 MB');
+    });
+});
+
+describe('etaText', () => {
+    test('plain words', () => {
+        expect(etaText(30)).toBe('under a minute left');
+        expect(etaText(4 * 60 + 10)).toBe('about 4 min left');
+        expect(etaText(2 * 3600 + 5 * 60)).toBe('about 2 h 5 min left');
+        expect(etaText(Infinity)).toBeNull();
+        expect(etaText(0)).toBeNull();
     });
 });

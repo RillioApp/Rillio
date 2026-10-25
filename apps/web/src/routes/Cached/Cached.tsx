@@ -218,8 +218,8 @@ const useDownloadSpeed = (entry: CacheEntry | null): number => {
 // Buttons over the hero's artwork: the house surface tint plus a blur, so
 // they read on any backdrop.
 const HERO_BTN = 'h-10 shrink-0 rounded-full bg-surface-hover px-4 text-[0.8125rem] font-bold text-fg backdrop-blur-md hover:brightness-110';
-const HERO_ICON = 'size-10 shrink-0 rounded-full bg-surface-hover text-fg-muted backdrop-blur-md hover:text-fg';
-const HERO_PILL = 'inline-flex h-5 shrink-0 items-center rounded-full px-2 text-[0.6875rem] font-extrabold uppercase leading-none tracking-wide';
+const HERO_ICON = 'size-10 shrink-0 rounded-full bg-surface-hover text-fg backdrop-blur-md hover:brightness-110';
+const HERO_PILL = 'inline-flex h-5 shrink-0 items-center rounded-full px-2 text-[0.6875rem] font-extrabold leading-none tracking-wide';
 
 /**
  * The download hero: the active download presented like a title, not a row.
@@ -285,7 +285,8 @@ const HeroDownload = ({ row, links, streamingMode, onPlay, onPlayEpisode, onPlay
                     :
                     null
             }
-            <div className="absolute inset-0 bg-gradient-to-r from-bg/90 via-bg/70 to-bg/30" />
+            {/* Light at the top, where the title logo sits on the artwork; dark under the text. */}
+            <div className="absolute inset-0 bg-gradient-to-b from-bg/10 via-bg/55 to-bg/90" />
 
             <div className="relative flex flex-col gap-3.5 px-6 py-5">
                 <div className="flex flex-col gap-1.5">
@@ -302,13 +303,13 @@ const HeroDownload = ({ row, links, streamingMode, onPlay, onPlayEpisode, onPlay
                     }
                     {/* Always there, logo or not: what exactly this is, and which copy. */}
                     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm text-fg">
-                        {tag ? <span className="font-bold">{tag}</span> : null}
-                        {rest.length > 0 ? <><span className="text-fg-subtle">·</span><span>{rest.join(' · ')}</span></> : null}
+                        {tag ? <span className="text-sm font-bold">{tag}</span> : null}
+                        {rest.length > 0 ? <><span className="text-sm text-fg-subtle">·</span><span className="text-sm">{rest.join(' · ')}</span></> : null}
                         {described.unmatched ? <span className="rounded-full bg-surface px-2 py-0.5 text-[0.6875rem] font-bold text-fg-subtle">Not matched to a title</span> : null}
                         {release.resolution ? <span className={cn(HERO_PILL, 'bg-accent text-bg')}>{release.resolution}</span> : null}
-                        {release.hdrLabel ? <span className={cn(HERO_PILL, 'bg-surface-hover text-fg')}>{release.hdrLabel}</span> : null}
-                        {release.source ? <span className={cn(HERO_PILL, 'bg-surface-hover text-fg')}>{[release.service, release.source].filter(Boolean).join(' ')}</span> : null}
-                        {release.group ? <span className="text-fg-muted">{release.group}</span> : null}
+                        {release.hdrLabel ? <span className={cn(HERO_PILL, 'bg-surface-hover uppercase text-fg')}>{release.hdrLabel}</span> : null}
+                        {release.source ? <span className={cn(HERO_PILL, 'bg-surface-hover uppercase text-fg')}>{[release.service, release.source].filter(Boolean).join(' ')}</span> : null}
+                        {release.group ? <span className="text-sm font-semibold text-fg">{release.group}</span> : null}
                         {row.note !== null ? <span className="rounded-full bg-surface-hover px-2 py-0.5 text-[0.6875rem] font-bold text-fg-muted">{row.note}</span> : null}
                     </div>
                 </div>
@@ -337,7 +338,8 @@ const HeroDownload = ({ row, links, streamingMode, onPlay, onPlayEpisode, onPlay
                                 null
                         }
                         <Button variant="ghost" className={HERO_BTN} onClick={() => onSetPaused(entry.infoHash, !paused)} title={paused ? 'Resume this download' : 'Pause this download'}>
-                            {paused ? 'Resume' : 'Pause'}
+                            {/* "Resume download", not "Resume": Play beside it may read "Resume" (playback). */}
+                            {paused ? 'Resume download' : 'Pause'}
                         </Button>
                         {
                             // Keep only matters while auto-clean can delete things.
@@ -624,6 +626,11 @@ const Cached = ({ onClose }: Props) => {
         }));
     }, [visible, heroEntry, facts, libraryLinks]);
     const heroModel = heroEntry !== null ? models[0] ?? null : null;
+    // The one open card, for this visit only (the window unmounts on close).
+    const [openCard, setOpenCard] = useState<string | null>(null);
+    const toggleCard = useCallback((infoHash: string) => {
+        setOpenCard((current) => (current === infoHash ? null : infoHash));
+    }, []);
     const rowModels = heroModel !== null ? models.slice(1) : models;
 
     return (
@@ -683,14 +690,14 @@ const Cached = ({ onClose }: Props) => {
                 // facets as text chips (accent when active), and the sort behind
                 // a thin divider.
                 entries !== null && entries.length > 0 ?
-                    <div className="flex h-10 shrink-0 flex-wrap items-center gap-2 px-7 pb-3.5">
+                    <div className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-2 gap-y-2 px-7 pb-3.5">
                         <Search className="size-3.5 shrink-0 text-fg-subtle" />
                         <input
                             type="text"
                             value={query}
                             onChange={(event) => setQuery(event.target.value)}
                             placeholder="Search the cache"
-                            className="min-w-0 flex-1 bg-transparent text-[0.8125rem] text-fg outline-none placeholder:text-fg-subtle"
+                            className="min-w-32 flex-1 bg-transparent text-[0.8125rem] text-fg outline-none placeholder:text-fg-subtle"
                         />
                         {
                             query.length > 0 ?
@@ -791,11 +798,13 @@ const Cached = ({ onClose }: Props) => {
                                                 :
                                                 null
                                         }
-                                        <div className="flex flex-col divide-y divide-line px-3 pt-1">
+                                        <div className="flex flex-col gap-2 px-4 pt-2">
                                             {rowModels.map((row) => (
                                                 <CacheRow
                                                     key={row.entry.infoHash}
                                                     row={row}
+                                                    open={openCard === row.entry.infoHash}
+                                                    onToggleOpen={toggleCard}
                                                     streamingMode={streamingMode.enabled}
                                                     refetching={refetching.includes(row.entry.infoHash)}
                                                     onRefetch={refetch}
