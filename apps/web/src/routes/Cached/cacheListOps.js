@@ -15,7 +15,12 @@ const SORTS = ['date', 'size', 'quality'];
 //
 // Ties (and entries missing the sort key) fall back to name order so the list
 // is stable across polls instead of flickering by server whim.
-const sortEntries = (entries, sort, getQuality) => {
+//
+// 'date' is "Recent": newest activity first. getRecency(entry) -> epoch ms
+// (the Cache window passes the later of added and last played, see
+// cacheRowModel.recencyOf); without it, the added time.
+const sortEntries = (entries, sort, getQuality, getRecency) => {
+    const recency = typeof getRecency === 'function' ? getRecency : (entry) => entry.addedAt;
     const byName = (a, b) => (a.name || '').localeCompare(b.name || '');
     const sorted = [...entries];
     switch (sort) {
@@ -37,7 +42,7 @@ const sortEntries = (entries, sort, getQuality) => {
             break;
         case 'date':
         default:
-            sorted.sort((a, b) => ((b.addedAt || 0) - (a.addedAt || 0)) || byName(a, b));
+            sorted.sort((a, b) => ((recency(b) || 0) - (recency(a) || 0)) || byName(a, b));
             break;
     }
     return sorted;

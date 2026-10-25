@@ -44,6 +44,12 @@ describe('cache sort', () => {
         expect(names(sortEntries(withMissing, 'date', getQuality)).pop()).toBe('unknown');
     });
 
+    it('"Recent" ranks by the recency accessor: a download played just now outranks a newer add', () => {
+        const playedAt = { 'old-4k-hdr': 500 };
+        const recency = (e) => Math.max(e.addedAt, playedAt[e.name] || 0);
+        expect(names(sortEntries(list, 'date', getQuality, recency))).toEqual(['old-4k-hdr', 'new-1080p', 'mid-4k']);
+    });
+
     it('size sorts largest first', () => {
         expect(names(sortEntries(list, 'size', getQuality))).toEqual(['old-4k-hdr', 'mid-4k', 'new-1080p']);
     });
