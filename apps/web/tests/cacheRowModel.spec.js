@@ -486,6 +486,19 @@ describe('the right-hand lines', () => {
 
     // advance_to_video (finishing an episode, or mark-watched on details) moves
     // video_id to the NEXT episode with time_offset = 1: a placeholder, not a play.
+    // NextVideo and a stream change write offset 1 WITHOUT moving video_id:
+    // the video is the one just finished, watched in the bitfield. Its
+    // activity is real; only an offset-1 video NOT marked watched is the
+    // advance placeholder.
+    test('offset 1 on a watched video (NextVideo, stream change) is still its activity', () => {
+        const library = libraryWith({ videoId: 'tt11280740:2:2', timeOffset: 1, watchedField: WATCHED_E1_E2 });
+        const facts = rowFacts({ entry: packEntry, files: packFiles, videos: VIDEOS, library, addonNames: {}, now: NOW });
+        expect(facts.details).toMatch(/Last activity on E02/);
+        // Unknown bitfield: the placeholder rule holds (say nothing).
+        const unknown = rowFacts({ entry: packEntry, files: packFiles, videos: null, library, addonNames: {}, now: NOW });
+        expect(unknown.details).not.toMatch(/Last activity/);
+    });
+
     test('the core\'s "moved on to the next episode" placeholder is no activity on that episode', () => {
         const library = libraryWith({ videoId: 'tt11280740:2:4', timeOffset: 1, watchedField: WATCHED_E1_E2 });
         expect(lastActivityOf({ videoIds: ['tt11280740:2:4'], library })).toBeNull();

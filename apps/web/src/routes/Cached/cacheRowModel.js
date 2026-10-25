@@ -483,13 +483,17 @@ const recencyOf = ({ entry }) => {
  * advance_to_video (finishing an episode past the credits, or marking it
  * watched) moves video_id on to the NEXT episode with time_offset = 1: that
  * placeholder is no activity on the next episode at all (an offset of 0 is a
- * title watched to its end, which is). labels maps a video id to its episode
- * label (packs).
+ * title watched to its end, which is). NextVideo and a stream change also
+ * write offset 1, but WITHOUT moving video_id: that video is the one just
+ * finished, marked watched, and its activity is real. So the placeholder rule
+ * applies only to a video isWatched does not confirm (unknown counts as not
+ * confirmed: say nothing). labels maps a video id to its episode label (packs).
  */
-const lastActivityOf = ({ videoIds, library, labels }) => {
+const lastActivityOf = ({ videoIds, library, labels, isWatched }) => {
     if (library === undefined || library === null || typeof library.videoId !== 'string') return null;
     if (!videoIds.includes(library.videoId)) return null;
-    if (isNumber(library.timeOffset) && library.timeOffset > 0 && library.timeOffset < MIN_OFFSET_MS) return null;
+    const placeholder = isNumber(library.timeOffset) && library.timeOffset > 0 && library.timeOffset < MIN_OFFSET_MS;
+    if (placeholder && !(typeof isWatched === 'function' && isWatched(library.videoId))) return null;
     const at = timeOf(library.lastWatched);
     if (at === null) return null;
     return { at, label: labels && labels[library.videoId] ? labels[library.videoId] : null };
@@ -614,7 +618,9 @@ const rowFacts = ({ entry, files, videos, library, addonNames, now }) => {
     (rows || []).forEach((row) => { if (row.videoId) labels[row.videoId] = row.label; });
     const videoIds = rowVideoIds({ entry, described, rows, videos: videoList });
     const recency = recencyOf({ entry });
-    const activity = lastActivityOf({ videoIds, library, labels });
+    const { orderedIds, watchedFlags } = librarySetup(videoList, library);
+    const isWatched = (id) => watchedFlags !== null && watchedFlags[orderedIds.indexOf(id)] === true;
+    const activity = lastActivityOf({ videoIds, library, labels, isWatched });
     const noun = described.kind === 'movie' ? 'Movie' : 'Episode';
     const strip = rows !== null && rows.length >= 2 ? packStrip(rows) : null;
     const summary = rows !== null ? packSummary(rows) : null;
