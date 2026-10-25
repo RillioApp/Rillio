@@ -1503,7 +1503,7 @@ mod tests {
     #[test]
     fn the_hidden_window_stops_while_its_queue_is_being_refilled() {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_NULL};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_NULL};
 
         const DROP_BUDGET: Duration = Duration::from_secs(5);
         /// Enough posters to outpace one pump, so the queue never empties.
@@ -1532,16 +1532,14 @@ mod tests {
             drop(window);
             let _ = done.send(());
         });
+        // Only that the drop returns: destruction is the_hidden_window_stops_on_drop's
+        // to check, without producers racing a reused handle.
         let returned = dropped.recv_timeout(DROP_BUDGET).is_ok();
-        // Destroyed right after the drop returned, before any reuse of the
-        // handle could make this check lie.
-        let destroyed = returned && !unsafe { IsWindow(Some(HWND(wid as *mut _))) }.as_bool();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for producer in producers {
             producer.join().expect("producer");
         }
         assert!(returned, "the drop hung behind a refilled queue");
-        assert!(destroyed, "destroyed with its thread");
     }
 
     /// The shipped cap, and the bound it is derived for.
