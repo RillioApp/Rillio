@@ -110,4 +110,25 @@ describe('parseReleaseName', () => {
             title: 'For All Mankind', year: null, season: 2, episode: null,
         });
     });
+
+    // Packaging BEFORE the title used to become the title: the matcher then
+    // searched the addons for "[SubsPlease] Frieren - 12 (1080p) [ABCD1234]"
+    // or "www Torrenting com - Some Indie Thing" and never found a thing, and
+    // the Cache window showed that as the name.
+    test('a leading [group] tag is not part of the title', () => {
+        expect(parseReleaseName('[SubsPlease] Frieren - 12 (1080p) [ABCD1234].mkv').title).toBe('Frieren');
+    });
+
+    test('a site prefix is not part of the title', () => {
+        expect(parseReleaseName('www.Torrenting.com - Some.Indie.Thing.2019.WEBRip.x264-ION10').title).toBe('Some Indie Thing');
+        expect(parseReleaseName('[ www.Speed.cd ] - Oppenheimer.2023.1080p.BluRay.x264-SPARKS').title).toBe('Oppenheimer');
+        // Domain-looking words inside a title are the title.
+        expect(parseReleaseName('Call.Me.By.Your.Name.2017.1080p.BluRay.x264-AMIABLE').title).toBe('Call Me By Your Name');
+    });
+
+    test('an absolute episode number ends an anime title', () => {
+        expect(parseReleaseName('Sousou no Frieren - 12 (1080p)')).toEqual({
+            title: 'Sousou no Frieren', year: null, season: null, episode: null,
+        });
+    });
 });

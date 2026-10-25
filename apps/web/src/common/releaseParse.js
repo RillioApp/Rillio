@@ -61,9 +61,25 @@ const stripExtension = (name) => name.replace(/\.[a-z0-9]{2,4}$/i, '');
 // Separators to spaces: scene names use dots and underscores for spaces.
 const spaced = (name) => name.replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim();
 
+// Packaging that comes BEFORE the title: a tracker's site prefix
+// ("www.Torrenting.com - ", "[ www.Speed.cd ] - ") and an anime group tag
+// ("[SubsPlease] "). Read on the raw name, before dots turn into spaces. An
+// unbracketed domain only counts with the " - " a site prefix always carries:
+// titles contain domain-like words ("Call.Me.By.Your.Name").
+const SITE_PREFIX = /^\s*(?:\[\s*(?:www\.)?[\w-]+(?:\.[\w-]+)+\s*\]\s*(?:-\s*)?|(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,6}\s+-\s+)/i;
+const GROUP_PREFIX = /^\s*\[([^\]]+)\]\s*/;
+const stripPrefixes = (name) => {
+    let rest = name;
+    for (;;) {
+        const next = rest.replace(SITE_PREFIX, '').replace(GROUP_PREFIX, '');
+        if (next === rest || next.trim().length === 0) return rest;
+        rest = next;
+    }
+};
+
 /** Reduce a scene release name to a searchable title (+ year, + S/E). */
 const parseReleaseName = (raw) => {
-    const name = spaced(stripExtension(raw));
+    const name = spaced(stripPrefixes(stripExtension(raw)));
 
     const se = name.match(SEASON_EPISODE);
     const seasonOnly = se ? null : name.match(SEASON_ONLY);
@@ -73,7 +89,9 @@ const parseReleaseName = (raw) => {
     // The title ends at whichever marker comes first: the season(/episode)
     // tag, the release year, or the first packaging token. Everything to the
     // left is the title, which is what a catalog search wants.
-    const cuts = [se?.index, seasonOnly?.index, name.match(YEAR)?.index, name.match(NOISE)?.index]
+    // An anime release's absolute episode ("Title - 12 (1080p)") ends the
+    // title the same way an SxxEyy does.
+    const cuts = [se?.index, seasonOnly?.index, name.match(YEAR)?.index, name.match(NOISE)?.index, name.match(DASH_NUMBER)?.index]
         .filter((index) => typeof index === 'number' && index > 0);
     const cut = cuts.length > 0 ? Math.min(...cuts) : name.length;
 
@@ -138,4 +156,4 @@ const parseEpisode = (path) => {
     return { season, episode, lastEpisode: episode };
 };
 
-module.exports = { parseReleaseName, parseEpisode };
+module.exports = { parseReleaseName, parseEpisode, stripPrefixes };
