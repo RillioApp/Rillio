@@ -26,11 +26,15 @@ export type TorrentFile = {
     downloaded: number,
     selected: boolean,
     video: boolean,
+    // Bytes of this file in pieces it shares with a neighbour: up to this much
+    // on an unselected file can be piece-overlap credit, not data of its own.
+    sharedPieceBytes?: number,
 };
 
-const { formatSize, formatOf } = require('./cacheRowModel') as {
+const { formatSize, formatOf, onDisk } = require('./cacheRowModel') as {
     formatSize: (bytes: number) => string,
     formatOf: (done: number, total: number) => string,
+    onDisk: (file: TorrentFile) => boolean,
 };
 
 /**
@@ -58,15 +62,15 @@ export const useFileToggle = (
 /** "Complete", "6 of 15 MB", "Not downloaded" for one file. */
 export const fileState = (file: TorrentFile): string => {
     if (file.length > 0 && file.downloaded >= file.length) return 'Complete';
-    // Bytes on an unselected, incomplete file are a piece boundary's overlap
-    // credit, not a download (see cacheRowModel.onDisk).
-    if (!file.selected) return 'Not downloaded';
+    // Deselecting never deletes bytes: real kept data says so. A few bytes up
+    // to the file's shared-piece share are only overlap credit (cacheRowModel.onDisk).
+    if (!file.selected) return onDisk(file) ? `Not downloading · ${formatSize(file.downloaded)} kept` : 'Not downloaded';
     return file.downloaded > 0 ? formatOf(file.downloaded, file.length) : 'Waiting';
 };
 
 /** A thin progress line for a file part-way on disk, or null. */
 export const FileProgress = ({ file, className }: { file: TorrentFile, className?: string }) => {
-    if (!file.selected || !(file.downloaded > 0) || file.length <= 0 || file.downloaded >= file.length) return null;
+    if (!onDisk(file) || file.length <= 0 || file.downloaded >= file.length) return null;
     return (
         <div className={cn('h-0.5 w-16 shrink-0 overflow-hidden rounded-full bg-surface-hover', className)}>
             <div className="h-full rounded-full bg-fg-subtle" style={{ width: `${Math.round((file.downloaded / file.length) * 100)}%` }} />

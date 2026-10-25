@@ -435,6 +435,63 @@ pub(crate) struct TorrentFile {
     pub selected: bool,
     /// Whether the player can open it (drives the per-file Play button).
     pub video: bool,
+    /// How many of this file's bytes lie in pieces it SHARES with a
+    /// neighbouring file (its partial first and last piece). librqbit credits
+    /// a finished piece to every file it overlaps, so an unselected file can
+    /// show up to this many bytes it was never asked for. More `downloaded`
+    /// than this is data of its own (a file deselected after it had started,
+    /// which keeps its bytes); this much or less may be only that overlap.
+    pub shared_piece_bytes: u64,
+}
+
+/// The bytes of the file at `offset..offset + length` that lie in pieces
+/// another file also occupies (see `TorrentFile::shared_piece_bytes`). A
+/// piece boundary inside the torrent is shared unless it falls exactly on
+/// the file's edge; the torrent's own start and end are shared with nothing.
+pub(crate) fn shared_piece_bytes(offset: u64, length: u64, piece_length: u64, total: u64) -> u64 {
+    if length == 0 || piece_length == 0 {
+        return 0;
+    }
+    let end = offset + length;
+    let head_shared = offset % piece_length != 0;
+    let tail_shared = end % piece_length != 0 && end < total;
+    if offset / piece_length == (end - 1) / piece_length {
+        // The whole file sits in one piece.
+        return if head_shared || tail_shared { length } else { 0 };
+    }
+    let head = if head_shared { piece_length - offset % piece_length } else { 0 };
+    let tail = if tail_shared { end % piece_length } else { 0 };
+    head + tail
+}
+
+#[cfg(test)]
+mod shared_piece_tests {
+    use super::shared_piece_bytes;
+
+    const P: u64 = 256 * 1024;
+
+    #[test]
+    fn piece_aligned_files_share_nothing() {
+        assert_eq!(shared_piece_bytes(0, 4 * P, P, 8 * P), 0);
+        assert_eq!(shared_piece_bytes(4 * P, 4 * P, P, 8 * P), 0);
+    }
+
+    /// The overlap probe's layout: two 300 KiB files, 256 KiB pieces. The
+    /// engine credited the unselected B with 217088 bytes: exactly this bound.
+    #[test]
+    fn a_file_starting_mid_piece_shares_its_head() {
+        let size = 300 * 1024;
+        assert_eq!(shared_piece_bytes(0, size, P, 2 * size), size - P);
+        assert_eq!(shared_piece_bytes(size, size, P, 2 * size), 2 * P - size);
+        assert_eq!(2 * P - size, 217_088);
+    }
+
+    #[test]
+    fn a_file_inside_one_shared_piece_is_all_shared_and_the_torrent_edges_are_not() {
+        assert_eq!(shared_piece_bytes(10, 100, P, 3 * P), 100);
+        assert_eq!(shared_piece_bytes(0, 100, P, 100), 0);
+        assert_eq!(shared_piece_bytes(P + 5, 2 * P, P, 3 * P + 5), P - 5);
+    }
 }
 
 /// `GET /cache/files/{info_hash}` - the whole torrent's contents.
@@ -454,6 +511,10 @@ pub(crate) async fn files(
         Some(only) => only.into_iter().filter(|&i| i < all.len()).collect(),
         None => (0..all.len()).collect(),
     };
+    let piece_length = handle
+        .with_metadata(|m| u64::from(m.lengths.default_piece_length()))
+        .unwrap_or(0);
+    let total: u64 = all.iter().map(|file| file.length).sum();
     let out: Vec<TorrentFile> = all
         .iter()
         .enumerate()
@@ -464,6 +525,7 @@ pub(crate) async fn files(
             downloaded: stats.file_progress.get(index).copied().unwrap_or(0),
             selected: selected.contains(&index),
             video: is_video(&file.name),
+            shared_piece_bytes: shared_piece_bytes(file.offset, file.length, piece_length, total),
             path: file.path.clone(),
             length: file.length,
         })

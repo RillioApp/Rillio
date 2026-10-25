@@ -295,13 +295,18 @@ const rowVideoIds = ({ entry, described, rows, videos }) => {
 // The pack strip
 // ---------------------------------------------------------------------------
 
-// On disk: a complete file, or a partial one that is SELECTED. librqbit
-// credits a finished piece to every file it overlaps, so an unselected file
-// next to a downloading one shows a few bytes it was never asked for; those
-// are not a download. Being selected alone (queued, or streaming) is not on
-// disk either; that is `playable`, what Play may start.
+// On disk: a complete file; a partial one that is selected; or a partial
+// unselected one holding MORE than its shared-piece bytes. librqbit credits a
+// finished piece to every file it overlaps, so an unselected file beside a
+// downloading one shows up to `sharedPieceBytes` (the server derives it from
+// the piece length and the file's offset) it was never asked for; anything
+// beyond that is its own data, kept when it was deselected part-way
+// (deselecting never deletes bytes). Being selected alone (queued, or
+// streaming) is not on disk; that is `playable`, what Play may start.
 const isComplete = (file) => file.length > 0 && file.downloaded >= file.length;
-const onDisk = (file) => isComplete(file) || (file.selected === true && file.downloaded > 0);
+const keptBeyondOverlap = (file) => file.downloaded > (isNumber(file.sharedPieceBytes) ? file.sharedPieceBytes : 0);
+const onDisk = (file) => isComplete(file) ||
+    (file.downloaded > 0 && (file.selected === true || keptBeyondOverlap(file)));
 const playable = (file) => file.selected === true;
 
 /**

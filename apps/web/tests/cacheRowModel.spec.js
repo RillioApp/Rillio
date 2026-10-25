@@ -395,15 +395,33 @@ describe('the right-hand lines', () => {
     // librqbit credits a finished piece to every file it overlaps, so an
     // unselected neighbour of a downloading episode shows some bytes.
     test('a partial file counts as on disk only when selected; a complete one always', () => {
-        const files = packFiles.map((file) => (file.index === 3 ? { ...file, downloaded: 200 * 1024 } : file));
+        const files = packFiles.map((file) => (file.index === 3 ? { ...file, downloaded: 200 * 1024, sharedPieceBytes: 256 * 1024 } : file));
         const episodes = splitFiles(files).episodes;
         const rows = episodeRows({ episodes, videos: null, library: undefined });
         expect(packStrip(rows).map((bar) => bar.state)).toEqual(['disk', 'disk', 'disk', 'missing', 'missing']);
         expect(diskText(packEntry, episodes)).toBe('3 of 5 on disk · 33 MB');
         expect(onDisk({ length: 10, downloaded: 10, selected: false })).toBe(true);
-        expect(onDisk({ length: 10, downloaded: 4, selected: false })).toBe(false);
         expect(onDisk({ length: 10, downloaded: 4, selected: true })).toBe(true);
         expect(onDisk({ length: 10, downloaded: 0, selected: true })).toBe(false);
+    });
+
+    // Deselecting never deletes bytes: a file deselected part-way (a legacy
+    // pack narrowed on first play, or the row's own Stop) KEEPS its data. The
+    // server says how much of a file could be piece-overlap credit
+    // (sharedPieceBytes); more than that is the file's own.
+    test('unselected and partial: overlap is not on disk, real kept data is', () => {
+        // The probe's B: 217088 B credited, all of it shared-piece overlap.
+        expect(onDisk({ length: 307200, downloaded: 217088, selected: false, sharedPieceBytes: 217088 })).toBe(false);
+        // The probe's 'kept' B (1000 KiB, deselected part-way): the engine
+        // reports 479232 B, one whole piece beyond its 217088 shared bytes.
+        expect(onDisk({ length: 1024000, downloaded: 479232, selected: false, sharedPieceBytes: 217088 })).toBe(true);
+        // A deselected E04 at 800 MB of 1.4 GB: kept.
+        const e04 = { length: 1400 * MB, downloaded: 800 * MB, selected: false, sharedPieceBytes: 3 * MB };
+        expect(onDisk(e04)).toBe(true);
+        const files = packFiles.map((file) => (file.index === 3 ? { ...file, downloaded: 9 * MB, sharedPieceBytes: 256 * 1024 } : file));
+        const episodes = splitFiles(files).episodes;
+        expect(diskText(packEntry, episodes)).toBe('4 of 5 on disk · 33 MB');
+        expect(packStrip(episodeRows({ episodes, videos: null, library: undefined }))[3].state).toBe('disk');
     });
 
     test('a selected episode with no bytes yet is not on disk', () => {
