@@ -812,7 +812,7 @@ fn spawn_event_loop(ctrl: Arc<Controller>, app: AppHandle) {
                         serde_json::json!({ "reason": reason_str, "error": err }),
                     );
                 }
-                MpvEvent::Other => {}
+                MpvEvent::Other | MpvEvent::Empty => {}
             }
             }
         })

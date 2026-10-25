@@ -97,6 +97,10 @@ const CACHE_MAX_THUMBS: usize = 256;
 /// torrent region that is not downloaded yet stalls exactly here).
 const SEEK_SETTLE_MS: u64 = 4000;
 const SETTLE_POLL: Duration = Duration::from_millis(25);
+/// How many of mpv's error lines a libplacebo shadow keeps for its refusal: a
+/// gpu-next start failure ends in four that say why (measured with a window
+/// that cannot be used: no window, no GPU context, no VO, nothing to play).
+const MPV_ERRORS_KEPT: usize = 4;
 
 // Scene scan: the shadow sweeps the whole file at a coarse spacing, comparing
 // tiny luma grids of consecutive samples; strong differences are scene cuts.
@@ -270,6 +274,9 @@ struct Shadow {
     /// What the open stream needs, once mpv has reported it ([`settle`]).
     /// Nothing is captured before it is known and matches `render`.
     conversion: Option<Conversion>,
+    /// mpv's latest error lines (a libplacebo shadow asks for them), for the
+    /// refusal that says why gpu-next could not show the stream.
+    mpv_errors: std::cell::RefCell<Vec<String>>,
     /// The never-shown window a [`Render::Libplacebo`] shadow renders into.
     /// Declared after `mpv` because fields drop in order: mpv's own output
     /// window is a child of this one and must go first.
@@ -585,6 +592,11 @@ impl Shadow {
                         tracing::warn!("thumbs: option {name}={value} not applied: {e}");
                     }
                 }
+                // mpv's own error lines, so a refusal can say why gpu-next
+                // failed ([`Shadow::check_load`]). Diagnostics only.
+                if let Err(e) = mpv.request_log_messages("error") {
+                    tracing::debug!("thumbs: mpv error log unavailable: {e}");
+                }
             }
         }
         for (name, value) in [
@@ -617,17 +629,25 @@ impl Shadow {
             .map_err(|e| format!("thumbs: scaling to {width}px failed: {e}"))?;
         mpv.initialize()?;
         mpv.command(&["loadfile", url])?;
-        Ok(Self { mpv, width, render, conversion: None, _window: window })
+        Ok(Self {
+            mpv,
+            width,
+            render,
+            conversion: None,
+            mpv_errors: std::cell::RefCell::new(Vec::new()),
+            _window: window,
+        })
     }
 
     /// What the open stream needs ([`conversion_for`] over what mpv reports),
     /// waiting up to the seek budget for the first decoded frame. `Ok(None)`
-    /// while there is none (bytes not there yet: a later job asks again).
-    /// A libplacebo shadow also proves here that gpu-next came up: a decoded
-    /// frame with no configured VO means it never will, and that is an `Err`.
+    /// while there is none (bytes not there yet, or the machine is busy: a
+    /// later job asks again). A libplacebo shadow is only ready once its VO is
+    /// configured, and fails for good when mpv ends its load in error.
     fn read_conversion(&self) -> Result<Option<Conversion>, String> {
         let deadline = Instant::now() + Duration::from_millis(SEEK_SETTLE_MS);
         loop {
+            self.check_load()?;
             let profile = self.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
             let params = match self.mpv.get_property_string("video-params") {
                 Some(json) => VideoParams::parse(&json, profile.as_deref())?,
@@ -636,6 +656,9 @@ impl Shadow {
             if let Some(params) = params {
                 let renders = match self.render {
                     Render::Software => true,
+                    // A decoded frame whose VO is still configuring is slow,
+                    // not broken (seen with the player decoding 4K and the
+                    // subtitle model loading at once): wait, never refuse.
                     Render::Libplacebo => {
                         self.mpv.get_property_string("vo-configured").as_deref() == Some("yes")
                     }
@@ -643,16 +666,43 @@ impl Shadow {
                 if renders {
                     return conversion_for(&params).map(Some);
                 }
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "thumbs: a frame decoded but gpu-next never configured (current-vo: {})",
-                        self.mpv.get_property_string("current-vo").as_deref().unwrap_or("none")
-                    ));
-                }
-            } else if Instant::now() >= deadline {
+            }
+            if Instant::now() >= deadline {
                 return Ok(None);
             }
             std::thread::sleep(SETTLE_POLL);
+        }
+    }
+
+    /// Drain the shadow's events (nothing else reads them). For a libplacebo
+    /// shadow, a load mpv ended in error is final, and the `Err` carries mpv's
+    /// reason and its own error lines: the same stream just opened fine in
+    /// software, so what failed is the renderer (gpu-next could not start).
+    /// A software shadow keeps today's rule, a dead stream simply never shows
+    /// a frame and every job times out.
+    fn check_load(&self) -> Result<(), String> {
+        loop {
+            match self.mpv.wait_event(0.0) {
+                mpv::MpvEvent::Empty => return Ok(()),
+                mpv::MpvEvent::LogMessage { prefix, text, .. } => {
+                    let mut said = self.mpv_errors.borrow_mut();
+                    if said.len() == MPV_ERRORS_KEPT {
+                        said.remove(0);
+                    }
+                    said.push(format!("[{prefix}] {text}"));
+                }
+                mpv::MpvEvent::EndFile { reason, error }
+                    if reason == mpv::MPV_END_FILE_REASON_ERROR
+                        && self.render == Render::Libplacebo =>
+                {
+                    return Err(format!(
+                        "thumbs: gpu-next could not show the stream ({}); mpv said: {}",
+                        self.mpv.error_string(error),
+                        self.mpv_errors.borrow().join("; ")
+                    ));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1219,6 +1269,34 @@ mod tests {
             std::thread::sleep(SETTLE_POLL);
         }
         shadow
+    }
+
+    /// A libplacebo shadow whose load mpv ends in error is refused with mpv's
+    /// own reason, never left to time out job after job in silence. Driven
+    /// here by a file that does not exist, the same END_FILE error a gpu-next
+    /// that cannot start produces (measured: "no audio or video data played"
+    /// after "Error opening/initializing the selected video_out"). Needs
+    /// `libmpv-2.dll` (next to the test binary or via `RILLIO_LIBMPV`).
+    /// Run: `cargo test --lib thumbs::tests::libplacebo_load -- --ignored`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll"]
+    fn libplacebo_load_failure_is_refused_with_mpvs_reason() {
+        let missing = std::env::temp_dir().join("rillio-thumbs-no-such-file.mkv");
+        assert!(!missing.exists());
+        let missing = missing.to_string_lossy().to_string();
+        let shadow = Shadow::spawn(&missing, 448, Render::Libplacebo).expect("shadow spawn");
+        let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
+        let err = loop {
+            match shadow.read_conversion() {
+                Err(e) => break e,
+                Ok(None) => assert!(Instant::now() < deadline, "the failed load was never reported"),
+                Ok(Some(c)) => panic!("a missing file decided {c}"),
+            }
+        };
+        assert!(err.contains("gpu-next could not show the stream"), "{err}");
+        // The software shadow keeps its old rule: no frame, no verdict.
+        let software = Shadow::spawn(&missing, 448, Render::Software).expect("shadow spawn");
+        assert_eq!(software.read_conversion(), Ok(None));
     }
 
     /// The median and the 95th percentile (nearest rank) of `millis`.
