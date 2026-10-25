@@ -28,8 +28,9 @@ const { rowFacts, copyNotes, etaText, formatSize, formatOf, relativeTime } = req
     formatOf: (done: number, total: number) => string,
     relativeTime: (now: number, at: number) => string,
 };
-const { videoKey } = require('./cacheDetailsState') as {
+const { videoKey, stillOpen } = require('./cacheDetailsState') as {
     videoKey: (meta: CacheEntry['meta']) => string | null,
+    stillOpen: (openCard: string | null, entries: CacheEntry[] | null) => string | null,
 };
 const { parseReleaseInfo } = require('rillio/common/releaseInfo') as {
     parseReleaseInfo: (name: string) => { resolution: string | null, source: string | null, service: string | null, hdrLabel: string | null, group: string | null },
@@ -635,6 +636,10 @@ const Cached = ({ onClose }: Props) => {
     const toggleCard = useCallback((infoHash: string) => {
         setOpenCard((current) => (current === infoHash ? null : infoHash));
     }, []);
+    // A deleted download closes its card, so a re-add of the same hash starts closed.
+    useEffect(() => {
+        setOpenCard((current) => stillOpen(current, entries));
+    }, [entries]);
     const rowModels = heroModel !== null ? models.slice(1) : models;
 
     return (
