@@ -2,7 +2,7 @@
 // removed hashes, per-addon episode lists, retries, the open card.
 
 const {
-    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, applyFailure, prune,
+    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, applyFailure, makeFileListLoader, prune,
     videoKey, keepWanted, retryInMs, stillOpen,
 } = require('../src/routes/Cached/cacheDetailsState');
 
@@ -60,6 +60,63 @@ describe('file lists', () => {
         expect(book.generations).toEqual({});
     });
 });
+describe('makeFileListLoader: the loader the hook runs', () => {
+    // Responses resolve only when the test says so, in any order.
+    const setup = () => {
+        const pending = [];
+        const ref = { current: emptyBook('http://a') };
+        const committed = [];
+        let counter = 0;
+        const load = makeFileListLoader({
+            ref,
+            commit: (book) => committed.push(book.lists),
+            fetchList: (server, infoHash) => new Promise((resolve, reject) => pending.push({ server, infoHash, resolve, reject })),
+            nextGeneration: () => { counter += 1; return counter; },
+        });
+        const settle = (index, list) => { pending[index].resolve(list); return new Promise((r) => setTimeout(r, 0)); };
+        return { ref, committed, load, pending, settle };
+    };
+
+    test('two loads of one hash: the older answer, arriving last, is dropped', async () => {
+        const { ref, load, settle } = setup();
+        load('http://a', 'h');
+        load('http://a', 'h');
+        await settle(1, ['new']);
+        await settle(0, ['old']);
+        expect(ref.current.lists.h).toEqual(['new']);
+    });
+
+    test('a late answer from the old server never wipes the new server\'s lists', async () => {
+        const { ref, committed, load, settle } = setup();
+        load('http://a', 'h');
+        // The hook's effect moves the book to the new server.
+        ref.current = bookFor(ref.current, 'http://b');
+        load('http://b', 'h');
+        await settle(1, ['from b']);
+        await settle(0, ['from a']);
+        expect(ref.current.server).toBe('http://b');
+        expect(ref.current.lists).toEqual({ h: ['from b'] });
+        expect(committed).toEqual([{ h: ['from b'] }]);
+    });
+
+    test('a hash deleted and re-added within one round trip gets the new list only', async () => {
+        const { ref, load, settle } = setup();
+        load('http://a', 'h');
+        ref.current = prune(ref.current, []);
+        load('http://a', 'h');
+        await settle(0, ['deleted']);
+        expect(ref.current.lists.h).toBeUndefined();
+        await settle(1, ['re-added']);
+        expect(ref.current.lists.h).toEqual(['re-added']);
+    });
+
+    test('no request against another server\'s book', () => {
+        const { load, pending } = setup();
+        load('http://other', 'h');
+        expect(pending).toHaveLength(0);
+    });
+});
+
 describe('episode lists', () => {
     test('keyed by addon, type and id; movies and addon-less titles have none', () => {
         expect(videoKey({ metaId: 'tt1', type: 'series', metaTransportUrl: 'https://a/manifest.json' })).toBe('https://a/manifest.json|series|tt1');

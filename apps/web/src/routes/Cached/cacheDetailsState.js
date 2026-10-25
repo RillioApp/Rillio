@@ -52,6 +52,36 @@ const applyFailure = (book, server, infoHash, generation) => {
     return { ...book, signatures };
 };
 
+/**
+ * The file-list loader useFileLists runs, everything but React: the hook only
+ * hands it its ref and callbacks. `ref.current` is the current book (the
+ * hook's useRef); `commit(book)` publishes lists to the UI;
+ * `fetchList(server, infoHash)` resolves with the list or rejects;
+ * `nextGeneration()` draws from ONE counter that never resets. Returns
+ * load(server, infoHash) -> Promise. Every decision is made against
+ * ref.current at the moment it is needed (see beginRequest / applyResponse).
+ */
+const makeFileListLoader = ({ ref, commit, fetchList, nextGeneration, onError }) => (server, infoHash) => {
+    if (typeof server !== 'string' || server.length === 0) return Promise.resolve();
+    const mine = nextGeneration();
+    const started = beginRequest(ref.current, server, infoHash, mine);
+    if (started === null) return Promise.resolve();
+    ref.current = started;
+    return fetchList(server, infoHash).then(
+        (list) => {
+            const next = applyResponse(ref.current, server, infoHash, mine, list);
+            if (next === null) return;
+            ref.current = next;
+            commit(next);
+        },
+        (error) => {
+            if (typeof onError === 'function') onError(error, infoHash);
+            const next = applyFailure(ref.current, server, infoHash, mine);
+            if (next !== null) ref.current = next;
+        },
+    );
+};
+
 /** Forgets everything about hashes no longer in the list (a re-add refetches). */
 const prune = (book, hashes) => {
     const keep = (map) => Object.fromEntries(Object.entries(map).filter(([hash]) => hashes.includes(hash)));
@@ -88,6 +118,6 @@ const retryInMs = (cached, now) => (cached.videos !== null ? null : Math.max(0, 
 const stillOpen = (openCard, entries) => (openCard !== null && Array.isArray(entries) && entries.some((entry) => entry.infoHash === openCard) ? openCard : null);
 
 module.exports = {
-    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, applyFailure, prune, fileSignature,
+    RETRY_MS, emptyBook, bookFor, beginRequest, applyResponse, applyFailure, makeFileListLoader, prune, fileSignature,
     videoKey, keepWanted, retryInMs, stillOpen,
 };

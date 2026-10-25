@@ -14,7 +14,7 @@
 //     when the torrent's numbers move, so packs can be told apart from single
 //     episodes and every file can be managed from the row.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useCore } from 'rillio/core';
 import { serverFetch } from 'rillio/common/serverFetch';
 import type { CacheEntry } from './useCachedTorrents';
@@ -25,6 +25,13 @@ const details = require('./cacheDetailsState') as {
     beginRequest: (book: FileBook | null, server: string, infoHash: string, generation: number) => FileBook | null,
     applyResponse: (book: FileBook | null, server: string, infoHash: string, generation: number, list: TorrentFile[]) => FileBook | null,
     applyFailure: (book: FileBook | null, server: string, infoHash: string, generation: number) => FileBook | null,
+    makeFileListLoader: (deps: {
+        ref: { current: FileBook | null },
+        commit: (book: FileBook) => void,
+        fetchList: (server: string, infoHash: string) => Promise<TorrentFile[]>,
+        nextGeneration: () => number,
+        onError?: (error: unknown, infoHash: string) => void,
+    }) => (server: string, infoHash: string) => Promise<void>,
     prune: (book: FileBook, hashes: string[]) => FileBook,
     fileSignature: (entry: CacheEntry) => string,
     videoKey: (meta: CacheEntry['meta']) => string | null,
@@ -188,32 +195,24 @@ export const useFileLists = (entries: CacheEntry[] | null, serverUrl: unknown) =
     // within a round trip, or a server switched back and forth, can never see
     // an old request's answer apply.
     const generation = useRef(0);
-    const load = useCallback((infoHash: string) => {
-        if (server.length === 0) return Promise.resolve();
-        generation.current += 1;
-        const mine = generation.current;
-        // Decided against the CURRENT book: none, or another server's, makes no request.
-        const started = details.beginRequest(book.current, server, infoHash, mine);
-        if (started === null) return Promise.resolve();
-        book.current = started;
-        return serverFetch(new URL(`cache/files/${infoHash}`, server))
+    // Every decision lives in the tested loader (cacheDetailsState.makeFileListLoader);
+    // this hook only supplies the ref, the publisher and the fetch.
+    const loader = useMemo(() => details.makeFileListLoader({
+        ref: book,
+        commit,
+        nextGeneration: () => {
+            generation.current += 1;
+            return generation.current;
+        },
+        fetchList: (fromServer: string, infoHash: string) => serverFetch(new URL(`cache/files/${infoHash}`, fromServer))
             .then((resp) => {
                 if (!resp.ok) throw new Error(`cache/files responded ${resp.status}`);
-                return resp.json();
-            })
-            .then((list: TorrentFile[]) => {
-                // Null: the window moved to another server, or a newer request
-                // for this hash was made. Either way this answer is dropped.
-                const next = details.applyResponse(book.current, server, infoHash, mine, list);
-                if (next !== null) commit(next);
-            })
-            .catch((error: unknown) => {
-                // The row falls back to what /cache/list says; the next change retries.
-                console.error('Cached: listing a torrent failed', infoHash, error);
-                const next = details.applyFailure(book.current, server, infoHash, mine);
-                if (next !== null) book.current = next;
-            });
-    }, [server, commit]);
+                return resp.json() as Promise<TorrentFile[]>;
+            }),
+        // The row falls back to what /cache/list says; the next change retries.
+        onError: (error: unknown, infoHash: string) => console.error('Cached: listing a torrent failed', infoHash, error),
+    }), [commit]);
+    const load = useCallback((infoHash: string) => loader(server, infoHash), [loader, server]);
     useEffect(() => {
         if (entries === null) return;
         let current = details.prune(details.bookFor(book.current, server), entries.map((entry) => entry.infoHash));
