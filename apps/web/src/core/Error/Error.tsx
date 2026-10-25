@@ -17,7 +17,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 // The active profile's buckets (crates/core/src/constants.rs) plus the web-side
 // per-profile keys. Clearing is scoped to the ACTIVE profile: a corrupt boot is
 // a per-profile problem, and localStorage.clear() would destroy every OTHER
-// profile on the device too.
+// profile on the device too. `dismissed_events` is a retired bucket nothing
+// reads any more; it stays listed so Clear data also removes it from profiles
+// written by older versions.
 const PROFILE_KEYS = [
     'schema_version', 'profile', 'library', 'library_recent', 'streams',
     'search_history', 'streaming_server_urls', 'notifications', 'calendar',

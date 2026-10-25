@@ -4,7 +4,6 @@ use crate::runtime::msg::{Action, ActionCtx};
 use crate::runtime::{Env, EnvFutureExt, Runtime, RuntimeAction, TryEnvFuture};
 use crate::types::addon::{Descriptor, Manifest};
 use crate::types::api::{APIResult, SuccessResponse};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::{Auth, AuthKey, GDPRConsent, Profile, User};
@@ -59,9 +58,7 @@ fn actionctx_installaddon_install() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,
@@ -167,9 +164,7 @@ fn actionctx_installaddon_install_with_user() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,
@@ -291,9 +286,7 @@ fn actionctx_installaddon_update() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,
@@ -369,9 +362,7 @@ fn actionctx_installaddon_already_installed() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,

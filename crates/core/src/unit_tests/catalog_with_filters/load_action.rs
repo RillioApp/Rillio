@@ -4,7 +4,6 @@ use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionLoad};
 use crate::runtime::{EnvFutureExt, Runtime, RuntimeAction, RuntimeEvent, TryEnvFuture};
 use crate::types::addon::{ExtraValue, ResourcePath, ResourceRequest, ResourceResponse};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::Profile;
@@ -53,9 +52,7 @@ fn default_catalog() {
         StreamsBucket::default(),
         ServerUrlsBucket::new::<TestEnv>(None),
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
     let (discover, effects) = CatalogWithFilters::<MetaItemPreview>::new(&ctx.profile);
     let (runtime, rx) = Runtime::<TestEnv, _>::new(
         TestModel { ctx, discover },
@@ -155,9 +152,7 @@ fn search_catalog() {
         StreamsBucket::default(),
         ServerUrlsBucket::new::<TestEnv>(None),
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
     let (discover, effects) = CatalogWithFilters::<MetaItemPreview>::new(&ctx.profile);
     let (runtime, rx) = Runtime::<TestEnv, _>::new(
         TestModel { ctx, discover },

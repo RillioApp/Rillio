@@ -8,9 +8,8 @@ use crate::models::streaming_server::PlaybackDevice;
 use crate::runtime::EnvError;
 use crate::types::addon::{Descriptor, Manifest, ResourceRequest, ResourceResponse};
 use crate::types::api::{
-    APIRequest, AuthRequest, DataExportResponse, DatastoreRequest, GetModalResponse,
-    GetNotificationResponse, LinkCodeResponse, LinkDataResponse, SeekLogRequest, SkipGapsRequest,
-    SkipGapsResponse, SuccessResponse,
+    APIRequest, AuthRequest, DataExportResponse, DatastoreRequest, LinkCodeResponse,
+    LinkDataResponse, SeekLogRequest, SkipGapsRequest, SkipGapsResponse, SuccessResponse,
 };
 use crate::types::library::{LibraryBucket, LibraryItem, LibraryItemId};
 use crate::types::profile::{Auth, AuthKey, Profile, User};
@@ -163,15 +162,6 @@ pub enum Internal {
     SkipGapsResult(SkipGapsRequest, Result<SkipGapsResponse, CtxError>),
     /// The result of querying the data for LocalSearch
     LoadLocalSearchResult(Url, Result<Vec<Searchable>, EnvError>),
-    /// Result for getModal request
-    GetModalResult(APIRequest, Result<Option<GetModalResponse>, CtxError>),
-    /// Result for getNotification request
-    GetNotificationResult(
-        APIRequest,
-        Result<Option<GetNotificationResponse>, CtxError>,
-    ),
-    /// When dismissed events changed
-    DismissedEventsChanged,
     RatingGetStatusResult(MetaItemId, Result<RatingGetStatusResponse, EnvError>),
     RatingSendResult(MetaItemId, Result<RatingSendResponse, EnvError>),
     /// Internal to core, sends the watched update when needed:

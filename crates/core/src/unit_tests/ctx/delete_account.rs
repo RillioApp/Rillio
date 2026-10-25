@@ -7,7 +7,6 @@ use crate::{
     },
     types::{
         api::{APIResult, SuccessResponse},
-        events::DismissedEventsBucket,
         library::LibraryBucket,
         notifications::NotificationsBucket,
         profile::{Auth, AuthKey, GDPRConsent, Password, Profile, User},
@@ -89,9 +88,7 @@ fn actionctx_delete_account() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,

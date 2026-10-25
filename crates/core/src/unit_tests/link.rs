@@ -4,7 +4,6 @@ use crate::models::link::Link;
 use crate::runtime::msg::{Action, ActionLink, ActionLoad};
 use crate::runtime::{EnvFutureExt, Runtime, RuntimeAction, TryEnvFuture};
 use crate::types::api::{APIResult, LinkAuthKey, LinkCodeResponse, LinkDataResponse};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::Profile;
@@ -64,9 +63,7 @@ fn create_link_code() {
             StreamsBucket::default(),
             ServerUrlsBucket::new::<TestEnv>(None),
             NotificationsBucket::new::<TestEnv>(None, vec![]),
-            SearchHistoryBucket::default(),
-            DismissedEventsBucket::default(),
-        ),
+            SearchHistoryBucket::default(),        ),
         link: Link::default(),
     };
     let (runtime, _rx) = Runtime::<TestEnv, _>::new(model, vec![], 1000);

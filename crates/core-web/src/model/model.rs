@@ -25,7 +25,7 @@ use rillio_core::{
     },
     runtime::Effects,
     types::{
-        addon::Descriptor, api::LinkAuthKey, events::DismissedEventsBucket, library::LibraryBucket,
+        addon::Descriptor, api::LinkAuthKey, library::LibraryBucket,
         notifications::NotificationsBucket, profile::Profile, resource::MetaItemPreview,
         search_history::SearchHistoryBucket, server_urls::ServerUrlsBucket, streams::StreamsBucket,
     },
@@ -67,7 +67,6 @@ impl WebModel {
         server_urls: ServerUrlsBucket,
         notifications: NotificationsBucket,
         search_history: SearchHistoryBucket,
-        dismissed_events: DismissedEventsBucket,
     ) -> (WebModel, Effects) {
         let (continue_watching_preview, continue_watching_preview_effects) =
             ContinueWatchingPreview::new(&library, &notifications);
@@ -90,7 +89,6 @@ impl WebModel {
                 server_urls,
                 notifications,
                 search_history,
-                dismissed_events,
             ),
             auth_link: Default::default(),
             data_export: Default::default(),

@@ -3,7 +3,6 @@ use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionCtx};
 use crate::runtime::{Runtime, RuntimeAction};
 use crate::types::addon::{Descriptor, Manifest};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::Profile;
@@ -91,9 +90,7 @@ fn actionctx_addon_upgrade() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,
@@ -184,9 +181,7 @@ fn actionctx_addon_upgrade_fail_due_to_different_url() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,

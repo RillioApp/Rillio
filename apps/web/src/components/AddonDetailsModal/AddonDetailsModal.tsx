@@ -197,7 +197,7 @@ const AddonDetailsModal = ({ transportUrl, onCloseRequest }: Props) => {
     return (
         <Dialog open onOpenChange={(next: boolean) => { if (!next) emitClose('close'); }}>
             <AddonDetailsShell
-                title={t('STREMIO_COMMUNITY_ADDON')}
+                title={t('ADDON_ADDON')}
                 background={background}
                 footer={footer}
             >
@@ -216,7 +216,7 @@ const AddonDetailsModalFallback = ({ onCloseRequest }: Props) => {
     }, [onCloseRequest]);
     return (
         <Dialog open onOpenChange={(next: boolean) => { if (!next) emitClose(); }}>
-            <AddonDetailsShell title={t('STREMIO_COMMUNITY_ADDON')}>
+            <AddonDetailsShell title={t('ADDON_ADDON')}>
                 <div className="py-6 text-center text-fg-muted">{t('ADDON_LOADING_MANIFEST')}</div>
             </AddonDetailsShell>
         </Dialog>

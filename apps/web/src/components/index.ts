@@ -4,7 +4,6 @@ import ContextMenu from './ContextMenu';
 import ContinueWatchingItem from './ContinueWatchingItem';
 import DelayedRenderer from './DelayedRenderer';
 import EmptyState from './EmptyState';
-import EventModal from './EventModal';
 import HorizontalScroll from './HorizontalScroll';
 import Image from './Image';
 import LibItem from './LibItem';
@@ -29,7 +28,6 @@ export {
     ContinueWatchingItem,
     DelayedRenderer,
     EmptyState,
-    EventModal,
     HorizontalScroll,
     Image,
     LibItem,

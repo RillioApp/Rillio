@@ -2,7 +2,6 @@ use crate::constants::STREAMING_SERVER_URLS_STORAGE_KEY;
 use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionCtx};
 use crate::runtime::{Env, Runtime, RuntimeAction};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::Profile;
@@ -27,9 +26,7 @@ fn test_add_server_url() {
         StreamsBucket::default(),
         ServerUrlsBucket::new::<TestEnv>(None),
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
     let (runtime, _rx) = Runtime::<TestEnv, _>::new(TestModel { ctx }, vec![], 1000);
     let new_url = Url::parse("http://localhost:11470").unwrap();
     TestEnv::run(|| {
@@ -83,9 +80,7 @@ fn test_delete_server_url() {
         StreamsBucket::default(),
         server_urls,
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
     let (runtime, _rx) = Runtime::<TestEnv, _>::new(TestModel { ctx }, vec![], 1000);
     TestEnv::run(|| {
         runtime.dispatch(RuntimeAction {
