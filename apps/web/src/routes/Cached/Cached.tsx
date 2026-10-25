@@ -28,6 +28,9 @@ const { rowFacts, copyNotes, etaText, formatSize, formatOf, relativeTime } = req
     formatOf: (done: number, total: number) => string,
     relativeTime: (now: number, at: number) => string,
 };
+const { videoKey } = require('./cacheDetailsState') as {
+    videoKey: (meta: CacheEntry['meta']) => string | null,
+};
 const { parseReleaseInfo } = require('rillio/common/releaseInfo') as {
     parseReleaseInfo: (name: string) => { resolution: string | null, source: string | null, service: string | null, hdrLabel: string | null, group: string | null },
 };
@@ -431,7 +434,7 @@ const Cached = ({ onClose }: Props) => {
     // Identify anything the Player never got to write metadata for.
     useMetadataMatcher(entries, refresh);
     const library = useLibraryMap();
-    const videosByMeta = useTitleVideos(entries);
+    const videosByKey = useTitleVideos(entries);
     const { lists: filesByHash, reload: reloadFiles } = useFileLists(entries, profile.settings.streamingServerUrl);
     // The addon each title was streamed from, by transport url ("From Torrentio").
     const addonNames = useMemo(() => {
@@ -574,14 +577,15 @@ const Cached = ({ onClose }: Props) => {
             map.set(entry.infoHash, rowFacts({
                 entry,
                 files: filesByHash[entry.infoHash] ?? null,
-                videos: entry.meta !== undefined ? videosByMeta[entry.meta.metaId] : undefined,
+                // By the addon the list came from, not the bare meta id.
+                videos: (() => { const key = videoKey(entry.meta); return key !== null ? videosByKey[key] : undefined; })(),
                 library: entry.meta !== undefined ? library[entry.meta.metaId] : undefined,
                 addonNames,
                 now,
             }));
         });
         return map;
-    }, [entries, filesByHash, videosByMeta, library, addonNames]);
+    }, [entries, filesByHash, videosByKey, library, addonNames]);
     const searchName = useCallback((entry: CacheEntry): string => {
         const described = facts.get(entry.infoHash)?.described;
         return described !== undefined ? `${described.title} ${described.subtitle ?? ''}` : entry.name;

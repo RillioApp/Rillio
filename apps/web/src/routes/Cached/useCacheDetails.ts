@@ -20,6 +20,24 @@ import { serverFetch } from 'rillio/common/serverFetch';
 import type { CacheEntry } from './useCachedTorrents';
 import type { TorrentFile } from './TorrentFiles';
 
+const details = require('./cacheDetailsState') as {
+    bookFor: (book: FileBook | null, server: string) => FileBook,
+    beginRequest: (book: FileBook, infoHash: string) => { book: FileBook, generation: number },
+    applyResponse: (book: FileBook, server: string, infoHash: string, generation: number, list: TorrentFile[]) => FileBook,
+    prune: (book: FileBook, hashes: string[]) => FileBook,
+    fileSignature: (entry: CacheEntry) => string,
+    videoKey: (meta: CacheEntry['meta']) => string | null,
+    keepWanted: <T>(lists: Record<string, T>, keys: string[]) => Record<string, T>,
+    retryInMs: (cached: { videos: unknown, at: number }, now: number) => number | null,
+};
+
+type FileBook = {
+    server: string,
+    generations: Record<string, number>,
+    lists: Record<string, TorrentFile[]>,
+    signatures: Record<string, string>,
+};
+
 export type LibraryEntry = {
     removed: boolean,
     watched: boolean,
@@ -67,7 +85,6 @@ export const useLibraryMap = (): Record<string, LibraryEntry> => {
 
 // Session cache of episode lists, keyed by addon + type + id. `null` is a
 // failed fetch, retried after RETRY_MS (an addon that was down may be back).
-const RETRY_MS = 5 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 10000;
 const videoCache = new Map<string, { videos: MetaVideo[] | null, at: number }>();
 const inFlight = new Map<string, Promise<MetaVideo[] | null>>();
@@ -101,64 +118,104 @@ const fetchVideos = (key: string, url: string): Promise<MetaVideo[] | null> => {
     return request;
 };
 
-/** metaId -> its episode list, null when it could not be fetched; absent while loading. */
+/**
+ * The episode list of every identified series, keyed by the addon, type and id
+ * it came from (`videoKey`): null when it could not be fetched, absent while
+ * loading. Keys no longer wanted are dropped. A failure is retried once
+ * RETRY_MS has passed (a timer per failed key, cleared on change).
+ */
 export const useTitleVideos = (entries: CacheEntry[] | null): Record<string, MetaVideo[] | null> => {
     const [videos, setVideos] = useState<Record<string, MetaVideo[] | null>>({});
+    // Bumped by a retry timer to re-run the fetch effect for an unchanged list.
+    const [retryTick, setRetryTick] = useState(0);
     const wanted = (entries ?? [])
         .map((entry) => entry.meta)
-        .filter((meta): meta is NonNullable<CacheEntry['meta']> =>
-            meta !== undefined && meta.type !== 'movie' && typeof meta.metaTransportUrl === 'string' && meta.metaTransportUrl.length > 0);
-    const signature = wanted.map((meta) => `${meta.metaTransportUrl}|${meta.type}|${meta.metaId}`).sort().join(',');
+        .filter((meta): meta is NonNullable<CacheEntry['meta']> => details.videoKey(meta) !== null);
+    const keys = [...new Set(wanted.map((meta) => details.videoKey(meta) as string))].sort();
+    const signature = keys.join(',');
     useEffect(() => {
         let cancelled = false;
+        const timers: ReturnType<typeof setTimeout>[] = [];
+        setVideos((current) => details.keepWanted(current, keys));
+        const scheduleRetry = (cached: { videos: MetaVideo[] | null, at: number }) => {
+            const delay = details.retryInMs(cached, Date.now());
+            if (delay !== null) timers.push(setTimeout(() => setRetryTick((tick) => tick + 1), delay + 50));
+        };
         wanted.forEach((meta) => {
-            const key = `${meta.metaTransportUrl}|${meta.type}|${meta.metaId}`;
+            const key = details.videoKey(meta) as string;
             const cached = videoCache.get(key);
-            if (cached !== undefined && (cached.videos !== null || Date.now() - cached.at < RETRY_MS)) {
-                setVideos((current) => (current[meta.metaId] === cached.videos ? current : { ...current, [meta.metaId]: cached.videos }));
+            if (cached !== undefined && (cached.videos !== null || (details.retryInMs(cached, Date.now()) as number) > 0)) {
+                setVideos((current) => (current[key] === cached.videos ? current : { ...current, [key]: cached.videos }));
+                scheduleRetry(cached);
                 return;
             }
+            // fetchVideos dedupes a request already in flight for this key.
             fetchVideos(key, metaUrl(meta.metaTransportUrl as string, meta.type, meta.metaId)).then((list) => {
-                if (!cancelled) setVideos((current) => ({ ...current, [meta.metaId]: list }));
+                if (cancelled) return;
+                setVideos((current) => ({ ...current, [key]: list }));
+                const after = videoCache.get(key);
+                if (after !== undefined) scheduleRetry(after);
             });
         });
-        return () => { cancelled = true; };
+        return () => {
+            cancelled = true;
+            timers.forEach((timer) => clearTimeout(timer));
+        };
         // The signature carries everything the effect reads from `wanted`.
-    }, [signature]);
+    }, [signature, retryTick]);
     return videos;
 };
 
 /**
- * infoHash -> the torrent's whole file list (absent until read). Re-read when
- * an entry's numbers move (bytes, selection size, state); `reload` re-reads
- * one at once (after a selection change).
+ * infoHash -> the torrent's whole file list (absent until read), for the
+ * current streaming server only. Re-read when an entry's numbers move (bytes,
+ * selection size, state); `reload` re-reads one at once (after a selection
+ * change). An older response never overwrites a newer one (a request
+ * generation per hash), and a hash that leaves the list is forgotten, so a
+ * re-add starts from scratch.
  */
 export const useFileLists = (entries: CacheEntry[] | null, serverUrl: unknown) => {
+    const server = typeof serverUrl === 'string' ? serverUrl : '';
+    const book = useRef<FileBook | null>(null);
     const [lists, setLists] = useState<Record<string, TorrentFile[]>>({});
-    const seen = useRef<Record<string, string>>({});
+    const commit = useCallback((next: FileBook) => {
+        book.current = next;
+        setLists(next.lists);
+    }, []);
     const load = useCallback((infoHash: string) => {
-        if (typeof serverUrl !== 'string') return Promise.resolve();
-        return serverFetch(new URL(`cache/files/${infoHash}`, serverUrl))
+        if (server.length === 0) return Promise.resolve();
+        const started = details.beginRequest(details.bookFor(book.current, server), infoHash);
+        book.current = started.book;
+        return serverFetch(new URL(`cache/files/${infoHash}`, server))
             .then((resp) => {
                 if (!resp.ok) throw new Error(`cache/files responded ${resp.status}`);
                 return resp.json();
             })
-            .then((list: TorrentFile[]) => setLists((current) => ({ ...current, [infoHash]: list })))
+            .then((list: TorrentFile[]) => {
+                commit(details.applyResponse(details.bookFor(book.current, server), server, infoHash, started.generation, list));
+            })
             .catch((error: unknown) => {
-                // The row falls back to what /cache/list says; a later change retries.
+                // The row falls back to what /cache/list says; the next change retries.
                 console.error('Cached: listing a torrent failed', infoHash, error);
-                delete seen.current[infoHash];
+                const current = details.bookFor(book.current, server);
+                const { [infoHash]: _forgotten, ...signatures } = current.signatures;
+                book.current = { ...current, signatures };
             });
-    }, [serverUrl]);
+    }, [server, commit]);
     useEffect(() => {
-        (entries ?? []).forEach((entry) => {
+        if (entries === null) return;
+        let current = details.prune(details.bookFor(book.current, server), entries.map((entry) => entry.infoHash));
+        const toLoad: string[] = [];
+        entries.forEach((entry) => {
             // A torrent set aside has no file list to read.
             if (entry.state === 'waiting') return;
-            const signature = `${entry.downloaded}|${entry.total}|${entry.fileCount}|${entry.state}`;
-            if (seen.current[entry.infoHash] === signature) return;
-            seen.current[entry.infoHash] = signature;
-            load(entry.infoHash);
+            const signature = details.fileSignature(entry);
+            if (current.signatures[entry.infoHash] === signature) return;
+            current = { ...current, signatures: { ...current.signatures, [entry.infoHash]: signature } };
+            toLoad.push(entry.infoHash);
         });
-    }, [entries, load]);
+        commit(current);
+        toLoad.forEach((infoHash) => load(infoHash));
+    }, [entries, server, load, commit]);
     return { lists, reload: load };
 };
