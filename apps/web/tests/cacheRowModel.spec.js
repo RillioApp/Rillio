@@ -6,7 +6,7 @@
 
 const {
     splitFiles, describeEntry, episodeRows, itemView, packStrip, packSummary,
-    diskText, viewText, copyNotes, relativeTime, exactTime, clockTime, recencyOf, primaryAction, rowFacts, etaText,
+    diskText, viewText, copyNotes, relativeTime, exactTime, clockTime, recencyOf, primaryAction, rowFacts, etaText, lastPlayOf,
 } = require('../src/routes/Cached/cacheRowModel');
 
 const NOW = Date.parse('2026-10-25T14:00:00');
@@ -315,25 +315,48 @@ describe('the right-hand lines', () => {
         expect(diskText(packEntry, splitFiles(packFiles).episodes)).toBe('3 of 5 on disk · 33 MB');
     });
 
-    test('viewing and recency', () => {
-        expect(viewText({ view: { state: 'watched' }, recency: { kind: 'played', at: NOW - DAY } }, NOW)).toBe('Watched · Played yesterday');
-        expect(viewText({ view: { state: 'partial', offset: 432000, duration: 1440000 }, recency: { kind: 'played', at: NOW - 3 * DAY } }, NOW))
-            .toBe('Stopped at 7:12 of 24:00 · 3 days ago');
-        expect(viewText({ view: { state: 'unwatched' }, recency: { kind: 'added', at: NOW - 40 * 60 * 1000 } }, NOW)).toBe('Added 40 min ago · Not started');
-        expect(viewText({ view: null, recency: { kind: 'added', at: NOW - 5 * DAY } }, NOW)).toBe('Added 5 days ago');
-        expect(viewText({ view: { state: 'watched', source: 'cache' }, recency: { kind: 'added', at: NOW - 7 * DAY } }, NOW)).toBe('Watched · Added 1 week ago');
-        expect(viewText({ view: null, recency: { kind: 'played', at: NOW - DAY, label: 'E02' } }, NOW)).toBe('Played E02 yesterday');
+    test('viewing and recency: library facts are about the episode, recency about this copy', () => {
+        const play = { at: NOW - DAY, label: null };
+        expect(viewText({ view: { state: 'watched' }, recency: { kind: 'added', at: NOW - 3 * DAY }, play, noun: 'Episode' }, NOW))
+            .toBe('Episode watched yesterday');
+        expect(viewText({ view: { state: 'watched' }, recency: { kind: 'added', at: NOW - 3 * DAY }, play: null, noun: 'Movie' }, NOW))
+            .toBe('Movie watched · Added 3 days ago');
+        expect(viewText({ view: { state: 'partial', offset: 432000, duration: 1440000 }, recency: { kind: 'added', at: NOW - 5 * DAY }, play: { at: NOW - 3 * DAY }, noun: 'Episode' }, NOW))
+            .toBe('Episode stopped at 7:12 of 24:00 3 days ago');
+        expect(viewText({ view: { state: 'unwatched' }, recency: { kind: 'added', at: NOW - 40 * 60 * 1000 }, play: null, noun: 'Episode' }, NOW))
+            .toBe('Added 40 min ago · Episode not started');
+        expect(viewText({ view: null, recency: { kind: 'added', at: NOW - 5 * DAY }, play: null }, NOW)).toBe('Added 5 days ago');
+        // The player marked THIS torrent watched: about this copy.
+        expect(viewText({ view: { state: 'watched', source: 'cache', at: NOW - 20 * 60 * 1000 }, recency: { kind: 'watched', at: NOW - 20 * 60 * 1000 } }, NOW))
+            .toBe('Watched 20 min ago');
+        expect(viewText({ view: null, recency: { kind: 'added', at: NOW - 3 * DAY }, play: { at: NOW - DAY, label: 'E02' } }, NOW)).toBe('E02 last played yesterday');
     });
 
-    test('recency: played only when the library\'s last video is this row\'s', () => {
+    // The library cannot tell which copy of an episode was played: its play
+    // time never dates or ranks a copy. Only this torrent's own evidence does.
+    test('recency is this copy\'s: added, or watched here (watchedAt)', () => {
+        expect(recencyOf({ entry: uhdEntry })).toEqual({ kind: 'added', at: uhdEntry.addedAt });
+        expect(recencyOf({ entry: { ...webEntry, watchedAt: NOW - 20 * 60 * 1000 } })).toEqual({ kind: 'watched', at: NOW - 20 * 60 * 1000 });
+        // A watched mark older than the add (a re-add) does not count.
+        expect(recencyOf({ entry: { ...webEntry, watchedAt: webEntry.addedAt - DAY } })).toEqual({ kind: 'added', at: webEntry.addedAt });
+    });
+
+    test('two copies of one episode: same episode fact, each its own recency', () => {
+        const library = libraryWith({ watchedField: WATCHED_E1_E2 });
+        const a = rowFacts({ entry: { ...uhdEntry, addedAt: NOW - 3 * DAY }, files: null, videos: VIDEOS, library, addonNames: {}, now: NOW });
+        const b = rowFacts({ entry: { ...webEntry, watched: false, addedAt: NOW - 2 * DAY }, files: null, videos: VIDEOS, library, addonNames: {}, now: NOW });
+        expect(a.viewLine).toBe('Episode stopped at 28:00 of 54:00 yesterday');
+        expect(b.viewLine).toBe('Episode stopped at 28:00 of 54:00 yesterday');
+        expect(a.recencyAt).toBe(NOW - 3 * DAY);
+        expect(b.recencyAt).toBe(NOW - 2 * DAY);
+        expect(a.details).not.toMatch(/This copy watched/);
+    });
+
+    test('lastPlayOf: only the library\'s own last video, with its label', () => {
         const library = libraryWith({});
-        expect(recencyOf({ entry: { ...uhdEntry, addedAt: NOW - 3 * DAY }, videoIds: ['tt11280740:2:3'], library })).toEqual({ kind: 'played', at: NOW - DAY, label: null });
-        expect(recencyOf({ entry: uhdEntry, videoIds: ['tt11280740:2:1'], library })).toEqual({ kind: 'added', at: uhdEntry.addedAt });
-        expect(recencyOf({ entry: packEntry, videoIds: ['tt11280740:2:1', 'tt11280740:2:3'], library, labels: { 'tt11280740:2:3': 'E03' } }))
-            .toEqual({ kind: 'played', at: NOW - DAY, label: 'E03' });
-        // Played long before it was added (another copy): the newer fact wins.
-        const old = libraryWith({ lastWatched: new Date(NOW - 30 * DAY).toISOString() });
-        expect(recencyOf({ entry: uhdEntry, videoIds: ['tt11280740:2:3'], library: old })).toEqual({ kind: 'added', at: uhdEntry.addedAt });
+        expect(lastPlayOf({ videoIds: ['tt11280740:2:3'], library })).toEqual({ at: NOW - DAY, label: null });
+        expect(lastPlayOf({ videoIds: ['tt11280740:2:1'], library })).toBeNull();
+        expect(lastPlayOf({ videoIds: ['tt11280740:2:3'], library, labels: { 'tt11280740:2:3': 'E03' } })).toEqual({ at: NOW - DAY, label: 'E03' });
     });
 });
 
@@ -408,11 +431,11 @@ describe('rowFacts: everything one row shows', () => {
         expect(facts.strip.map((bar) => bar.state)).toEqual(['watched', 'watched', 'partial', 'missing', 'missing']);
         expect(facts.summary).toBe('E01 to E02 watched, E03 halfway');
         expect(facts.action.label).toBe('Resume E03');
-        expect(facts.viewLine).toBe('Played E03 yesterday');
-        expect(facts.details).toBe(`From Torrentio · Added ${exactTime(packEntry.addedAt)} · Last played ${exactTime(NOW - DAY)} · 33 of 70 MB on disk`);
+        expect(facts.viewLine).toBe('E03 last played yesterday');
+        expect(facts.details).toBe(`From Torrentio · Added ${exactTime(packEntry.addedAt)} · E03 last played ${exactTime(NOW - DAY)} · 33 of 70 MB on disk`);
         expect(facts.other.map((file) => file.path)).toEqual(['NTb.nfo']);
         expect(facts.copyKey.covers).toEqual([[2, 1], [2, 2], [2, 3], [2, 4], [2, 5]]);
-        expect(facts.recencyAt).toBe(NOW - DAY);
+        expect(facts.recencyAt).toBe(packEntry.addedAt);
     });
 
     test('an unidentified torrent: cleaned name, no viewing claims, added recency', () => {
