@@ -450,7 +450,7 @@ const timeOf = (value) => {
  * What makes THIS copy recent: when it was added, or when the player marked
  * this very torrent watched (`watchedAt`), whichever is later. Only
  * torrent-level evidence: the library cannot tell which copy of an episode was
- * played, so its play time never ranks or dates a copy (see lastPlayOf).
+ * played, so its time never ranks or dates a copy (see lastActivityOf).
  * Returns { kind: 'added' | 'watched', at }.
  */
 const recencyOf = ({ entry }) => {
@@ -460,14 +460,21 @@ const recencyOf = ({ entry }) => {
 };
 
 /**
- * When the library last played one of the row's videos: a fact about the
- * EPISODE (or movie), shown in those words ("Episode watched yesterday"),
- * never as this copy's activity. { at, label } or null. labels maps a video
- * id to its episode label (packs).
+ * The library's last activity on one of the row's videos: { at, label } or
+ * null. "Activity", not "play": the core's last_watched also moves when a
+ * notification is dismissed or an episode is marked watched (raised to its
+ * release date), and nothing tells those apart from playback. So it never
+ * dates a viewing line; the details show it as "Last activity". And
+ * advance_to_video (finishing an episode past the credits, or marking it
+ * watched) moves video_id on to the NEXT episode with time_offset = 1: that
+ * placeholder is no activity on the next episode at all (an offset of 0 is a
+ * title watched to its end, which is). labels maps a video id to its episode
+ * label (packs).
  */
-const lastPlayOf = ({ videoIds, library, labels }) => {
+const lastActivityOf = ({ videoIds, library, labels }) => {
     if (library === undefined || library === null || typeof library.videoId !== 'string') return null;
     if (!videoIds.includes(library.videoId)) return null;
+    if (isNumber(library.timeOffset) && library.timeOffset > 0 && library.timeOffset < MIN_OFFSET_MS) return null;
     const at = timeOf(library.lastWatched);
     if (at === null) return null;
     return { at, label: labels && labels[library.videoId] ? labels[library.videoId] : null };
@@ -475,34 +482,27 @@ const lastPlayOf = ({ videoIds, library, labels }) => {
 
 /**
  * The viewing + recency line under the on-disk line. view: the row's viewing
- * state; recency: this copy's (recencyOf); play: the title-level last play
- * (lastPlayOf); noun: 'Episode' | 'Movie' for library facts.
+ * state, said about the episode or movie (noun: 'Episode' | 'Movie'); the time
+ * on it is always this copy's own (recencyOf: added, or watched here).
  */
-const viewText = ({ view, recency, play, noun }, now) => {
+const viewText = ({ view, recency, noun }, now) => {
     const rel = (at) => relativeTime(now, at);
     const subject = noun || 'Title';
     const copy = recency && isNumber(recency.at) && recency.at > 0 ?
         (recency.kind === 'watched' ? `Watched ${rel(recency.at)}` : `Added ${rel(recency.at)}`)
         :
         null;
-    if (view === null || view === undefined) {
-        if (play) return `${play.label ?? subject} last played ${rel(play.at)}`;
-        return copy;
-    }
+    const withCopy = (text) => (copy !== null ? `${text} · ${copy}` : text);
+    if (view === null || view === undefined) return copy;
     if (view.state === 'watched') {
         // The player marked THIS torrent watched: about this copy.
         if (view.source === 'cache') return isNumber(view.at) ? `Watched ${rel(view.at)}` : 'Watched';
-        if (play) return `${subject} watched ${rel(play.at)}`;
-        return copy !== null ? `${subject} watched · ${copy}` : `${subject} watched`;
+        return withCopy(`${subject} watched`);
     }
-    if (view.state === 'partial') {
-        const stopped = `${subject} stopped at ${clockTime(view.offset)} of ${clockTime(view.duration)}`;
-        return play ? `${stopped} ${rel(play.at)}` : copy !== null ? `${stopped} · ${copy}` : stopped;
-    }
-    if (view.state === 'partly') return copy !== null ? `Partly watched · ${copy}` : 'Partly watched';
+    if (view.state === 'partial') return withCopy(`${subject} stopped at ${clockTime(view.offset)} of ${clockTime(view.duration)}`);
+    if (view.state === 'partly') return withCopy('Partly watched');
     return copy !== null ? `${copy} · ${subject} not started` : `${subject} not started`;
 };
-
 /** "28 of 54 min" for the episode table. */
 const minutesOf = (view) => `${Math.round(view.offset / 60000)} of ${Math.round(view.duration / 60000)} min`;
 
@@ -597,7 +597,7 @@ const rowFacts = ({ entry, files, videos, library, addonNames, now }) => {
     (rows || []).forEach((row) => { if (row.videoId) labels[row.videoId] = row.label; });
     const videoIds = rowVideoIds({ entry, described, rows, videos: videoList });
     const recency = recencyOf({ entry });
-    const play = lastPlayOf({ videoIds, library, labels });
+    const activity = lastActivityOf({ videoIds, library, labels });
     const noun = described.kind === 'movie' ? 'Movie' : 'Episode';
     const strip = rows !== null && rows.length >= 2 ? packStrip(rows) : null;
     const summary = rows !== null ? packSummary(rows) : null;
@@ -609,14 +609,14 @@ const rowFacts = ({ entry, files, videos, library, addonNames, now }) => {
     const details = [
         source ? `From ${source}` : null,
         isNumber(entry.addedAt) && entry.addedAt > 0 ? `Added ${exactTime(entry.addedAt)}` : null,
-        // Title-level: the library cannot tell which copy was played.
-        play !== null ? `${play.label ?? noun} last played ${exactTime(play.at)}` : null,
+        // Title-level, and only "activity" (see lastActivityOf).
+        activity !== null ? (activity.label ? `Last activity on ${activity.label} ${exactTime(activity.at)}` : `Last activity ${exactTime(activity.at)}`) : null,
         // This copy: the player marked this very torrent watched.
         entry.watched && isNumber(entry.watchedAt) ? `This copy watched ${exactTime(entry.watchedAt)}` : null,
         totalLength > 0 ? `${totalHere >= totalLength ? formatSize(totalHere) : formatOf(totalHere, totalLength)} on disk` : null,
     ].filter(Boolean).join(' · ');
 
-    const viewLine = viewText({ view, recency, play, noun }, now);
+    const viewLine = viewText({ view, recency, noun }, now);
 
     return {
         entry,
@@ -658,6 +658,6 @@ const rowFacts = ({ entry, files, videos, library, addonNames, now }) => {
 module.exports = {
     rowFacts, etaText,
     splitFiles, describeEntry, episodeRows, itemView, rowVideoIds, packStrip, packSummary,
-    diskText, viewText, minutesOf, copyNotes, primaryAction, recencyOf, lastPlayOf,
+    diskText, viewText, minutesOf, copyNotes, primaryAction, recencyOf, lastActivityOf,
     formatSize, formatOf, relativeTime, exactTime, clockTime, basename, onDisk,
 };
