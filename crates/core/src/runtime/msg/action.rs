@@ -100,10 +100,6 @@ pub enum ActionCtx {
     ///
     /// [`LibraryItem`]: crate::types::library::LibraryItem
     PullNotifications,
-    /// Make request to api to get events modal and notification
-    GetEvents,
-    /// Dismiss an event by id, either a Modal or Notification
-    DismissEvent(String),
     /// Add a server URL to the list of available streaming servers
     AddServerUrl(Url),
     /// Delete a server URL from the list of available streaming servers

@@ -16,6 +16,10 @@ pub const SEARCH_HISTORY_STORAGE_KEY: &str = "search_history";
 pub const STREAMING_SERVER_URLS_STORAGE_KEY: &str = "streaming_server_urls";
 pub const NOTIFICATIONS_STORAGE_KEY: &str = "notifications";
 pub const CALENDAR_STORAGE_KEY: &str = "calendar";
+/// Retired bucket: the dismissals of Stremio's server-pushed promo modals and
+/// notifications. Rillio never fetches those promos, so nothing reads or writes
+/// it any more; the key is kept only for `migrate_storage_schema_to_v12`. A
+/// profile that still has it stored boots fine, the value is simply ignored.
 pub const DISMISSED_EVENTS_STORAGE_KEY: &str = "dismissed_events";
 pub const LIBRARY_COLLECTION_NAME: &str = "libraryItem";
 pub const SEARCH_EXTRA_NAME: &str = "search";

@@ -2,7 +2,6 @@ use crate::constants::PROFILE_STORAGE_KEY;
 use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionCtx};
 use crate::runtime::{Runtime, RuntimeAction};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::{Profile, Settings};
@@ -31,9 +30,7 @@ fn actionctx_updatesettings() {
         StreamsBucket::default(),
         ServerUrlsBucket::new::<TestEnv>(None),
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
     let (runtime, _rx) = Runtime::<TestEnv, _>::new(TestModel { ctx }, vec![], 1000);
     TestEnv::run(|| {
         runtime.dispatch(RuntimeAction {
@@ -91,9 +88,7 @@ fn actionctx_updatesettings_not_changed() {
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,

@@ -1,11 +1,10 @@
 use crate::{
     constants::LIBRARY_COLLECTION_NAME,
     models::{
-        common::{DescriptorLoadable, Loadable, ResourceLoadable},
+        common::{DescriptorLoadable, ResourceLoadable},
         ctx::{
-            update_events, update_library, update_notifications, update_profile,
-            update_search_history, update_streaming_server_urls, update_streams,
-            update_trakt_addon, CtxError, OtherError,
+            update_library, update_notifications, update_profile, update_search_history,
+            update_streaming_server_urls, update_streams, update_trakt_addon, CtxError, OtherError,
         },
     },
     runtime::{
@@ -17,7 +16,6 @@ use crate::{
             fetch_api, APIRequest, APIResult, AuthRequest, AuthResponse, CollectionResponse,
             DatastoreCommand, DatastoreRequest, LibraryItemsResponse, SuccessResponse,
         },
-        events::{DismissedEventsBucket, Events},
         library::LibraryBucket,
         notifications::NotificationsBucket,
         profile::{Auth, AuthKey, Profile},
@@ -60,8 +58,6 @@ pub struct Ctx {
     #[serde(skip)]
     pub search_history: SearchHistoryBucket,
     #[serde(skip)]
-    pub dismissed_events: DismissedEventsBucket,
-    #[serde(skip)]
     #[cfg_attr(test, derivative(Default(value = "CtxStatus::Ready")))]
     pub status: CtxStatus,
     #[serde(skip)]
@@ -73,8 +69,6 @@ pub struct Ctx {
     ///
     /// [`LAST_VIDEOS_IDS_EXTRA_PROP`]: static@crate::constants::LAST_VIDEOS_IDS_EXTRA_PROP
     pub notification_catalogs: Vec<ResourceLoadable<Vec<MetaItem>>>,
-
-    pub events: Events,
 }
 
 impl Ctx {
@@ -86,7 +80,6 @@ impl Ctx {
         notifications: NotificationsBucket,
 
         search_history: SearchHistoryBucket,
-        dismissed_events: DismissedEventsBucket,
     ) -> Self {
         Self {
             profile,
@@ -94,15 +87,10 @@ impl Ctx {
             streams,
             streaming_server_urls,
             search_history,
-            dismissed_events,
             notifications,
             trakt_addon: None,
             notification_catalogs: vec![],
             status: CtxStatus::Ready,
-            events: Events {
-                modal: Loadable::Loading,
-                notification: Loadable::Loading,
-            },
         }
     }
 }
@@ -136,8 +124,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                 let streams_effects = update_streams::<E>(&mut self.streams, &self.status, msg);
                 let search_history_effects =
                     update_search_history::<E>(&mut self.search_history, &self.status, msg);
-                let events_effects =
-                    update_events::<E>(&mut self.events, &mut self.dismissed_events, msg);
                 let trakt_addon_effects = update_trakt_addon::<E>(
                     &mut self.trakt_addon,
                     &self.profile,
@@ -160,7 +146,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(library_effects)
                     .join(streams_effects)
                     .join(search_history_effects)
-                    .join(events_effects)
                     .join(trakt_addon_effects)
                     .join(notifications_effects)
             }
@@ -184,8 +169,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                 );
                 let search_history_effects =
                     update_search_history::<E>(&mut self.search_history, &self.status, msg);
-                let events_effects =
-                    update_events::<E>(&mut self.events, &mut self.dismissed_events, msg);
                 let trakt_addon_effects = update_trakt_addon::<E>(
                     &mut self.trakt_addon,
                     &self.profile,
@@ -209,7 +192,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(streams_effects)
                     .join(server_urls_effects)
                     .join(search_history_effects)
-                    .join(events_effects)
                     .join(trakt_addon_effects)
                     .join(notifications_effects)
             }
@@ -240,8 +222,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                 );
                 let search_history_effects =
                     update_search_history::<E>(&mut self.search_history, &self.status, msg);
-                let events_effects =
-                    update_events::<E>(&mut self.events, &mut self.dismissed_events, msg);
                 let ctx_effects = match &self.status {
                     CtxStatus::Loading(loading_auth_request)
                         if loading_auth_request == auth_request =>
@@ -310,7 +290,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(trakt_addon_effects)
                     .join(notifications_effects)
                     .join(search_history_effects)
-                    .join(events_effects)
                     .join(ctx_effects)
             }
             _ => {
@@ -340,8 +319,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                 );
                 let search_history_effects =
                     update_search_history::<E>(&mut self.search_history, &self.status, msg);
-                let events_effects =
-                    update_events::<E>(&mut self.events, &mut self.dismissed_events, msg);
                 profile_effects
                     .join(library_effects)
                     .join(streams_effects)
@@ -349,7 +326,6 @@ impl<E: Env + 'static> Update<E> for Ctx {
                     .join(trakt_addon_effects)
                     .join(notifications_effects)
                     .join(search_history_effects)
-                    .join(events_effects)
             }
         }
     }

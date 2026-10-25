@@ -4,7 +4,6 @@ use crate::models::data_export::DataExport;
 use crate::runtime::msg::{Action, ActionLoad};
 use crate::runtime::{EnvFutureExt, Runtime, RuntimeAction, RuntimeEvent, TryEnvFuture};
 use crate::types::api::{APIResult, DataExportResponse};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::LibraryBucket;
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::Profile;
@@ -56,9 +55,7 @@ fn data_export_with_user() {
         StreamsBucket::default(),
         ServerUrlsBucket::new::<TestEnv>(None),
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
     ctx.profile.auth = Some(Auth {
         key: AuthKey("user_key".into()),
         user: User::default(),
@@ -139,9 +136,7 @@ fn data_export_without_a_user() {
         StreamsBucket::default(),
         ServerUrlsBucket::new::<TestEnv>(None),
         NotificationsBucket::new::<TestEnv>(None, vec![]),
-        SearchHistoryBucket::default(),
-        DismissedEventsBucket::default(),
-    );
+        SearchHistoryBucket::default(),    );
 
     assert!(
         ctx.profile.auth.is_none(),

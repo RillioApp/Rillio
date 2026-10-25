@@ -2,7 +2,6 @@ use crate::constants::LIBRARY_RECENT_STORAGE_KEY;
 use crate::models::ctx::Ctx;
 use crate::runtime::msg::{Action, ActionCtx};
 use crate::runtime::{Runtime, RuntimeAction};
-use crate::types::events::DismissedEventsBucket;
 use crate::types::library::{LibraryBucket, LibraryItem, LibraryItemState};
 use crate::types::notifications::NotificationsBucket;
 use crate::types::profile::Profile;
@@ -42,9 +41,7 @@ fn test_runtime(library: LibraryBucket) -> (Runtime<TestEnv, TestModel>, impl st
                 StreamsBucket::default(),
                 ServerUrlsBucket::new::<TestEnv>(None),
                 NotificationsBucket::new::<TestEnv>(None, vec![]),
-                SearchHistoryBucket::default(),
-                DismissedEventsBucket::default(),
-            ),
+                SearchHistoryBucket::default(),            ),
         },
         vec![],
         1000,

@@ -16,9 +16,7 @@ mod model {
     use serde::Serialize;
 
     use rillio_core::deep_links::SearchHistoryItemDeepLinks;
-    use rillio_core::types::{
-        events::Events, notifications::NotificationItem, resource::MetaItemId,
-    };
+    use rillio_core::types::{notifications::NotificationItem, resource::MetaItemId};
     use url::Url;
 
     use crate::{env::WebEnv, model::deep_links_ext::DeepLinksExt};
@@ -29,7 +27,6 @@ mod model {
         pub profile: Profile<'a>,
         pub notifications: Notifications<'a>,
         pub search_history: Vec<SearchHistoryItem<'a>>,
-        pub events: &'a Events,
         pub streaming_server_urls: Vec<StreamingServerUrlItem>,
         /// Compact, id-keyed view of the whole library so the web app can look up
         /// a meta item's membership/watched state at render without loading a
@@ -125,7 +122,6 @@ mod model {
                         deep_links: SearchHistoryItemDeepLinks::from(query).into_web_deep_links(),
                     })
                     .collect(),
-                events: &ctx.events,
                 streaming_server_urls: ctx
                     .streaming_server_urls
                     .items
