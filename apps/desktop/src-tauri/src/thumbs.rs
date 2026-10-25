@@ -362,6 +362,11 @@ impl std::fmt::Display for Conversion {
 
 /// The colour matrix mpv reports for frames that carry a Dolby Vision RPU.
 const DOLBY_VISION_MATRIX: &str = "dolbyvision";
+/// The Dolby Vision profile with no backward-compatible base layer (IPTPQc2,
+/// signal compatibility id 0). Profiles 7 and 8.x carry a real HDR10 / HLG
+/// base layer that is a correct picture even when the RPU is missing; profile
+/// 5 frames without their RPU are no picture at all.
+const DV_PROFILE_WITHOUT_BASE_LAYER: u8 = 5;
 /// Colour systems the software path decodes: plain YCbCr and RGB.
 const SOFTWARE_MATRICES: &[&str] =
     &["bt.601", "bt.709", "smpte-240m", "bt.2020-ncl", "ycgco", "ycgco-re", "ycgco-ro", "rgb"];
@@ -455,6 +460,18 @@ fn conversion_for(params: &VideoParams) -> Result<Conversion, String> {
                 "thumbs: mpv reports {what} {value:?}, for which no conversion to SDR is known"
             ));
         }
+    }
+    if colormatrix != DOLBY_VISION_MATRIX
+        && *dolby_vision_profile == Some(DV_PROFILE_WITHOUT_BASE_LAYER)
+    {
+        // Without the RPU these frames are IPTPQc2 under whatever tags they
+        // carry; there is no HDR10 picture underneath to tone map instead.
+        return Err(format!(
+            "thumbs: a Dolby Vision profile {DV_PROFILE_WITHOUT_BASE_LAYER} track whose frames \
+             arrive without their RPU (reported as {colormatrix}/{gamma}): profile \
+             {DV_PROFILE_WITHOUT_BASE_LAYER} has no HDR10 base layer, so only the RPU makes a \
+             picture of it"
+        ));
     }
     Ok(if colormatrix == DOLBY_VISION_MATRIX {
         Conversion::Libplacebo(Need::DolbyVision { profile: *dolby_vision_profile })
@@ -1110,9 +1127,28 @@ mod tests {
             decide(HDR10_LIGHT_LEVELS, Some("8")),
             Ok(Conversion::Libplacebo(Need::Hdr { transfer: "pq".into() }))
         );
+        // Profile 7 without the RPU is its HDR10 base layer too.
+        assert_eq!(
+            decide(HDR10_LIGHT_LEVELS, Some("7")),
+            Ok(Conversion::Libplacebo(Need::Hdr { transfer: "pq".into() }))
+        );
         for (params, profile) in [(DV_P5, "5"), (DV_P81, "8")] {
             assert_eq!(decide(params, Some(profile)).unwrap().render(), Render::Libplacebo);
         }
+    }
+
+    /// Profile 5 has no HDR10 base layer: frames that arrive without their
+    /// RPU (stripped, lost) are refused, never tone mapped as if they were
+    /// HDR10, whatever tags they carry.
+    #[test]
+    fn profile_5_without_its_rpu_is_refused() {
+        for params in [HDR10_BARE, HDR10_LIGHT_LEVELS, SDR_BT709] {
+            let err = decide(params, Some("5")).unwrap_err();
+            assert!(err.contains("profile 5") && err.contains("without their RPU"), "{err}");
+            assert!(err.contains("no HDR10 base layer"), "{err}");
+        }
+        // With the RPU on the frames it is the Dolby Vision route as ever.
+        assert!(decide(DV_P5, Some("5")).is_ok());
     }
 
     /// HDR10 and HLG are tone mapped by libplacebo; light-level metadata
