@@ -22,6 +22,23 @@
 //! holds at most one pending bucket and every newer request overwrites it. The
 //! web layer polls (a miss returns `None` and the caller asks again on its next
 //! hover tick); the cache fills in behind the cursor.
+//!
+//! Colour: a screenshot is only as right as the conversion behind it. The
+//! `vo=null` shadow converts the scaled frame to RGB in software, which shows
+//! SDR BT.709-class video correctly and nothing else: a Dolby Vision profile 5
+//! frame is IPTPQc2 that only its RPU turns into a picture (purple and green
+//! without it), and PQ/HLG frames need tone mapping. Playback is right because
+//! gpu-next renders through libplacebo, which applies the RPU and tone maps. So
+//! once a stream is open, [`conversion_for`] reads what mpv reports about it,
+//! and a stream that needs more than the software path gets a shadow whose
+//! screenshots libplacebo renders, on a window nobody sees (see [`Render`]).
+//!
+//! Measured 2026-10-25 against the alternatives, with the shipped libmpv:
+//! FFmpeg's `libplacebo` filter inside this same lavfi chain converts just as
+//! correctly, but mpv rebuilds a lavfi graph on every seek and the filter
+//! creates a Vulkan device each time (libplacebo logs ~1.1 s for it), so a
+//! thumbnail took 0.9-1.9 s against 0.05-0.33 s for the gpu-next screenshot;
+//! FFmpeg's zscale + tonemap cannot apply an RPU at all.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -248,6 +265,257 @@ struct Shadow {
     mpv: Mpv,
     /// The width the `vf=scale` chain currently outputs.
     width: u32,
+    /// How this shadow's screenshots are rendered.
+    render: Render,
+    /// What the open stream needs, once mpv has reported it ([`settle`]).
+    /// Nothing is captured before it is known and matches `render`.
+    conversion: Option<Conversion>,
+    /// The never-shown window a [`Render::Libplacebo`] shadow renders into.
+    /// Declared after `mpv` because fields drop in order: mpv's own output
+    /// window is a child of this one and must go first.
+    _window: Option<HiddenWindow>,
+}
+
+/// How the shadow turns a decoded, scaled frame into a screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Render {
+    /// `vo=null`: mpv converts the frame to RGB in software. Right for SDR
+    /// BT.709-class video only.
+    Software,
+    /// `vo=gpu-next` on a never-shown window, `screenshot-sw=no`: libplacebo
+    /// renders the frame to SDR BT.709 with the player's own tone mapping
+    /// ([`crate::shell::TONE_MAPPING_OPTIONS`]), applying a Dolby Vision RPU
+    /// first. The `vf` chain still scales before it, so the GPU only ever sees
+    /// a thumbnail-sized frame and the width rule is the same for both.
+    Libplacebo,
+}
+
+/// Why a stream needs libplacebo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Need {
+    /// The frames carry a Dolby Vision RPU (mpv reports
+    /// `colormatrix=dolbyvision`): applied, then tone mapped. `profile` is the
+    /// track's, for the log: 5 is IPTPQc2 with no fallback picture, 8.x and 7
+    /// put the RPU on an HDR10 / HLG base layer.
+    DolbyVision { profile: Option<u8> },
+    /// An HDR transfer (PQ, HLG, ...): tone mapped to SDR.
+    Hdr { transfer: String },
+    /// A colour system the software path does not decode (ICtCp, XYZ,
+    /// constant-luminance BT.2020).
+    ColourSystem { colormatrix: String },
+    /// SDR on primaries wider than BT.709: gamut mapped, not shown desaturated.
+    WideGamut { primaries: String },
+}
+
+/// What a stream's frames need to become a correct SDR BT.709 thumbnail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Conversion {
+    /// SDR BT.709-class video: scaled and screenshot in software, as always.
+    Plain,
+    /// Rendered by libplacebo, for this reason.
+    Libplacebo(Need),
+}
+
+impl Conversion {
+    fn render(&self) -> Render {
+        match self {
+            Conversion::Plain => Render::Software,
+            Conversion::Libplacebo(_) => Render::Libplacebo,
+        }
+    }
+}
+
+impl std::fmt::Display for Conversion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Conversion::Plain => write!(f, "SDR, plain software screenshot"),
+            Conversion::Libplacebo(Need::DolbyVision { profile: Some(profile) }) => {
+                write!(f, "Dolby Vision profile {profile}, RPU applied and tone mapped by libplacebo")
+            }
+            Conversion::Libplacebo(Need::DolbyVision { profile: None }) => {
+                write!(f, "Dolby Vision, RPU applied and tone mapped by libplacebo")
+            }
+            Conversion::Libplacebo(Need::Hdr { transfer }) => {
+                write!(f, "HDR ({transfer}), tone mapped by libplacebo")
+            }
+            Conversion::Libplacebo(Need::ColourSystem { colormatrix }) => {
+                write!(f, "colour system {colormatrix}, converted by libplacebo")
+            }
+            Conversion::Libplacebo(Need::WideGamut { primaries }) => {
+                write!(f, "wide gamut ({primaries}), gamut mapped by libplacebo")
+            }
+        }
+    }
+}
+
+// The names below are mpv's (`video-params`), and every one mpv can report is
+// listed on exactly one side: a name missing from both is refused by
+// [`conversion_for`] rather than guessed at, so a name a later mpv adds fails
+// loud instead of slipping through as SDR.
+
+/// The colour matrix mpv reports for frames that carry a Dolby Vision RPU.
+const DOLBY_VISION_MATRIX: &str = "dolbyvision";
+/// Colour systems the software path decodes: plain YCbCr and RGB.
+const SOFTWARE_MATRICES: &[&str] =
+    &["bt.601", "bt.709", "smpte-240m", "bt.2020-ncl", "ycgco", "ycgco-re", "ycgco-ro", "rgb"];
+/// Colour systems only libplacebo decodes.
+const LIBPLACEBO_MATRICES: &[&str] =
+    &[DOLBY_VISION_MATRIX, "bt.2020-cl", "bt.2100-pq", "bt.2100-hlg", "xyz"];
+/// SDR transfer curves: the software path shows them as they are.
+const SDR_TRANSFERS: &[&str] = &[
+    "bt.1886", "srgb", "linear", "gamma1.8", "gamma2.0", "gamma2.2", "gamma2.4", "gamma2.6",
+    "gamma2.8", "prophoto", "st428",
+];
+/// HDR transfer curves: only libplacebo tone maps them to SDR.
+const HDR_TRANSFERS: &[&str] = &["pq", "hlg", "v-log", "s-log1", "s-log2", "scrgb"];
+/// The BT.709 family of primaries, close enough that the software path has
+/// always shown them without gamut mapping.
+const NARROW_PRIMARIES: &[&str] = &["bt.709", "bt.601-525", "bt.601-625", "bt.470m", "ebu3213"];
+/// Primaries wider than BT.709.
+const WIDE_PRIMARIES: &[&str] = &[
+    "bt.2020", "apple", "adobe", "prophoto", "cie1931", "dci-p3", "display-p3", "v-gamut",
+    "s-gamut", "film-c", "aces-ap0", "aces-ap1",
+];
+
+/// The colour description mpv reports for the open video stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VideoParams {
+    colormatrix: String,
+    primaries: String,
+    /// mpv's name for the transfer function.
+    gamma: String,
+    dolby_vision_profile: Option<u8>,
+}
+
+impl VideoParams {
+    /// `video_params` is mpv's JSON for the `video-params` property (the
+    /// decoded frames after mpv's own guessing, before the shadow's scale);
+    /// `dolby_vision_profile` is `current-tracks/video/dolby-vision-profile`,
+    /// which mpv only has for a Dolby Vision track.
+    ///
+    /// `Ok(None)` until the colour is reported: mpv fills `video-params` in two
+    /// steps, the size from the container first (`{"w":3840,"h":1920}`), the
+    /// full description with the first decoded frame.
+    fn parse(
+        video_params: &str,
+        dolby_vision_profile: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        let json: serde_json::Value = serde_json::from_str(video_params)
+            .map_err(|e| format!("thumbs: video-params is not JSON ({e}): {video_params}"))?;
+        if json.get("colormatrix").is_none() {
+            return Ok(None);
+        }
+        let field = |name: &str| {
+            json.get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("thumbs: video-params has no {name}: {video_params}"))
+        };
+        let dolby_vision_profile = dolby_vision_profile
+            .map(|profile| {
+                profile
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|e| format!("thumbs: dolby-vision-profile {profile:?}: {e}"))
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            colormatrix: field("colormatrix")?,
+            primaries: field("primaries")?,
+            gamma: field("gamma")?,
+            dolby_vision_profile,
+        }))
+    }
+}
+
+/// THE decision: what a stream with these parameters needs to become a
+/// correct SDR BT.709 thumbnail, or why no conversion is known for it.
+///
+/// Decided from the frames' own description, never the file name. Light levels
+/// (MaxCLL, mastering peak, DV L1, HDR10+) choose no route: libplacebo reads
+/// them, or measures the frame, exactly as playback does. Order matters only
+/// where a stream qualifies twice, and then the stronger need names it: an RPU
+/// outranks the PQ base layer it rides on, an HDR curve outranks its gamut.
+fn conversion_for(params: &VideoParams) -> Result<Conversion, String> {
+    let VideoParams { colormatrix, primaries, gamma, dolby_vision_profile } = params;
+    for (what, value, sides) in [
+        ("colour matrix", colormatrix, [SOFTWARE_MATRICES, LIBPLACEBO_MATRICES]),
+        ("transfer", gamma, [SDR_TRANSFERS, HDR_TRANSFERS]),
+        ("primaries", primaries, [NARROW_PRIMARIES, WIDE_PRIMARIES]),
+    ] {
+        if !sides.iter().any(|side| side.contains(&value.as_str())) {
+            return Err(format!(
+                "thumbs: mpv reports {what} {value:?}, for which no conversion to SDR is known"
+            ));
+        }
+    }
+    Ok(if colormatrix == DOLBY_VISION_MATRIX {
+        Conversion::Libplacebo(Need::DolbyVision { profile: *dolby_vision_profile })
+    } else if HDR_TRANSFERS.contains(&gamma.as_str()) {
+        Conversion::Libplacebo(Need::Hdr { transfer: gamma.clone() })
+    } else if LIBPLACEBO_MATRICES.contains(&colormatrix.as_str()) {
+        Conversion::Libplacebo(Need::ColourSystem { colormatrix: colormatrix.clone() })
+    } else if WIDE_PRIMARIES.contains(&primaries.as_str()) {
+        Conversion::Libplacebo(Need::WideGamut { primaries: primaries.clone() })
+    } else {
+        Conversion::Plain
+    })
+}
+
+/// A shadow after [`settle`].
+enum Settled {
+    /// The conversion is known and this shadow renders it: capture away.
+    Ready(Shadow),
+    /// The stream has not shown a frame yet (bytes not downloaded, slow
+    /// open): nothing decided, the job is skipped like an unsettled seek.
+    NotYet(Shadow),
+    /// No correct thumbnail can be made for this stream, and why. The caller
+    /// stops previews for it and logs the reason once.
+    Refused(String),
+}
+
+/// Make sure `shadow` renders what its stream needs before anything is
+/// captured: read the stream's parameters, decide, and when the decision needs
+/// the other [`Render`], replace the shadow with one that has it (a new
+/// shadow at the same url and width, born with the decision).
+fn settle(mut shadow: Shadow, url: &str) -> Settled {
+    if shadow.conversion.is_some() {
+        return Settled::Ready(shadow);
+    }
+    let conversion = match shadow.read_conversion() {
+        Ok(Some(conversion)) => conversion,
+        Ok(None) => return Settled::NotYet(shadow),
+        Err(e) => return Settled::Refused(e),
+    };
+    if conversion.render() == shadow.render {
+        tracing::info!("thumbs: {conversion} ({url})");
+        shadow.conversion = Some(conversion);
+        return Settled::Ready(shadow);
+    }
+    let width = shadow.width;
+    // The old shadow's decoder and connection go before the new one opens.
+    drop(shadow);
+    match Shadow::spawn(url, width, conversion.render()) {
+        // The new shadow reads its own parameters rather than inheriting the
+        // decision: that read is also what proves its renderer came up. Not
+        // ready yet, it goes back undecided and the next step reads again.
+        Ok(replacement) => match replacement.read_conversion() {
+            Ok(Some(confirmed)) if confirmed == conversion => {
+                tracing::info!("thumbs: {conversion} ({url})");
+                let mut replacement = replacement;
+                replacement.conversion = Some(confirmed);
+                Settled::Ready(replacement)
+            }
+            Ok(Some(other)) => Settled::Refused(format!(
+                "thumbs: the stream reported {conversion}, then {other} once reopened"
+            )),
+            Ok(None) => Settled::NotYet(replacement),
+            Err(e) => Settled::Refused(e),
+        },
+        Err(e) => Settled::Refused(format!(
+            "thumbs: {conversion} needs libplacebo, which could not start: {e}"
+        )),
+    }
 }
 
 /// The shadow's filter chain for an output `width`: scale down to it, keeping
@@ -274,13 +542,52 @@ fn thumb_width(requested: u32) -> Result<u32, String> {
 }
 
 impl Shadow {
-    /// A windowless, muted mpv over `url` whose decode chain outputs `width`.
-    /// Options follow Harbor's shadow flags; `hr-seek=no` + keyframe seeks are
-    /// the speed.
-    fn spawn(url: &str, width: u32) -> Result<Self, String> {
+    /// A muted mpv over `url` whose decode chain outputs `width`, rendering its
+    /// screenshots as `render` says. Options follow Harbor's shadow flags;
+    /// `hr-seek=no` + keyframe seeks are the speed. Born undecided: [`settle`]
+    /// confirms the stream wants this `render` before anything is captured.
+    fn spawn(url: &str, width: u32, render: Render) -> Result<Self, String> {
+        let window = match render {
+            Render::Software => None,
+            Render::Libplacebo => Some(HiddenWindow::create()?),
+        };
         let mpv = Mpv::load(&mpv::default_dll_path())?;
+        match &window {
+            None => {
+                // Optional like the rest below: a build without the null VO
+                // fails at the first screenshot, loudly enough.
+                if let Err(e) = mpv.set_option("vo", "null") {
+                    tracing::debug!("thumbs: option vo=null: {e}");
+                }
+            }
+            Some(window) => {
+                // Every one of these decides whether the screenshot is the
+                // libplacebo render of an SDR target, so none is optional: no
+                // fallback VO (a software screenshot is exactly the wrong
+                // picture), the hidden window to render into, the screenshot
+                // taken from the VO, and untagged, which makes its target SDR.
+                let wid = window.wid().to_string();
+                for (name, value) in [
+                    ("vo", "gpu-next"),
+                    ("wid", wid.as_str()),
+                    ("force-window", "no"),
+                    ("screenshot-sw", "no"),
+                    ("screenshot-tag-colorspace", "no"),
+                ] {
+                    mpv.set_option(name, value).map_err(|e| {
+                        format!("thumbs: libplacebo screenshots need {name}={value}: {e}")
+                    })?;
+                }
+                // The player's own tone mapping; best-effort exactly as the
+                // player applies it (shell.rs).
+                for (name, value) in crate::shell::TONE_MAPPING_OPTIONS {
+                    if let Err(e) = mpv.set_option(name, value) {
+                        tracing::warn!("thumbs: option {name}={value} not applied: {e}");
+                    }
+                }
+            }
+        }
         for (name, value) in [
-            ("vo", "null"),
             ("aid", "no"),
             ("sid", "no"),
             ("pause", "yes"),
@@ -310,7 +617,43 @@ impl Shadow {
             .map_err(|e| format!("thumbs: scaling to {width}px failed: {e}"))?;
         mpv.initialize()?;
         mpv.command(&["loadfile", url])?;
-        Ok(Self { mpv, width })
+        Ok(Self { mpv, width, render, conversion: None, _window: window })
+    }
+
+    /// What the open stream needs ([`conversion_for`] over what mpv reports),
+    /// waiting up to the seek budget for the first decoded frame. `Ok(None)`
+    /// while there is none (bytes not there yet: a later job asks again).
+    /// A libplacebo shadow also proves here that gpu-next came up: a decoded
+    /// frame with no configured VO means it never will, and that is an `Err`.
+    fn read_conversion(&self) -> Result<Option<Conversion>, String> {
+        let deadline = Instant::now() + Duration::from_millis(SEEK_SETTLE_MS);
+        loop {
+            let profile = self.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
+            let params = match self.mpv.get_property_string("video-params") {
+                Some(json) => VideoParams::parse(&json, profile.as_deref())?,
+                None => None,
+            };
+            if let Some(params) = params {
+                let renders = match self.render {
+                    Render::Software => true,
+                    Render::Libplacebo => {
+                        self.mpv.get_property_string("vo-configured").as_deref() == Some("yes")
+                    }
+                };
+                if renders {
+                    return conversion_for(&params).map(Some);
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "thumbs: a frame decoded but gpu-next never configured (current-vo: {})",
+                        self.mpv.get_property_string("current-vo").as_deref().unwrap_or("none")
+                    ));
+                }
+            } else if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(SETTLE_POLL);
+        }
     }
 
     /// Rebuild the filter chain for another output width (a no-op when it
@@ -387,6 +730,135 @@ impl Shadow {
             .get_property_string("duration")
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|d| d.is_finite() && *d > 0.0)
+    }
+}
+
+/// The window a [`Render::Libplacebo`] shadow's gpu-next renders into: created
+/// hidden and never shown, owned by a thread of its own that pumps its
+/// messages (mpv makes its output window a child of this one, and a parent
+/// whose thread never reads its queue stalls the child's thread). Dropping it
+/// ends the thread, which destroys the window; drop the mpv that rendered into
+/// it first.
+#[cfg(windows)]
+struct HiddenWindow {
+    /// The HWND as mpv's `wid` takes it (an HWND is not `Send`; this is).
+    wid: isize,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The hidden window's size in pixels. gpu-next sizes its swapchain to it, and
+/// that swapchain is never presented: a `video` screenshot renders at the
+/// frame's own (already scaled) size whatever the window is. The smallest
+/// size, so the swapchain costs next to nothing.
+#[cfg(windows)]
+const HIDDEN_WINDOW_PX: i32 = 1;
+
+#[cfg(windows)]
+impl HiddenWindow {
+    fn create() -> Result<Self, String> {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+            WM_APP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<isize, String>>();
+        let thread = std::thread::Builder::new()
+            .name("thumbs-window".into())
+            .spawn(move || {
+                // The system STATIC class: no class to register, and its
+                // window procedure is all a never-shown parent needs. No
+                // WS_VISIBLE, and nothing ever shows it.
+                let created = unsafe {
+                    CreateWindowExW(
+                        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        w!("STATIC"),
+                        w!("rillio-thumbs"),
+                        WS_POPUP,
+                        0,
+                        0,
+                        HIDDEN_WINDOW_PX,
+                        HIDDEN_WINDOW_PX,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                };
+                let hwnd = match created {
+                    Ok(hwnd) => hwnd,
+                    Err(e) => {
+                        let _ = sender.send(Err(format!("thumbs: hidden window: {e}")));
+                        return;
+                    }
+                };
+                if sender.send(Ok(hwnd.0 as isize)).is_err() {
+                    let _ = unsafe { DestroyWindow(hwnd) };
+                    return;
+                }
+                let mut msg = MSG::default();
+                // GetMessageW: >0 a message, 0 WM_QUIT, -1 an error.
+                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+                    if msg.hwnd == hwnd && msg.message == WM_APP {
+                        break;
+                    }
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                let _ = unsafe { DestroyWindow(hwnd) };
+            })
+            .map_err(|e| format!("thumbs: hidden window thread: {e}"))?;
+        let wid = receiver
+            .recv()
+            .map_err(|_| "thumbs: the hidden window thread died".to_string())??;
+        Ok(Self { wid, thread: Some(thread) })
+    }
+
+    fn wid(&self) -> isize {
+        self.wid
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HiddenWindow {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+
+        // WM_APP on our own window is the thread's cue to destroy it and end.
+        let posted = unsafe {
+            PostMessageW(Some(HWND(self.wid as *mut _)), WM_APP, WPARAM(0), LPARAM(0))
+        };
+        match posted {
+            Ok(()) => {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+            // The window is already gone; never block on a thread that may
+            // not be listening.
+            Err(e) => tracing::warn!("thumbs: hidden window {:#x}: {e}", self.wid),
+        }
+    }
+}
+
+/// No hidden-window renderer off Windows: a stream that needs libplacebo is
+/// refused there (no preview, logged) rather than shown wrong.
+#[cfg(not(windows))]
+struct HiddenWindow;
+
+#[cfg(not(windows))]
+impl HiddenWindow {
+    fn create() -> Result<Self, String> {
+        Err("thumbs: libplacebo screenshots need a hidden window, which only the Windows shell \
+             provides"
+            .into())
+    }
+
+    fn wid(&self) -> isize {
+        unreachable!("HiddenWindow::create never succeeds off Windows")
     }
 }
 
@@ -524,6 +996,172 @@ mod tests {
         assert!(cache.frames.is_empty());
     }
 
+    // `video-params` exactly as the shipped libmpv (libmpv-20260610) reported
+    // it for each sample on 2026-10-25, with the track's
+    // `dolby-vision-profile` beside it. The samples: 45 s copied out of a
+    // web release (profile 5, profile 8.1), and encodes made from the 8.1 one
+    // through a raw pipe so no side data could leak (HDR10 with and without
+    // MaxCLL/mastering metadata, HLG, SDR BT.709, SDR BT.601).
+    const DV_P5: &str = r#"{"pixelformat":"yuv420p10","average-bpp":24,"w":3840,"h":1920,"dw":3840,"dh":1920,"crop-x":0,"crop-y":0,"crop-w":3840,"crop-h":1920,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"dolbyvision","colorlevels":"limited","primaries":"bt.2020","gamma":"pq","sig-peak":4.929080,"light":"display","chroma-location":"mpeg2/4/h264","stereo-in":"mono","rotate":0,"alpha":"none","min-luma":0.000104,"max-luma":1000.603271,"max-cll":0.000000,"max-fall":0.000000,"max-pq-y":0.704762,"avg-pq-y":0.330647}"#;
+    const DV_P81: &str = r#"{"pixelformat":"yuv420p10","average-bpp":24,"w":3840,"h":1920,"dw":3840,"dh":1920,"crop-x":0,"crop-y":0,"crop-w":3840,"crop-h":1920,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"dolbyvision","colorlevels":"limited","primaries":"bt.2020","gamma":"pq","sig-peak":4.929080,"light":"display","chroma-location":"uhd","stereo-in":"mono","rotate":0,"alpha":"none","min-luma":0.000104,"max-luma":1000.603271,"max-cll":808.000000,"max-fall":138.000000,"scene-max-r":154.399994,"scene-max-g":139.100006,"scene-max-b":128.800003,"scene-avg":2.500000,"max-pq-y":0.520391,"avg-pq-y":0.300122,"prim-red-x":0.680000,"prim-red-y":0.320000,"prim-green-x":0.265000,"prim-green-y":0.690000,"prim-blue-x":0.150000,"prim-blue-y":0.060000,"prim-white-x":0.312700,"prim-white-y":0.329000}"#;
+    const HDR10_LIGHT_LEVELS: &str = r#"{"pixelformat":"yuv420p10","average-bpp":24,"w":1920,"h":960,"dw":1920,"dh":960,"crop-x":0,"crop-y":0,"crop-w":1920,"crop-h":960,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"bt.2020-ncl","colorlevels":"limited","primaries":"bt.2020","gamma":"pq","sig-peak":4.926108,"light":"display","chroma-location":"mpeg2/4/h264","stereo-in":"mono","rotate":0,"alpha":"none","min-luma":0.005000,"max-luma":1000.000000,"max-cll":808.000000,"max-fall":138.000000,"prim-red-x":0.680000,"prim-red-y":0.320000,"prim-green-x":0.265000,"prim-green-y":0.690000,"prim-blue-x":0.150000,"prim-blue-y":0.060000,"prim-white-x":0.312700,"prim-white-y":0.329000}"#;
+    const HDR10_BARE: &str = r#"{"pixelformat":"yuv420p10","average-bpp":24,"w":1920,"h":960,"dw":1920,"dh":960,"crop-x":0,"crop-y":0,"crop-w":1920,"crop-h":960,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"bt.2020-ncl","colorlevels":"limited","primaries":"bt.2020","gamma":"pq","sig-peak":49.261086,"light":"display","chroma-location":"mpeg2/4/h264","stereo-in":"mono","rotate":0,"alpha":"none","min-luma":0.000001,"max-luma":10000.000000,"max-cll":0.000000,"max-fall":0.000000}"#;
+    const HLG: &str = r#"{"pixelformat":"yuv420p10","average-bpp":24,"w":1920,"h":960,"dw":1920,"dh":960,"crop-x":0,"crop-y":0,"crop-w":1920,"crop-h":960,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"bt.2020-ncl","colorlevels":"limited","primaries":"bt.2020","gamma":"hlg","sig-peak":4.926108,"light":"hlg","chroma-location":"mpeg2/4/h264","stereo-in":"mono","rotate":0,"alpha":"none","min-luma":0.000001,"max-luma":1000.000000,"max-cll":0.000000,"max-fall":0.000000}"#;
+    const SDR_BT709: &str = r#"{"pixelformat":"yuv420p","average-bpp":12,"w":1920,"h":960,"dw":1920,"dh":960,"crop-x":0,"crop-y":0,"crop-w":1920,"crop-h":960,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"bt.709","colorlevels":"limited","primaries":"bt.709","gamma":"bt.1886","sig-peak":0.000000,"light":"display","chroma-location":"mpeg2/4/h264","stereo-in":"mono","rotate":0,"alpha":"none"}"#;
+    const SDR_BT601: &str = r#"{"pixelformat":"yuv420p","average-bpp":12,"w":720,"h":360,"dw":720,"dh":360,"crop-x":0,"crop-y":0,"crop-w":720,"crop-h":360,"aspect":2.000000,"aspect-name":"Univisium","par":1.000000,"sar":2.000000,"sar-name":"Univisium","colormatrix":"bt.601","colorlevels":"limited","primaries":"bt.601-525","gamma":"bt.1886","sig-peak":0.000000,"light":"display","chroma-location":"mpeg2/4/h264","stereo-in":"mono","rotate":0,"alpha":"none"}"#;
+
+    fn decide(video_params: &str, profile: Option<&str>) -> Result<Conversion, String> {
+        let params = VideoParams::parse(video_params, profile)?
+            .ok_or_else(|| format!("no colour reported yet: {video_params}"))?;
+        conversion_for(&params)
+    }
+
+    /// Before the first frame mpv reports only the container's size (seen on
+    /// the profile 5 sample): not ready, which is neither a decision nor a
+    /// refusal.
+    #[test]
+    fn video_params_before_the_first_frame_are_not_ready() {
+        assert_eq!(VideoParams::parse(r#"{"w":3840,"h":1920}"#, Some("5")), Ok(None));
+        assert!(VideoParams::parse(DV_P5, Some("5")).unwrap().is_some());
+    }
+
+    /// A reported shape with some fields replaced: for the shapes no sample
+    /// on this machine has (profile 7, an HLG base layer, ICtCp, ...).
+    fn with(video_params: &str, fields: &[(&str, &str)]) -> String {
+        let mut json: serde_json::Value = serde_json::from_str(video_params).unwrap();
+        for (name, value) in fields {
+            json[*name] = serde_json::Value::String((*value).to_owned());
+        }
+        json.to_string()
+    }
+
+    /// The bug (owner, 2026-10-25: "everything looks purple/green"): every
+    /// stream was screenshot in software. Dolby Vision, whatever the profile,
+    /// must reach libplacebo, which applies the RPU; the profile only names it.
+    #[test]
+    fn dolby_vision_is_rendered_by_libplacebo() {
+        let dv = |profile| Conversion::Libplacebo(Need::DolbyVision { profile });
+        // Profile 5: IPTPQc2, no picture at all without the RPU.
+        assert_eq!(decide(DV_P5, Some("5")), Ok(dv(Some(5))));
+        // Profile 8.1: the RPU rides an HDR10 base layer; mpv still reports
+        // the frames as dolbyvision, and the RPU (not just the PQ base) wins.
+        assert_eq!(decide(DV_P81, Some("8")), Ok(dv(Some(8))));
+        // Profile 7 (UHD Blu-ray, base + enhancement layer): mpv decodes the
+        // base layer with the RPU, the same shape as 8.1.
+        assert_eq!(decide(DV_P81, Some("7")), Ok(dv(Some(7))));
+        // Profile 8.4: the RPU on an HLG base layer.
+        assert_eq!(decide(&with(DV_P81, &[("gamma", "hlg")]), Some("8")), Ok(dv(Some(8))));
+        // The frames decide, not the track: no profile reported still means
+        // Dolby Vision frames...
+        assert_eq!(decide(DV_P5, None), Ok(dv(None)));
+        // ...and a DV-flagged track whose frames arrive as plain HDR10 (no RPU
+        // on them) is tone mapped as the HDR10 it is.
+        assert_eq!(
+            decide(HDR10_LIGHT_LEVELS, Some("8")),
+            Ok(Conversion::Libplacebo(Need::Hdr { transfer: "pq".into() }))
+        );
+        for (params, profile) in [(DV_P5, "5"), (DV_P81, "8")] {
+            assert_eq!(decide(params, Some(profile)).unwrap().render(), Render::Libplacebo);
+        }
+    }
+
+    /// HDR10 and HLG are tone mapped by libplacebo; light-level metadata
+    /// (present or absent) changes nothing about the route, only what
+    /// libplacebo does along it, exactly as in playback.
+    #[test]
+    fn hdr_is_tone_mapped_with_or_without_light_levels() {
+        let pq = Ok(Conversion::Libplacebo(Need::Hdr { transfer: "pq".into() }));
+        assert_eq!(decide(HDR10_LIGHT_LEVELS, None), pq);
+        assert_eq!(decide(HDR10_BARE, None), pq);
+        assert_eq!(decide(HLG, None), Ok(Conversion::Libplacebo(Need::Hdr { transfer: "hlg".into() })));
+        // PQ on BT.709 primaries is still HDR: the curve outranks the gamut.
+        assert_eq!(decide(&with(HDR10_BARE, &[("primaries", "bt.709")]), None), pq);
+    }
+
+    /// SDR BT.709-class video keeps the plain software screenshot it always
+    /// had; only a gamut or colour system it cannot show moves it.
+    #[test]
+    fn sdr_stays_plain_unless_it_cannot_be() {
+        assert_eq!(decide(SDR_BT709, None), Ok(Conversion::Plain));
+        assert_eq!(decide(SDR_BT601, None), Ok(Conversion::Plain));
+        assert_eq!(decide(SDR_BT709, None).unwrap().render(), Render::Software);
+        assert_eq!(
+            decide(&with(SDR_BT709, &[("colormatrix", "bt.2020-ncl"), ("primaries", "bt.2020")]), None),
+            Ok(Conversion::Libplacebo(Need::WideGamut { primaries: "bt.2020".into() }))
+        );
+        assert_eq!(
+            decide(&with(SDR_BT709, &[("colormatrix", "bt.2020-cl")]), None),
+            Ok(Conversion::Libplacebo(Need::ColourSystem { colormatrix: "bt.2020-cl".into() }))
+        );
+        // ICtCp PQ is HDR first: the transfer names it.
+        assert_eq!(
+            decide(&with(HDR10_BARE, &[("colormatrix", "bt.2100-pq")]), None),
+            Ok(Conversion::Libplacebo(Need::Hdr { transfer: "pq".into() }))
+        );
+    }
+
+    /// Every name the decision knows is on exactly one side of each table, so
+    /// no name is both "fine in software" and "needs libplacebo".
+    #[test]
+    fn the_name_tables_do_not_overlap() {
+        for (a, b) in [
+            (SOFTWARE_MATRICES, LIBPLACEBO_MATRICES),
+            (SDR_TRANSFERS, HDR_TRANSFERS),
+            (NARROW_PRIMARIES, WIDE_PRIMARIES),
+        ] {
+            for name in a {
+                assert!(!b.contains(name), "{name} is on both sides");
+            }
+        }
+    }
+
+    /// No known conversion: refused with the reason, never guessed as SDR
+    /// (a name a later mpv adds would otherwise come out purple or grey).
+    /// Malformed reports are refused too.
+    #[test]
+    fn what_cannot_be_converted_is_refused_loudly() {
+        for (field, value) in [
+            ("colormatrix", "ipt-c2-of-the-future"),
+            ("gamma", "auto"),
+            ("primaries", "unknown"),
+        ] {
+            let err = decide(&with(SDR_BT709, &[(field, value)]), None).unwrap_err();
+            assert!(err.contains(value), "{err}");
+        }
+        assert!(decide("not json", None).is_err());
+        assert!(decide(r#"{"colormatrix":"bt.709","primaries":"bt.709"}"#, None)
+            .unwrap_err()
+            .contains("gamma"));
+        assert!(decide(DV_P5, Some("five")).is_err());
+    }
+
+    /// A refused stream gets no preview: nothing queued, no worker, and it
+    /// stays that way until the stream changes, when the new one is judged
+    /// afresh.
+    #[test]
+    fn a_refused_stream_gets_no_previews() {
+        let url = "http://127.0.0.1:11470/dv-profile-5".to_owned();
+        let mut inner = Inner::default();
+        assert_eq!(
+            inner.request_thumb(url.clone(), 7, 448),
+            ThumbRequest::Pending { start_worker: true }
+        );
+        // The worker refuses (e.g. libplacebo could not start), then exits.
+        inner.refuse("thumbs: Dolby Vision profile 5 needs libplacebo, which could not start");
+        inner.worker_running = false;
+        assert!(inner.disabled && inner.wanted.is_none() && inner.shadow.is_none());
+        for bucket in [7, 8, 9] {
+            assert_eq!(inner.request_thumb(url.clone(), bucket, 448), ThumbRequest::Refused);
+        }
+        assert!(inner.wanted.is_none() && !inner.worker_running);
+        // Another stream is judged on its own.
+        assert_eq!(
+            inner.request_thumb("http://127.0.0.1:11470/sdr".to_owned(), 7, 448),
+            ThumbRequest::Pending { start_worker: true }
+        );
+        assert!(!inner.disabled);
+    }
+
     /// The shipped cap, and the bound it is derived for.
     #[test]
     fn cache_default_is_the_named_cap() {
@@ -550,6 +1188,151 @@ mod tests {
         assert_eq!(THUMB_WIDTH_MAX % 2, 0);
     }
 
+    /// How long a bench waits for a local file to open and settle (one seek
+    /// budget per possible shadow: the software one, then its replacement).
+    const BENCH_OPEN_MS: u64 = 2 * SEEK_SETTLE_MS;
+
+    /// Open `file` exactly as the worker does: a software shadow, settled
+    /// into whatever the stream needs.
+    fn open_settled(file: &str, width: u32) -> Shadow {
+        let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
+        let mut shadow = Shadow::spawn(file, width, Render::Software).expect("shadow spawn");
+        loop {
+            match settle(shadow, file) {
+                Settled::Ready(ready) => return ready,
+                Settled::NotYet(pending) => {
+                    assert!(Instant::now() < deadline, "{file} never showed a frame");
+                    shadow = pending;
+                }
+                Settled::Refused(reason) => panic!("{file} refused: {reason}"),
+            }
+        }
+    }
+
+    /// The shadow as it was before the colour fix: software screenshots
+    /// whatever the stream is. The bench's "before".
+    fn open_unconverted(file: &str, width: u32) -> Shadow {
+        let shadow = Shadow::spawn(file, width, Render::Software).expect("shadow spawn");
+        let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
+        while shadow.duration().is_none() || shadow.mpv.get_property_string("video-params").is_none() {
+            assert!(Instant::now() < deadline, "{file} never opened");
+            std::thread::sleep(SETTLE_POLL);
+        }
+        shadow
+    }
+
+    /// The median and the 95th percentile (nearest rank) of `millis`.
+    fn median_p95(millis: &mut [f64]) -> (f64, f64) {
+        const P95: f64 = 0.95;
+        millis.sort_by(|a, b| a.total_cmp(b));
+        let n = millis.len();
+        let rank = ((P95 * n as f64).ceil() as usize).clamp(1, n);
+        (millis[n / 2], millis[rank - 1])
+    }
+
+    /// Colour before/after through the real shadow code path, per file: what
+    /// mpv reports, the conversion decided from it, then the same evenly
+    /// spread positions captured by the unconverted shadow ("before") and by
+    /// the settled one ("after"), each timed (seek + screenshot), and scene
+    /// scan samples interleaved on the settled shadow. Needs `libmpv-2.dll`
+    /// (next to the test binary or via `RILLIO_LIBMPV`) and:
+    ///   RILLIO_THUMBS_BENCH_FILES  the videos, separated by `;`
+    ///   RILLIO_THUMBS_BENCH_WIDTH  the thumbnail width, e.g. `448`
+    ///   RILLIO_THUMBS_BENCH_OUT    the directory the jpgs are written to
+    /// Run: `cargo test --lib thumbs::tests::bench_colour -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll and RILLIO_THUMBS_BENCH_FILES"]
+    fn bench_colour_conversion() {
+        const SAMPLES: u32 = 12;
+        let files = std::env::var("RILLIO_THUMBS_BENCH_FILES").expect("RILLIO_THUMBS_BENCH_FILES");
+        let width = thumb_width(
+            std::env::var("RILLIO_THUMBS_BENCH_WIDTH")
+                .expect("RILLIO_THUMBS_BENCH_WIDTH")
+                .trim()
+                .parse()
+                .expect("a width"),
+        )
+        .expect("a usable width");
+        let out = std::path::PathBuf::from(
+            std::env::var("RILLIO_THUMBS_BENCH_OUT").expect("RILLIO_THUMBS_BENCH_OUT"),
+        );
+        std::fs::create_dir_all(&out).expect("the output directory");
+
+        for file in files.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+            let stem = std::path::Path::new(file)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("a file name")
+                .to_owned();
+            let started = Instant::now();
+            let mut after = open_settled(file, width);
+            let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let duration = after.duration().expect("a duration");
+            let times: Vec<f64> =
+                (1..=SAMPLES).map(|i| duration * f64::from(i) / f64::from(SAMPLES + 1)).collect();
+            println!("== {stem}");
+            println!(
+                "  video-params: {}",
+                after.mpv.get_property_string("video-params").unwrap_or_default()
+            );
+            println!(
+                "  dolby-vision-profile: {:?}, current-vo: {:?}",
+                after.mpv.get_property_string("current-tracks/video/dolby-vision-profile"),
+                after.mpv.get_property_string("current-vo"),
+            );
+            println!(
+                "  conversion: {} -> {:?}, opened + settled in {open_ms:.0} ms",
+                after.conversion.as_ref().expect("settled"),
+                after.render
+            );
+
+            let mut after_ms = Vec::new();
+            let mut scan_ms = Vec::new();
+            for (index, &time) in times.iter().enumerate() {
+                let t = Instant::now();
+                after.set_width(width).expect("thumb width");
+                assert!(after.seek_settled(time), "seek to {time:.1}s");
+                let jpeg = after.capture_bytes().expect("capture");
+                after_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::fs::write(out.join(format!("{stem}-after-{index:02}.jpg")), &jpeg)
+                    .expect("writing the jpg");
+            }
+            // The scene sweep on the same shadow: at its own width, seek,
+            // capture, reduce to the luma grid.
+            for &time in &times {
+                let t = Instant::now();
+                after.set_width(SCAN_WIDTH).expect("scan width");
+                assert!(after.seek_settled(time), "scan seek to {time:.1}s");
+                luma_grid(&after.capture_bytes().expect("scan capture")).expect("luma");
+                scan_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            drop(after);
+
+            let mut before = open_unconverted(file, width);
+            let mut before_ms = Vec::new();
+            for (index, &time) in times.iter().enumerate() {
+                let t = Instant::now();
+                before.set_width(width).expect("thumb width");
+                assert!(before.seek_settled(time), "seek to {time:.1}s");
+                let jpeg = before.capture_bytes().expect("capture");
+                before_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::fs::write(out.join(format!("{stem}-before-{index:02}.jpg")), &jpeg)
+                    .expect("writing the jpg");
+            }
+            drop(before);
+
+            for (label, millis) in
+                [("before", &mut before_ms), ("after", &mut after_ms), ("scan", &mut scan_ms)]
+            {
+                let (median, p95) = median_p95(millis);
+                println!(
+                    "  {label}: median {median:.0} ms, p95 {p95:.0} ms over {} captures",
+                    millis.len()
+                );
+            }
+        }
+    }
+
     /// Measures the real shadow against a local file: pixel size, jpg bytes and
     /// seek + screenshot time per thumbnail at each width, then the same
     /// captures interleaved with scene-scan-sized ones (the filter rebuild a
@@ -572,12 +1355,7 @@ mod tests {
             .collect();
         let out = std::env::var("RILLIO_THUMBS_BENCH_OUT").ok().map(std::path::PathBuf::from);
 
-        let mut shadow = Shadow::spawn(&file, widths[0]).expect("shadow spawn");
-        // `loadfile` is asynchronous; a seek is refused until the file is open.
-        let opened = Instant::now() + Duration::from_millis(SEEK_SETTLE_MS);
-        while shadow.duration().is_none() && Instant::now() < opened {
-            std::thread::sleep(SETTLE_POLL);
-        }
+        let mut shadow = open_settled(&file, widths[0]);
         let duration = shadow.duration().expect("the file never opened");
         let source_width: u32 = shadow
             .mpv
@@ -686,40 +1464,81 @@ pub async fn player_thumb(
 
     let inner_arc = state.0.clone();
     let mut inner = inner_arc.lock().map_err(|_| "thumbs: poisoned")?;
-    if inner.url.as_deref() != Some(url.as_str()) {
-        // New stream: drop the old shadow (its decoder pipeline is for the old
-        // url) and every cached frame with it.
-        inner.url = Some(url);
-        inner.generation += 1;
-        inner.shadow = None;
-        inner.cache.clear();
-        inner.wanted = None;
-        inner.scan = None;
-        inner.scan_requested = false;
-        inner.disabled = false;
+    match inner.request_thumb(url, bucket, width) {
+        ThumbRequest::Hit(data_url) => Ok(Some(data_url)),
+        ThumbRequest::Pending { start_worker } => {
+            if start_worker {
+                let arc = inner_arc.clone();
+                // A dedicated OS thread: every step (mpv FFI, settle polling,
+                // file IO) is blocking, and exactly one capture runs at a time.
+                std::thread::spawn(move || worker(arc));
+            }
+            Ok(None)
+        }
+        ThumbRequest::Refused => Ok(None),
     }
-    if inner.width != width {
-        // The preview changed size (window moved to a denser screen, zoom):
-        // the shadow stays, the frames captured for the old size go.
-        inner.width = width;
-        inner.cache.clear();
-        inner.wanted = None;
+}
+
+/// What a thumbnail request finds.
+#[derive(Debug, PartialEq, Eq)]
+enum ThumbRequest {
+    /// The frame is cached.
+    Hit(String),
+    /// Queued as the latest wanted bucket; `start_worker` when no worker is
+    /// running to pick it up (the caller spawns one).
+    Pending { start_worker: bool },
+    /// This stream gets no previews ([`Inner::refuse`]): nothing is queued.
+    Refused,
+}
+
+impl Inner {
+    /// The bookkeeping half of [`player_thumb`]: switch streams or widths when
+    /// they changed, answer from the cache, else queue `bucket`.
+    fn request_thumb(&mut self, url: String, bucket: u32, width: u32) -> ThumbRequest {
+        if self.url.as_deref() != Some(url.as_str()) {
+            // New stream: drop the old shadow (its decoder pipeline is for the
+            // old url) and every cached frame with it.
+            self.url = Some(url);
+            self.generation += 1;
+            self.shadow = None;
+            self.cache.clear();
+            self.wanted = None;
+            self.scan = None;
+            self.scan_requested = false;
+            self.disabled = false;
+        }
+        if self.width != width {
+            // The preview changed size (window moved to a denser screen, zoom):
+            // the shadow stays, the frames captured for the old size go.
+            self.width = width;
+            self.cache.clear();
+            self.wanted = None;
+        }
+        if let Some(hit) = self.cache.get(bucket) {
+            return ThumbRequest::Hit(hit.clone());
+        }
+        if self.disabled {
+            return ThumbRequest::Refused;
+        }
+        self.wanted = Some(bucket);
+        let start_worker = !self.worker_running;
+        self.worker_running = true;
+        ThumbRequest::Pending { start_worker }
     }
-    if let Some(hit) = inner.cache.get(bucket) {
-        return Ok(Some(hit.clone()));
+
+    /// No correct thumbnail can be made for the current stream: stop its
+    /// previews and its scene sweep, and say why, once (nothing retries until
+    /// the stream changes). A preview in the wrong colours reads as a broken
+    /// file; none at all is the honest answer.
+    fn refuse(&mut self, reason: &str) {
+        tracing::warn!(
+            "thumbs: no previews for {}: {reason}",
+            self.url.as_deref().unwrap_or("(no stream)")
+        );
+        self.disabled = true;
+        self.wanted = None;
+        self.shadow = None;
     }
-    if inner.disabled {
-        return Ok(None);
-    }
-    inner.wanted = Some(bucket);
-    if !inner.worker_running {
-        inner.worker_running = true;
-        let arc = inner_arc.clone();
-        // A dedicated OS thread: every step (mpv FFI, settle polling, file IO)
-        // is blocking, and exactly one capture runs at a time.
-        std::thread::spawn(move || worker(arc));
-    }
-    Ok(None)
 }
 
 /// Tear the shadow down (player unmount / playback stop). Frees the decoder
@@ -820,7 +1639,9 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 Job::Thumb(_, width) => width,
                 Job::ScanStep => SCAN_WIDTH,
             };
-            match Shadow::spawn(&url, width) {
+            // Every stream starts on the software path; `settle` below moves it
+            // to libplacebo once mpv has said what the stream is.
+            match Shadow::spawn(&url, width, Render::Software) {
                 Ok(shadow) => {
                     let mut inner = match inner_arc.lock() {
                         Ok(guard) => guard,
@@ -834,14 +1655,12 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                     inner.shadow = Some(shadow);
                 }
                 Err(e) => {
-                    tracing::warn!("thumbs: shadow spawn failed: {e}");
                     let mut inner = match inner_arc.lock() {
                         Ok(guard) => guard,
                         Err(_) => return,
                     };
                     if inner.generation == generation {
-                        inner.disabled = true;
-                        inner.wanted = None;
+                        inner.refuse(&format!("thumbs: shadow spawn failed: {e}"));
                     }
                     inner.worker_running = false;
                     return;
@@ -864,7 +1683,41 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
             }
             inner.shadow.take()
         };
-        let Some(mut shadow) = taken else { continue };
+        let Some(shadow) = taken else { continue };
+        // Nothing is captured until the shadow renders what the stream needs:
+        // a thumbnail in the wrong colours is worse than none.
+        let mut shadow = match settle(shadow, &url) {
+            Settled::Ready(shadow) => shadow,
+            Settled::NotYet(shadow) => {
+                // No frame within the seek budget: skipped exactly like an
+                // unsettled seek, and the next job asks again.
+                let mut inner = match inner_arc.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                if inner.generation == generation {
+                    inner.shadow = Some(shadow);
+                }
+                if let Job::Thumb(bucket, _) = job {
+                    tracing::debug!("thumbs: bucket {bucket}: the stream has shown no frame yet");
+                }
+                continue;
+            }
+            Settled::Refused(reason) => {
+                let mut inner = match inner_arc.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                if inner.generation != generation {
+                    // A refusal for the stream before; the new one decides
+                    // for itself.
+                    continue;
+                }
+                inner.refuse(&reason);
+                inner.worker_running = false;
+                return;
+            }
+        };
         match job {
             Job::Thumb(bucket, width) => {
                 let capture = shadow.set_width(width).and_then(|()| {
