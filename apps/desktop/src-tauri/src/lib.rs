@@ -2073,8 +2073,20 @@ async fn server_request(
 /// path: the path is resolved from the ENGINE's own data (the torrent's output
 /// folder and file list) and confined to the cache root by
 /// `Engine::locate`, which refuses `..`, absolute names and links that lead
-/// out of the cache. A file not on disk yet reveals the folder it would be in.
-/// Explorer gets the path as its own argument, never through a shell string.
+/// out of the cache. A file not on disk yet reveals the nearest real folder it
+/// would be in (a file is never taken for a folder).
+///
+/// A reveal only ever SELECTS (see [`reveal_plan`]): nothing is opened through
+/// its default association, so a downloaded `.exe`, `.lnk` or `.app` cannot
+/// run from here. On Windows no Explorer command line is built at all (its
+/// `/select,` grammar splits at commas, which argument quoting does not
+/// protect): the shell API selects the item by its ID list.
+///
+/// TENSION (accepted, see `location::confine`): the path is checked, then the
+/// file manager resolves it again; a local process that can already write the
+/// cache could swap a folder for a junction in between. Worst case: an outside
+/// folder is shown, nothing runs.
+///
 /// Desktop only: there is no file manager to show on Android.
 #[tauri::command]
 async fn reveal_cache_item(
@@ -2110,37 +2122,158 @@ async fn reveal_cache_item(
     }
 }
 
-#[cfg(desktop)]
-fn reveal_in_file_manager(location: &rillio_streaming_server::location::Location) -> std::io::Result<()> {
+/// The desktop platforms a reveal is planned for (a parameter, not a `cfg`, so
+/// every platform's rule is tested on every build host).
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(desktop), allow(dead_code))]
+enum RevealOs {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+/// What a reveal does. Every variant only SELECTS or shows a verified folder.
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(desktop), allow(dead_code))]
+enum RevealPlan {
+    /// Windows: `SHOpenFolderAndSelectItems` on this item's ID list. A Folder
+    /// location (a file not on disk yet) is selected in ITS parent: opening a
+    /// folder goes through the shell's association for it, selecting does not.
+    ShellSelect(std::path::PathBuf),
+    /// Run `program` with `args`, the path its own argument.
+    Command { program: &'static str, args: Vec<std::ffi::OsString> },
+}
+
+#[cfg_attr(not(desktop), allow(dead_code))]
+fn reveal_plan(location: &rillio_streaming_server::location::Location, os: RevealOs) -> Result<RevealPlan, String> {
     use rillio_streaming_server::location::{display_path, Location};
-    let (path, select) = match location {
-        Location::Item(path) => (display_path(path), true),
-        Location::Folder(path) => (display_path(path), false),
+    let path = match location {
+        Location::Item(path) | Location::Folder(path) => display_path(path),
     };
-    #[cfg(windows)]
-    {
-        let mut command = std::process::Command::new("explorer.exe");
-        if select {
-            // "/select," then the path as a separate argument: Explorer
-            // accepts the space, and the path is never parsed by a shell.
-            command.arg("/select,");
+    match os {
+        RevealOs::Windows => Ok(RevealPlan::ShellSelect(path)),
+        // Always reveal (-R), never plain `open`: an `.app` is a directory
+        // that `open` would launch.
+        RevealOs::MacOs => Ok(RevealPlan::Command { program: "open", args: vec!["-R".into(), path.into_os_string()] }),
+        // Linux file managers have no portable "select": open a folder, and
+        // only one verified to be a directory (xdg-open runs anything else).
+        RevealOs::Linux => {
+            let folder = match location {
+                Location::Item(_) => path.parent().map(std::path::Path::to_path_buf),
+                Location::Folder(_) => Some(path.clone()),
+            }
+            .filter(|folder| folder.is_dir())
+            .ok_or_else(|| format!("no folder to show for {}", path.display()))?;
+            Ok(RevealPlan::Command { program: "xdg-open", args: vec![folder.into_os_string()] })
         }
-        // Explorer's exit code is 1 even when it worked; spawning is the check.
-        command.arg(&path).spawn().map(|_| ())
     }
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = std::process::Command::new("open");
-        if select {
-            command.arg("-R");
+}
+
+#[cfg(desktop)]
+fn reveal_in_file_manager(location: &rillio_streaming_server::location::Location) -> Result<(), String> {
+    let os = if cfg!(windows) {
+        RevealOs::Windows
+    } else if cfg!(target_os = "macos") {
+        RevealOs::MacOs
+    } else {
+        RevealOs::Linux
+    };
+    match reveal_plan(location, os)? {
+        RevealPlan::ShellSelect(path) => shell_select(path),
+        RevealPlan::Command { program, args } => std::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("{program}: {e}")),
+    }
+}
+
+/// Select one item in Explorer through the shell API: the path becomes an
+/// item ID list, so no command line is parsed and nothing is opened. COM is
+/// initialised on a thread of its own for the call.
+#[cfg(windows)]
+fn shell_select(path: std::path::PathBuf) -> Result<(), String> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+    std::thread::spawn(move || unsafe {
+        let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let wide = HSTRING::from(path.as_os_str());
+        let pidl = ILCreateFromPathW(&wide);
+        let result = if pidl.is_null() {
+            Err(format!("no shell item for {}", path.display()))
+        } else {
+            let selected = SHOpenFolderAndSelectItems(pidl, None, 0)
+                .map_err(|e| format!("SHOpenFolderAndSelectItems {}: {e}", path.display()));
+            ILFree(Some(pidl));
+            selected
+        };
+        if init.is_ok() {
+            CoUninitialize();
         }
-        command.arg(&path).spawn().map(|_| ())
+        result
+    })
+    .join()
+    .map_err(|_| "the reveal thread panicked".to_owned())?
+}
+
+#[cfg(all(desktop, not(windows)))]
+fn shell_select(path: std::path::PathBuf) -> Result<(), String> {
+    Err(format!("no shell selection on this platform ({})", path.display()))
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+    use rillio_streaming_server::location::Location;
+    use std::path::{Path, PathBuf};
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rillio-reveal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // No portable "select" on Linux file managers: open the folder.
-        let folder = if select { path.parent().map(std::path::Path::to_path_buf).unwrap_or(path) } else { path };
-        std::process::Command::new("xdg-open").arg(folder).spawn().map(|_| ())
+
+    #[test]
+    fn windows_only_ever_selects_and_builds_no_command_line() {
+        for location in [
+            Location::Item(PathBuf::from(r"C:\cache\Pack\one,two.mkv")),
+            Location::Item(PathBuf::from(r"C:\cache\-dash, comma.exe")),
+            Location::Item(PathBuf::from(r"C:\cache\shortcut.lnk")),
+            Location::Folder(PathBuf::from(r"\\?\C:\cache\Pack, with comma")),
+        ] {
+            let path = match &location {
+                Location::Item(p) | Location::Folder(p) => rillio_streaming_server::location::display_path(p),
+            };
+            assert_eq!(reveal_plan(&location, RevealOs::Windows).unwrap(), RevealPlan::ShellSelect(path));
+        }
+    }
+
+    #[test]
+    fn macos_always_reveals_never_opens() {
+        for location in [Location::Item(PathBuf::from("/c/x.app")), Location::Folder(PathBuf::from("/c/Evil.app"))] {
+            match reveal_plan(&location, RevealOs::MacOs).unwrap() {
+                RevealPlan::Command { program, args } => {
+                    assert_eq!(program, "open");
+                    assert_eq!(args[0], "-R");
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn linux_opens_only_a_verified_directory() {
+        let root = temp("linux");
+        std::fs::write(root.join("payload.exe"), b"MZ").unwrap();
+        // An item: its parent folder, which exists.
+        let plan = reveal_plan(&Location::Item(root.join("payload.exe")), RevealOs::Linux).unwrap();
+        assert_eq!(plan, RevealPlan::Command { program: "xdg-open", args: vec![root.clone().into_os_string()] });
+        // A "folder" that is really a file is refused, never handed to xdg-open.
+        assert!(reveal_plan(&Location::Folder(root.join("payload.exe")), RevealOs::Linux).is_err());
+        assert!(reveal_plan(&Location::Folder(Path::new("/no/such/dir").to_path_buf()), RevealOs::Linux).is_err());
     }
 }
 

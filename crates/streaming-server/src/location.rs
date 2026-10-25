@@ -77,6 +77,16 @@ pub fn join_relative(base: &Path, relative: &str) -> Result<PathBuf, LocationErr
 
 /// `path`, resolved on disk (links followed), if it is inside `root`
 /// (resolved the same way). `path` must exist.
+///
+/// TENSION (decided 2026-10-25, Codex review of feat/cache-cards-clarity):
+/// this checks the path at one moment and the file manager resolves it again
+/// a moment later. A process that can already write inside the cache could
+/// swap a checked folder for a junction in between and steer the reveal
+/// outside the cache. Accepted, not fixed: it needs a local writer the cache
+/// already trusts, and since a reveal only ever SELECTS an item (never opens
+/// or runs one, see the shell's reveal_cache_item), the worst case is showing
+/// an outside folder. Closing it would mean holding handles on the root and
+/// every ancestor through the shell call.
 pub fn confine(root: &Path, path: &Path) -> Result<PathBuf, LocationError> {
     let root = std::fs::canonicalize(root)
         .map_err(|e| LocationError::Unreadable(format!("{}: {e}", root.display())))?;
@@ -95,16 +105,21 @@ pub fn confine(root: &Path, path: &Path) -> Result<PathBuf, LocationError> {
 }
 
 /// The location of `target` under `root`: the item itself when it exists, or
-/// the nearest existing folder above it (never above `root`). Confined either
-/// way.
+/// the nearest existing DIRECTORY above it (never above `root`). Confined
+/// either way. A file standing where a folder is expected (a hostile
+/// `payload.exe/missing.mkv` layout) is skipped, never returned as a Folder.
 pub fn locate_path(root: &Path, target: &Path) -> Result<Location, LocationError> {
     if target.exists() {
         return confine(root, target).map(Location::Item);
     }
     let mut folder = target.parent();
     while let Some(candidate) = folder {
-        if candidate.exists() {
-            return confine(root, candidate).map(Location::Folder);
+        if candidate.is_dir() {
+            let real = confine(root, candidate)?;
+            // Checked again on the resolved path: a link can name a file.
+            if real.is_dir() {
+                return Ok(Location::Folder(real));
+            }
         }
         if candidate == root {
             break;
@@ -250,6 +265,38 @@ mod tests {
         assert!(matches!(locate_path(&root, &through), Err(LocationError::OutsideCache(_))));
         // And a missing file behind it: its folder is the link, still refused.
         assert!(matches!(locate_path(&root, &link.join("nope.mkv")), Err(LocationError::OutsideCache(_))));
+    }
+
+    /// A FILE never stands in for a missing folder: `payload.exe/missing.mkv`
+    /// with `payload.exe` an existing file must not make the file manager
+    /// "open the folder" `payload.exe` (which would run it).
+    #[test]
+    fn a_file_in_place_of_a_missing_folder_is_never_the_folder() {
+        let root = temp("file-ancestor");
+        std::fs::write(root.join("payload.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("shortcut.lnk"), b"L").unwrap();
+        for ancestor in ["payload.exe", "shortcut.lnk"] {
+            let found = locate_path(&root, &root.join(ancestor).join("missing.mkv")).unwrap();
+            assert_eq!(found, Location::Folder(std::fs::canonicalize(&root).unwrap()), "{ancestor}");
+        }
+    }
+
+    /// Commas, spaces and a leading dash are ordinary file names here: they
+    /// come back as exactly that item, to be selected (never parsed).
+    #[test]
+    fn awkward_names_resolve_to_exactly_that_item() {
+        let root = temp("awkward");
+        std::fs::create_dir_all(root.join("Pack, with comma")).unwrap();
+        for name in ["one,two.mkv", "-dash first.mkv", "a b , c.mkv", "payload.exe", "shortcut.lnk"] {
+            std::fs::write(root.join("Pack, with comma").join(name), b"x").unwrap();
+            let target = join_relative(&root, &format!("Pack, with comma/{name}")).unwrap();
+            let found = locate_path(&root, &target).unwrap();
+            assert_eq!(
+                found,
+                Location::Item(std::fs::canonicalize(root.join("Pack, with comma").join(name)).unwrap()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
