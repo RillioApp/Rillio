@@ -113,19 +113,22 @@ const describeEntry = ({ entry, files, videos }) => {
     const release = releaseLine(parseReleaseInfo(entry.name));
     const { episodes } = splitFiles(files);
     const isSeries = meta === undefined || meta.type !== 'movie';
-    const pack = isSeries && (Array.isArray(files) ? episodeCount(episodes) >= 2 : isPackName(entry.name));
+    // The file list decides when it says something: two or more episodes is a
+    // pack, exactly one is not. An empty or unreadable list (no episode names)
+    // is no evidence, so the release name's season tag stands.
+    const shown = Array.isArray(files) ? episodeCount(episodes) : 0;
+    const pack = isSeries && (shown >= 2 || (shown === 0 && isPackName(entry.name)));
     const base = { release, season: null, episode: null, packLabel: null, unmatched: meta === undefined };
 
     if (pack) {
         const title = meta !== undefined ? meta.name : cleanName(entry.name).title;
-        const label = Array.isArray(files) ?
+        const label = shown >= 2 ?
             packLabel(episodes) :
             (() => {
                 const season = parseReleaseName(entry.name).season;
                 return isNumber(season) ? `Season ${season} pack` : 'Pack';
             })();
-        const count = Array.isArray(files) ? episodeCount(episodes) : null;
-        return { ...base, kind: 'pack', title, packLabel: label, subtitle: count !== null ? `${label} · ${count} episodes` : label };
+        return { ...base, kind: 'pack', title, packLabel: label, subtitle: shown >= 2 ? `${label} · ${shown} episodes` : label };
     }
 
     if (meta === undefined) {

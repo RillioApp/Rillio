@@ -129,6 +129,28 @@ describe('describeEntry: what the row is', () => {
         });
     });
 
+    // An empty or unreadable file list is no evidence: the pack name stands,
+    // and the sidecar's first-played episode never labels the whole pack.
+    test('a pack stays a pack when its file list is empty or names no episodes', () => {
+        for (const files of [
+            [],
+            [
+                { index: 0, path: 'Severance Season 2/Disc A.mkv', length: 9, downloaded: 0, selected: true, video: true },
+                { index: 1, path: 'Severance Season 2/Disc B.mkv', length: 9, downloaded: 0, selected: false, video: true },
+            ],
+        ]) {
+            expect(describeEntry({ entry: packEntry, files, videos: VIDEOS })).toMatchObject({ kind: 'pack', subtitle: 'Season 2 pack' });
+        }
+    });
+
+    test('a file list that positively shows ONE episode overrides a season-like name', () => {
+        const files = [
+            { index: 0, path: 'Severance.S02E03.Who.Is.Alive.1080p.mkv', length: 9, downloaded: 9, selected: true, video: true },
+            { index: 1, path: 'NTb.nfo', length: 1, downloaded: 1, selected: true, video: false },
+        ];
+        expect(describeEntry({ entry: { ...packEntry, fileIdx: 0 }, files, videos: VIDEOS })).toMatchObject({ kind: 'episode', subtitle: 'S02E03 · Who Is Alive?' });
+    });
+
     test('an episode carries its number and title', () => {
         expect(describeEntry({ entry: uhdEntry, files: null, videos: VIDEOS })).toMatchObject({
             kind: 'episode', title: 'Severance', subtitle: 'S02E03 · Who Is Alive?', season: 2, episode: 3,
