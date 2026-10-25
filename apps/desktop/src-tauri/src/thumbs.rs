@@ -775,10 +775,16 @@ impl Shadow {
     fn seek_settled(&self, target: f64) -> bool {
         let deadline = Instant::now() + Duration::from_millis(SEEK_SETTLE_MS);
         while self.mpv.command(&["seek", &format!("{target:.3}"), "absolute+keyframes"]).is_err() {
+            // No retry starts after the budget: the sleep is capped to what
+            // is left, and the deadline is checked again before the next ask.
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            std::thread::sleep(SETTLE_POLL.min(left));
             if Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(SETTLE_POLL);
         }
         while Instant::now() < deadline {
             std::thread::sleep(SETTLE_POLL);
@@ -868,7 +874,7 @@ impl HiddenWindow {
     fn create() -> Result<Self, String> {
         use windows::core::w;
         use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-        use windows::Win32::System::Threading::{CreateEventW, INFINITE};
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, DispatchMessageW, MsgWaitForMultipleObjects,
             PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, WS_EX_NOACTIVATE,
@@ -915,13 +921,18 @@ impl HiddenWindow {
                     return;
                 }
                 let mut msg = MSG::default();
-                loop {
+                'pump: loop {
                     // Everything queued first: the wait below only wakes for
                     // input that arrives after the queue was last looked at.
+                    // `stop` is checked per message, so a queue something
+                    // keeps refilling cannot hold the drop's join.
                     while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
                         unsafe {
                             let _ = TranslateMessage(&msg);
                             DispatchMessageW(&msg);
+                        }
+                        if unsafe { WaitForSingleObject(stop, 0) } == WAIT_OBJECT_0 {
+                            break 'pump;
                         }
                     }
                     let woke = unsafe {
@@ -1481,6 +1492,46 @@ mod tests {
         }
         drop(window);
         assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool(), "destroyed with its thread");
+    }
+
+    /// The drop returns even while something keeps refilling the window's
+    /// queue through it: the pump checks `stop` per message, not only once the
+    /// queue is empty (Codex pass 2). The producer posts until the window is
+    /// gone (a full queue only makes a post fail, so failures are ignored),
+    /// so it cannot outlive the drop.
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_window_stops_while_its_queue_is_being_refilled() {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_NULL};
+
+        const DROP_BUDGET: Duration = Duration::from_secs(5);
+        /// Enough posters to outpace one pump, so the queue never empties.
+        const PRODUCERS: usize = 4;
+        let window = HiddenWindow::create().expect("hidden window");
+        let wid = window.wid();
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let hwnd = HWND(wid as *mut _);
+                    while unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                        let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+                    }
+                })
+            })
+            .collect();
+        // Let the producer get the queue busy before the drop starts.
+        std::thread::sleep(Duration::from_millis(50));
+        let (done, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(window);
+            let _ = done.send(());
+        });
+        assert!(dropped.recv_timeout(DROP_BUDGET).is_ok(), "the drop hung behind a refilled queue");
+        assert!(!unsafe { IsWindow(Some(HWND(wid as *mut _))) }.as_bool());
+        for producer in producers {
+            producer.join().expect("producer");
+        }
     }
 
     /// The shipped cap, and the bound it is derived for.
