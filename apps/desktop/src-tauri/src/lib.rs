@@ -2115,10 +2115,17 @@ async fn reveal_cache_item(
             tracing::warn!("reveal_cache_item {info_hash} {file_idx:?}: {e:?}");
             e.to_string()
         })?;
-        reveal_in_file_manager(&location).map_err(|e| {
-            tracing::error!("reveal_cache_item {info_hash} {file_idx:?}: {e}");
-            "Rillio could not open the folder.".to_owned()
-        })
+        // Off the async workers: SHOpenFolderAndSelectItems waits on Explorer,
+        // and a hung Explorer must not pin a worker of the runtime that also
+        // runs window drag and every other async command (the 0.1.50
+        // starvation class). The blocking pool is for exactly this.
+        tauri::async_runtime::spawn_blocking(move || reveal_in_file_manager(&location))
+            .await
+            .map_err(|e| format!("reveal_cache_item: the reveal task failed: {e}"))?
+            .map_err(|e| {
+                tracing::error!("reveal_cache_item {info_hash} {file_idx:?}: {e}");
+                "Rillio could not open the folder.".to_owned()
+            })
     }
 }
 
