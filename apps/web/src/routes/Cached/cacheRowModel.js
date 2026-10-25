@@ -207,12 +207,17 @@ const episodeRows = ({ episodes, videos, library }) => {
         for (let e = row.episode; e <= row.lastEpisode; e += 1) covered.push(videoFor(videos, row.season, e));
         const first = covered[0];
         const states = covered.map((video) => (video === null ? null : videoState(video.id, library, watchedFlags, orderedIds)));
+        // A combined file: watched when every episode it covers is, partly
+        // watched when some are, not started only when none is; any unknown
+        // episode leaves it unknown (an in-progress one still shows).
         let view = null;
-        if (states.every((state) => state !== null)) {
-            const partial = states.find((state) => state.state === 'partial');
-            view = partial ?? (states.every((state) => state.state === 'watched') ? { state: 'watched' } : { state: 'unwatched' });
-        } else {
-            view = states.find((state) => state !== null && state.state === 'partial') ?? null;
+        const partial = states.find((state) => state !== null && state.state === 'partial');
+        if (partial) {
+            view = partial;
+        } else if (states.every((state) => state !== null)) {
+            const watched = states.filter((state) => state.state === 'watched').length;
+            view = watched === states.length ? { state: 'watched' } :
+                watched > 0 ? { state: 'partly', watched, of: states.length } : { state: 'unwatched' };
         }
         return {
             label: episodeLabel(row, multiSeason),
@@ -296,24 +301,29 @@ const packStrip = (rows) => rows.map((row) => {
     const view = row.view;
     if (view !== null && view.state === 'watched') return { label: row.label, state: 'watched' };
     if (view !== null && view.state === 'partial') return { label: row.label, state: 'partial', fraction: Math.min(1, view.offset / view.duration) };
+    if (view !== null && view.state === 'partly') return { label: row.label, state: 'partly', fraction: view.watched / view.of };
     if (!here) return { label: row.label, state: 'missing' };
     if (view !== null) return { label: row.label, state: 'unwatched' };
     return { label: row.label, state: 'disk' };
 });
 
+// Whether row b directly follows row a: the next episode of the same season.
+const follows = (a, b) => a.season === b.season && b.episode === a.lastEpisode + 1;
+
 const ranges = (labels, rows) => {
-    // Consecutive rows collapse to "E01 to E04".
+    // Runs of consecutive episodes of one season collapse to "E01 to E04";
+    // a gap (an unknown, unwatched or absent episode) breaks the run.
     const out = [];
     let start = null;
     let prev = null;
     rows.forEach((row, index) => {
-        if (labels.has(index)) {
-            if (start === null) start = index;
+        if (labels.has(index) && start !== null && prev === index - 1 && follows(rows[prev], row)) {
             prev = index;
-        } else if (start !== null) {
-            out.push([start, prev]);
-            start = null;
+            return;
         }
+        if (start !== null) out.push([start, prev]);
+        start = labels.has(index) ? index : null;
+        prev = start;
     });
     if (start !== null) out.push([start, prev]);
     return out.map(([a, b]) => (a === b ? rows[a].label : `${rows[a].label} to ${rows[b].label}`));
@@ -332,9 +342,13 @@ const packSummary = (rows) => {
     const parts = [];
     const watchedRanges = ranges(watched, rows);
     if (watchedRanges.length > 0) parts.push(`${watchedRanges.join(', ')} watched`);
+    const partly = rows.filter((row) => row.view !== null && row.view.state === 'partly').map((row) => row.label);
+    if (partly.length > 0) parts.push(`${partly.join(', ')} partly watched`);
     const partial = rows.find((row) => row.view !== null && row.view.state === 'partial');
     if (partial) parts.push(`${partial.label} ${progressWord(partial.view.offset / partial.view.duration)}`);
-    return parts.length > 0 ? parts.join(', ') : 'Nothing watched yet';
+    if (parts.length > 0) return parts.join(', ');
+    // A negative summary needs every episode known.
+    return rows.every((row) => row.view !== null) ? 'Nothing watched yet' : null;
 };
 
 // ---------------------------------------------------------------------------

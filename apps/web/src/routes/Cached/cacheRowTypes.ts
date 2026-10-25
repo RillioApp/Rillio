@@ -8,10 +8,14 @@ import type { TorrentFile } from './TorrentFiles';
 export type ReleasePart = { text: string, strong?: boolean };
 
 export type ViewState = {
-    state: 'watched' | 'partial' | 'unwatched',
+    // 'partly': a combined file with some of its episodes watched.
+    state: 'watched' | 'partial' | 'partly' | 'unwatched',
     offset?: number,
     duration?: number,
+    watched?: number,
+    of?: number,
     source?: 'cache',
+    at?: number,
 };
 
 export type Described = {
@@ -38,7 +42,7 @@ export type EpisodeRowModel = {
 
 export type StripBar = {
     label: string,
-    state: 'watched' | 'partial' | 'unwatched' | 'disk' | 'missing',
+    state: 'watched' | 'partial' | 'partly' | 'unwatched' | 'disk' | 'missing',
     fraction?: number,
 };
 

@@ -292,6 +292,36 @@ describe('the pack strip and its summary', () => {
     test('a short summary', () => {
         expect(packSummary(rows)).toBe('E01 to E02 watched, E03 halfway');
     });
+
+    const row = (season, episode, state) => ({
+        label: `E${String(episode).padStart(2, '0')}`, season, episode, lastEpisode: episode,
+        file: { index: episode, path: '', length: 1, downloaded: 1, selected: true, video: true },
+        view: state === null ? null : { state },
+    });
+
+    test('ranges merge only consecutive episodes of one season', () => {
+        // E02 unknown sits between: "E01 to E03" would claim it.
+        expect(packSummary([row(1, 1, 'watched'), row(1, 2, null), row(1, 3, 'watched')])).toBe('E01, E03 watched');
+        // E02 missing from the pack entirely.
+        expect(packSummary([row(1, 1, 'watched'), row(1, 3, 'watched')])).toBe('E01, E03 watched');
+        // Adjacent rows across a season boundary.
+        expect(packSummary([row(1, 10, 'watched'), row(2, 1, 'watched')])).toBe('E10, E01 watched');
+        expect(packSummary([row(1, 1, 'watched'), row(1, 2, 'watched'), row(1, 3, 'watched')])).toBe('E01 to E03 watched');
+    });
+
+    test('"Nothing watched yet" only when every episode is known', () => {
+        expect(packSummary([row(1, 1, 'unwatched'), row(1, 2, null)])).toBeNull();
+        expect(packSummary([row(1, 1, 'unwatched'), row(1, 2, 'unwatched')])).toBe('Nothing watched yet');
+    });
+
+    test('a combined file with one episode watched and one not is partly watched', () => {
+        const combined = splitFiles([{ index: 0, path: 'Severance.S02E01E02.mkv', length: 9, downloaded: 9, selected: true, video: true }]).episodes;
+        // Only S02E01 watched (bit 2 of the core's order), anchored on it.
+        const library = libraryWith({ watchedField: 'tt11280740:2:1:3:eJxjAQAABQAF', videoId: 'x', timeOffset: 0 });
+        const [only] = episodeRows({ episodes: combined, videos: VIDEOS, library });
+        expect(only.view).toMatchObject({ state: 'partly' });
+        expect(packStrip([only])[0]).toMatchObject({ state: 'partly', fraction: 0.5 });
+    });
 });
 
 describe('itemView: one episode or a movie', () => {

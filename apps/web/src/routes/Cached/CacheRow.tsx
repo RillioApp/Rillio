@@ -101,7 +101,7 @@ const PackStrip = ({ bars, summary }: { bars: StripBar[], summary: string | null
                     bar.state === 'disk' && 'bg-fg-subtle/60',
                     bar.state === 'missing' && 'border border-dashed border-fg-subtle',
                 )}
-                style={bar.state === 'partial' ?
+                style={bar.state === 'partial' || bar.state === 'partly' ?
                     { background: `linear-gradient(90deg, var(--color-accent) ${Math.round((bar.fraction ?? 0) * 100)}%, var(--color-surface-hover) ${Math.round((bar.fraction ?? 0) * 100)}%)` }
                     :
                     undefined}
@@ -113,6 +113,7 @@ const PackStrip = ({ bars, summary }: { bars: StripBar[], summary: string | null
 const BAR_WORDS: Record<string, string> = {
     watched: 'watched',
     partial: 'in progress',
+    partly: 'partly watched',
     unwatched: 'not started',
     disk: 'on disk',
     missing: 'not downloaded',
@@ -134,6 +135,7 @@ const viewedText = (row: EpisodeRowModel): { text: string, tone: 'accent' | 'mut
     const view = row.view;
     if (view !== null && view.state === 'watched') return { text: 'Watched', tone: 'accent' };
     if (view !== null && view.state === 'partial') return { text: model.minutesOf(view as { offset: number, duration: number }), tone: 'muted' };
+    if (view !== null && view.state === 'partly') return { text: 'Partly watched', tone: 'muted' };
     if (!model.onDisk(row.file)) return { text: '-', tone: 'subtle' };
     if (view !== null) return { text: 'Not started', tone: 'subtle' };
     return { text: '', tone: 'subtle' };
