@@ -167,6 +167,15 @@ describe('describeEntry: what the row is', () => {
         expect(describeEntry({ entry, files: null, videos: VIDEOS })).toMatchObject({ kind: 'title', subtitle: null });
     });
 
+    test('a sample beside the one video does not make it two', () => {
+        const entry = { ...uhdEntry, name: 'Severance - Who Is Alive.mkv' };
+        const files = [
+            { index: 0, path: 'Severance - Who Is Alive.mkv', length: 900, downloaded: 900, selected: true, video: true },
+            { index: 1, path: 'Sample/severance-sample.mkv', length: 20, downloaded: 0, selected: false, video: true },
+        ];
+        expect(describeEntry({ entry, files, videos: VIDEOS })).toMatchObject({ kind: 'episode', subtitle: 'S02E03 · Who Is Alive?' });
+    });
+
     test('an episode carries its number and title', () => {
         expect(describeEntry({ entry: uhdEntry, files: null, videos: VIDEOS })).toMatchObject({
             kind: 'episode', title: 'Severance', subtitle: 'S02E03 · Who Is Alive?', season: 2, episode: 3,

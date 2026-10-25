@@ -65,6 +65,9 @@ const splitFiles = (files) => {
     return { episodes, other };
 };
 
+// A sample clip: a "sample" folder, or "sample" as a word of the name.
+const isSample = (file) => /(^|[\\/._ -])sample([\\/._ -]|$)/i.test(String(file.path));
+
 const episodeCount = (episodes) => new Set(episodes.flatMap((row) => {
     const keys = [];
     for (let e = row.episode; e <= row.lastEpisode; e += 1) keys.push(`${row.season}:${e}`);
@@ -149,7 +152,8 @@ const describeEntry = ({ entry, files, videos }) => {
     // "Show.Complete.Series" with no list yet (waiting, failed, loading) is
     // shown as the title alone, never as the first-played episode.
     const parsed = parseEpisode(entry.name);
-    const singleVideo = Array.isArray(files) && files.filter((file) => file.video).length === 1;
+    // A sample clip beside the video is packaging, not a second video.
+    const singleVideo = Array.isArray(files) && files.filter((file) => file.video && !isSample(file)).length === 1;
     const sidecar = parsed !== null || singleVideo;
     const season = parsed !== null && isNumber(parsed.season) ? parsed.season : (sidecar && isNumber(meta.season) ? meta.season : null);
     const episode = parsed !== null ? parsed.episode : (sidecar && isNumber(meta.episode) ? meta.episode : null);
