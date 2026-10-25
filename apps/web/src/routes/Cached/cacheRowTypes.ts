@@ -71,7 +71,8 @@ export type RowFacts = {
     recency: Recency,
     strip: StripBar[] | null,
     summary: string | null,
-    disk: string,
+    // Null when there is nothing honest to say (an issue, no counters).
+    disk: string | null,
     viewLine: string | null,
     watchedTone: boolean,
     action: RowAction | null,

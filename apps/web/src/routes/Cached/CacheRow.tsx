@@ -360,7 +360,7 @@ const CacheRow = ({ row, open, onToggleOpen, streamingMode, refetching, ...handl
                     }
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-1.5 text-right">
-                    <span className={cn('text-[0.8125rem] tabular-nums', entry.state === 'error' ? 'text-danger' : 'text-fg')}>{row.disk}</span>
+                    {row.disk !== null ? <span className="text-[0.8125rem] tabular-nums text-fg">{row.disk}</span> : null}
                     {row.viewLine !== null ? <span className={cn('text-xs', row.watchedTone ? 'text-accent' : 'text-fg-subtle')}>{row.viewLine}</span> : null}
                 </div>
             </div>

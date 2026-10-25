@@ -367,6 +367,22 @@ describe('the right-hand lines', () => {
         expect(diskText(packEntry, splitFiles(packFiles).episodes)).toBe('3 of 5 on disk · 33 MB');
     });
 
+    // Selected is not downloaded, and unavailable counters say nothing.
+    test('on disk: issues, preparing and missing counters come before byte counts', () => {
+        const episodes = splitFiles(packFiles).episodes;
+        expect(diskText({ ...packEntry, issue: { kind: 'engine-error', reason: 'x' } }, episodes)).toBeNull();
+        expect(diskText({ ...packEntry, state: 'waiting', downloaded: 0, total: 0, issue: { kind: 'metadata-missing', reason: '' } }, null)).toBeNull();
+        expect(diskText({ ...packEntry, state: 'initializing' }, episodes)).toBe('Preparing · 42 MB');
+        expect(diskText({ ...uhdEntry, state: 'live', downloaded: 0, total: 0 }, null)).toBeNull();
+    });
+
+    test('a selected episode with no bytes yet is not on disk', () => {
+        const files = packFiles.map((file) => (file.index === 3 ? { ...file, selected: true } : file));
+        const rows = episodeRows({ episodes: splitFiles(files).episodes, videos: null, library: undefined });
+        expect(packStrip(rows).map((bar) => bar.state)).toEqual(['disk', 'disk', 'disk', 'missing', 'missing']);
+        expect(diskText(packEntry, splitFiles(files).episodes)).toBe('3 of 5 on disk · 33 MB');
+    });
+
     test('viewing and recency: library facts are about the episode, recency about this copy', () => {
         const play = { at: NOW - DAY, label: null };
         expect(viewText({ view: { state: 'watched' }, recency: { kind: 'added', at: NOW - 3 * DAY }, play, noun: 'Episode' }, NOW))

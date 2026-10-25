@@ -289,7 +289,10 @@ const rowVideoIds = ({ entry, described, rows, videos }) => {
 // The pack strip
 // ---------------------------------------------------------------------------
 
-const onDisk = (file) => file.downloaded > 0 || file.selected;
+// On disk means bytes on disk. Being selected (queued for download, or
+// streaming) is not; that is `playable`, what Play may start.
+const onDisk = (file) => file.downloaded > 0;
+const playable = (file) => file.selected === true;
 
 /**
  * One bar per episode: 'watched' | 'partial' (with fraction) | 'unwatched' for
@@ -376,15 +379,23 @@ const formatOf = (done, total) => {
     return `${sizeNumber(done, unit)} of ${sizeNumber(total, unit)} ${name}`;
 };
 
-/** The on-disk line. episodes: splitFiles(...).episodes for a pack, else null. */
+/**
+ * The on-disk line, or null when there is nothing honest to say. episodes:
+ * splitFiles(...).episodes for a pack, else null. In order: a row with an
+ * issue (or one waiting to be restored) states its issue instead of byte
+ * counts it does not have; a torrent preparing has no have-count yet (packs
+ * included); no total is no measurement.
+ */
 const diskText = (entry, episodes) => {
+    if (entry.issue !== undefined || entry.state === 'waiting' || entry.state === 'error') return null;
+    if (entry.state === 'initializing') return entry.total > 0 ? `Preparing · ${formatSize(entry.total)}` : 'Preparing';
+    if (!(entry.total > 0)) return null;
     if (Array.isArray(episodes) && episodes.length >= 2) {
-        const here = episodes.filter((row) => row.file.downloaded > 0).length;
+        const here = episodes.filter((row) => onDisk(row.file)).length;
         return `${here} of ${episodes.length} on disk · ${formatSize(entry.downloaded)}`;
     }
-    if (entry.state === 'initializing') return entry.total > 0 ? `Preparing · ${formatSize(entry.total)}` : 'Preparing';
-    if (entry.total > 0 && entry.downloaded >= entry.total) return `Complete · ${formatSize(entry.downloaded)}`;
-    const amount = entry.total > 0 ? formatOf(entry.downloaded, entry.total) : formatSize(entry.downloaded);
+    if (entry.downloaded >= entry.total) return `Complete · ${formatSize(entry.downloaded)}`;
+    const amount = formatOf(entry.downloaded, entry.total);
     if (entry.state === 'paused') return `Paused · ${amount}`;
     return `Downloading · ${amount}`;
 };
@@ -538,7 +549,8 @@ const copyNotes = (rows) => {
 const primaryAction = ({ entry, kind, rows, view }) => {
     if (entry.issue !== undefined) return null;
     if (kind === 'pack') {
-        const here = (rows || []).filter((row) => onDisk(row.file));
+        // Play streams while it downloads: any episode in the selection can play.
+        const here = (rows || []).filter((row) => playable(row.file));
         const partial = here.find((row) => row.view !== null && row.view.state === 'partial');
         if (partial) return { label: `Resume ${partial.label}`, fileIdx: partial.file.index, row: partial };
         const next = here.find((row) => row.view === null || row.view.state !== 'watched') ?? here[0];
