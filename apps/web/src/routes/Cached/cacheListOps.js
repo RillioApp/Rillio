@@ -16,9 +16,10 @@ const SORTS = ['date', 'size', 'quality'];
 // Ties (and entries missing the sort key) fall back to name order so the list
 // is stable across polls instead of flickering by server whim.
 //
-// 'date' is "Recent": newest activity first. getRecency(entry) -> epoch ms
-// (the Cache window passes the later of added and last played, see
-// cacheRowModel.recencyOf); without it, the added time.
+// 'date' is "Recent": newest first. getRecency(entry) -> epoch ms (the Cache
+// window passes this copy's own time: when it was added, or when the player
+// marked this torrent watched, see cacheRowModel.recencyOf; never the
+// library's play time); without it, the added time.
 const sortEntries = (entries, sort, getQuality, getRecency) => {
     const recency = typeof getRecency === 'function' ? getRecency : (entry) => entry.addedAt;
     const byName = (a, b) => (a.name || '').localeCompare(b.name || '');

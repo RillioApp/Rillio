@@ -9,7 +9,7 @@
 //   - useTitleVideos: each identified series' episode list, from the addon the
 //     sidecar names (metaTransportUrl), cached for the session. A failure is
 //     "unknown" (null), never an empty list: the rows then say nothing about
-//     viewing rather than "not started".
+//     viewing rather than "Not watched".
 //   - useFileLists: every running torrent's file list (/cache/files), re-read
 //     when the torrent's numbers move, so packs can be told apart from single
 //     episodes and every file can be managed from the row.

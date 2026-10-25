@@ -16,10 +16,13 @@
 //     time offset, which exists for ONE video only (the library's current
 //     one), so only that episode can ever be "in progress". A file that cannot
 //     be tied to an episode of the title, an episode list that could not be
-//     fetched, or a title the library does not know: no state, never "not
-//     started".
-//   - WHEN (recencyOf): played, when the library's last video is this row's
-//     and it was played after the download was added; added otherwise.
+//     fetched, or a title the library does not know: no state, never a claim
+//     ("Not watched" only from a known bitfield).
+//   - WHEN (recencyOf): this copy's own time, when it was added or when the
+//     player marked this torrent watched. The library's time never dates a
+//     copy (it cannot tell copies apart, and it also moves on a notification
+//     dismiss or a mark-watched); it shows only in the details, as "Last
+//     activity" (lastActivityOf).
 //
 // Pure and dependency-free apart from the parsers, so the jest suite can
 // require it directly (tests/cacheRowModel.spec.js).
