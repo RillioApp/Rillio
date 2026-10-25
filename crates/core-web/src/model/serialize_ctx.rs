@@ -34,14 +34,29 @@ mod model {
         /// Compact, id-keyed view of the whole library so the web app can look up
         /// a meta item's membership/watched state at render without loading a
         /// per-item model. `removed == false` means the item is in the library.
-        pub library: HashMap<MetaItemId, LibraryEntry>,
+        pub library: HashMap<MetaItemId, LibraryEntry<'a>>,
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    pub struct LibraryEntry {
+    pub struct LibraryEntry<'a> {
         pub removed: bool,
         pub watched: bool,
+        /// Played without being added to the library (continue watching keeps
+        /// these): `removed` is true, yet the viewing state below is real.
+        pub temp: bool,
+        /// The viewing state, for the Cache window's per-episode view. All of
+        /// it is the core's own `LibraryItemState`, passed through unchanged:
+        /// the last video played, how far into it (milliseconds) and when.
+        pub last_watched: Option<DateTime<Utc>>,
+        pub video_id: Option<&'a String>,
+        pub time_offset: u64,
+        pub duration: u64,
+        /// The watched-videos bitfield in its serialized form
+        /// (`{anchorVideoId}:{anchorLength}:{base64 zlib bits}`). Decoding it
+        /// needs the title's video list, which the ctx does not hold; the web
+        /// side decodes it against the addon's list (common/watchedBitfield).
+        pub watched_field: Option<String>,
     }
 
     #[derive(Serialize)]
@@ -146,6 +161,16 @@ mod model {
                             LibraryEntry {
                                 removed: library_item.removed,
                                 watched: library_item.watched(),
+                                temp: library_item.temp,
+                                last_watched: library_item.state.last_watched,
+                                video_id: library_item.state.video_id.as_ref(),
+                                time_offset: library_item.state.time_offset,
+                                duration: library_item.state.duration,
+                                watched_field: library_item
+                                    .state
+                                    .watched
+                                    .as_ref()
+                                    .map(|field| field.to_string()),
                             },
                         )
                     })
