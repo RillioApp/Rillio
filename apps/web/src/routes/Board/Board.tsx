@@ -20,7 +20,7 @@ import React from 'react';
 import debounce from 'lodash.debounce';
 import useTranslate from 'rillio/common/useTranslate';
 import { useStreamingServer, useNotifications, withCoreSuspender, getVisibleChildrenRange, useProfile } from 'rillio/common';
-import { ContinueWatchingItem, EventModal, MainNavBars, MetaRow } from 'rillio/components';
+import { ContinueWatchingItem, MainNavBars, MetaRow } from 'rillio/components';
 import CatalogRows, { HIDE_POSTER, ROW_CLASS } from 'rillio/components/CatalogRows';
 import useBoard from './useBoard';
 import useContinueWatchingPreview from './useContinueWatchingPreview';
@@ -114,7 +114,6 @@ const Board = () => {
     }, [board.catalogs, onVisibleRangeChange]);
     return (
         <div className="flex h-[calc(100%-var(--safe-area-inset-bottom))] w-full flex-col max-[640px]:relative max-[640px]:z-0">
-            <EventModal />
             {/* The nav scrim stays ON whenever the board is full-bleed (Michael's
                 call): the nav always sits over art here, scrolled or not. */}
             <MainNavBars

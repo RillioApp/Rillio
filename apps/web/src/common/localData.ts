@@ -23,7 +23,9 @@ const base64ToBytes = (b64: string): Uint8Array => {
 };
 
 // Buckets the Rust core reads on boot. `schema_version` is included so an import
-// stays internally consistent with the buckets it shipped with.
+// stays internally consistent with the buckets it shipped with. (Codes exported
+// by older versions also carry `dismissed_events`, the retired Stremio-promo
+// dismissals bucket; the core no longer reads it, so import skips it.)
 const CORE_KEYS = [
     'profile',
     'library',
@@ -33,7 +35,6 @@ const CORE_KEYS = [
     'streaming_server_urls',
     'notifications',
     'calendar',
-    'dismissed_events',
     'schema_version',
 ];
 const NAME_KEY = 'rillio.displayName';
