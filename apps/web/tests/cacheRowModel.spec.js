@@ -499,13 +499,29 @@ describe('the right-hand lines', () => {
     // the video is the one just finished, watched in the bitfield. Its
     // activity is real; only an offset-1 video NOT marked watched is the
     // advance placeholder.
-    test('offset 1 on a watched video (NextVideo, stream change) is still its activity', () => {
+    test('offset 1 on a watched video (NextVideo, stream change) keeps its time, not its episode', () => {
         const library = libraryWith({ videoId: 'tt11280740:2:2', timeOffset: 1, watchedField: WATCHED_E1_E2 });
         const facts = rowFacts({ entry: packEntry, files: packFiles, videos: VIDEOS, library, addonNames: {}, now: NOW });
-        expect(facts.details).toMatch(/Last activity on E02/);
-        // Unknown bitfield: the placeholder rule holds (say nothing).
-        const unknown = rowFacts({ entry: packEntry, files: packFiles, videos: null, library, addonNames: {}, now: NOW });
+        // A rewatch advancing to an already-watched episode looks the same, so
+        // the episode is not named.
+        expect(facts.details).toMatch(/Last activity \d/);
+        expect(facts.details).not.toMatch(/Last activity on/);
+        // Unknown bitfield, with the episode list still known (so the row's
+        // video ids are real): the placeholder rule holds, say nothing.
+        const unknown = rowFacts({
+            entry: packEntry, files: packFiles, videos: VIDEOS,
+            library: { ...library, watchedField: null }, addonNames: {}, now: NOW,
+        });
         expect(unknown.details).not.toMatch(/Last activity/);
+        expect(lastActivityOf({ videoIds: ['tt11280740:2:2'], library, isWatched: () => false })).toBeNull();
+        expect(lastActivityOf({ videoIds: ['tt11280740:2:2'], library, isWatched: () => true })).toEqual({ at: NOW - DAY, label: null });
+    });
+
+    test('a file list without the shared-piece bound counts nothing as kept short of complete', () => {
+        const partial = { index: 0, path: 'a.mkv', length: 1000, downloaded: 600, selected: false, video: true };
+        expect(onDisk(partial)).toBe(false);
+        expect(onDisk({ ...partial, sharedPieceBytes: 100 })).toBe(true);
+        expect(onDisk({ ...partial, downloaded: 1000 })).toBe(true);
     });
 
     test('the core\'s "moved on to the next episode" placeholder is no activity on that episode', () => {

@@ -310,8 +310,12 @@ const rowVideoIds = ({ entry, described, rows, videos }) => {
 // beyond that is its own data, kept when it was deselected part-way
 // (deselecting never deletes bytes). Being selected alone (queued, or
 // streaming) is not on disk; that is `playable`, what Play may start.
+// Accepted miss: kept data no larger than the shared-piece bound (always under
+// two pieces) reads as not on disk; exact would need the server to count
+// whole pieces inside the file. A list without the bound counts nothing as
+// kept short of complete, never everything.
 const isComplete = (file) => file.length > 0 && file.downloaded >= file.length;
-const keptBeyondOverlap = (file) => file.downloaded > (isNumber(file.sharedPieceBytes) ? file.sharedPieceBytes : 0);
+const keptBeyondOverlap = (file) => file.downloaded > (isNumber(file.sharedPieceBytes) ? file.sharedPieceBytes : file.length);
 const onDisk = (file) => isComplete(file) ||
     (file.downloaded > 0 && (file.selected === true || keptBeyondOverlap(file)));
 const playable = (file) => file.selected === true;
@@ -494,7 +498,10 @@ const recencyOf = ({ entry }) => {
  * write offset 1, but WITHOUT moving video_id: that video is the one just
  * finished, marked watched, and its activity is real. So the placeholder rule
  * applies only to a video isWatched does not confirm (unknown counts as not
- * confirmed: say nothing). labels maps a video id to its episode label (packs).
+ * confirmed: say nothing). A confirmed one keeps its time but loses its
+ * episode label: a rewatch of E03 advances to an already-watched E04 with
+ * offset 1 too, so which episode the activity was on is not known.
+ * labels maps a video id to its episode label (packs).
  */
 const lastActivityOf = ({ videoIds, library, labels, isWatched }) => {
     if (library === undefined || library === null || typeof library.videoId !== 'string') return null;
@@ -503,6 +510,7 @@ const lastActivityOf = ({ videoIds, library, labels, isWatched }) => {
     if (placeholder && !(typeof isWatched === 'function' && isWatched(library.videoId))) return null;
     const at = timeOf(library.lastWatched);
     if (at === null) return null;
+    if (placeholder) return { at, label: null };
     return { at, label: labels && labels[library.videoId] ? labels[library.videoId] : null };
 };
 

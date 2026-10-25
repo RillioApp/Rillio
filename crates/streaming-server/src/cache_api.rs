@@ -429,7 +429,9 @@ pub(crate) struct TorrentFile {
     /// correctly in a list.
     pub path: String,
     pub length: u64,
-    /// Bytes held on disk for this file. 0 for a file nobody selected.
+    /// Bytes held on disk for this file. An unselected file can still hold
+    /// some: data kept from before it was deselected, or overlap credit from
+    /// a neighbour's piece (see `shared_piece_bytes`).
     pub downloaded: u64,
     /// Whether this file is part of the download selection.
     pub selected: bool,

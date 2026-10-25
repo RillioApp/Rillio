@@ -67,19 +67,20 @@ const makeFileListLoader = ({ ref, commit, fetchList, nextGeneration, onError })
     const started = beginRequest(ref.current, server, infoHash, mine);
     if (started === null) return Promise.resolve();
     ref.current = started;
-    return fetchList(server, infoHash).then(
-        (list) => {
+    // .catch after .then, not .then(ok, err): a throw while applying the list
+    // must also forget the request so its signature is fetched again.
+    return fetchList(server, infoHash)
+        .then((list) => {
             const next = applyResponse(ref.current, server, infoHash, mine, list);
             if (next === null) return;
             ref.current = next;
             commit(next);
-        },
-        (error) => {
+        })
+        .catch((error) => {
             if (typeof onError === 'function') onError(error, infoHash);
             const next = applyFailure(ref.current, server, infoHash, mine);
             if (next !== null) ref.current = next;
-        },
-    );
+        });
 };
 
 /** Forgets everything about hashes no longer in the list (a re-add refetches). */
