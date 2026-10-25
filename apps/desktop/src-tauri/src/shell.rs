@@ -344,6 +344,15 @@ const MPV_SETPROP_ALLOWLIST: &[&str] = &[
     "audio-delay",
 ];
 
+/// How libplacebo maps HDR onto an SDR target: measure the scene peak for the
+/// roll-off, and use bt.2446a, the curve the mpv manual recommends for
+/// well-mastered content (the default spline reads flat). Applies on SDR
+/// displays only (an HDR display gets the signal passed through). Shared with
+/// the seek-bar thumbnail shadow (thumbs.rs), so a preview is tone mapped
+/// exactly as the picture it previews.
+pub(crate) const TONE_MAPPING_OPTIONS: [(&str, &str); 2] =
+    [("hdr-compute-peak", "yes"), ("tone-mapping", "bt.2446a")];
+
 /// What [`shell_init`] returns to the web client's `useShell`.
 #[derive(Serialize)]
 pub struct ShellInit {
@@ -513,12 +522,10 @@ impl Controller {
             // `gpu` vo washes highlights to grey); keep `gpu` as a fallback for
             // a minimal libmpv build that lacks it.
             ("vo", "gpu-next,gpu"),
-            // Tone-mapping path (SDR displays only): measure scene peak for the
-            // roll-off, and use bt.2446a, the curve the mpv manual recommends
-            // for well-mastered content (the default spline reads flat).
-            ("hdr-compute-peak", "yes"),
-            ("tone-mapping", "bt.2446a"),
-        ] {
+        ]
+        .into_iter()
+        .chain(TONE_MAPPING_OPTIONS)
+        {
             if let Err(e) = mpv.set_option(name, value) {
                 tracing::warn!("mpv: option {name}={value} not applied: {e}");
             }
@@ -805,7 +812,7 @@ fn spawn_event_loop(ctrl: Arc<Controller>, app: AppHandle) {
                         serde_json::json!({ "reason": reason_str, "error": err }),
                     );
                 }
-                MpvEvent::Other => {}
+                MpvEvent::Other | MpvEvent::Empty => {}
             }
             }
         })

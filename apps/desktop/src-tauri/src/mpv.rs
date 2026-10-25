@@ -93,6 +93,10 @@ pub const MPV_ERROR_LOADING_FAILED: c_int = -13;
 /// `MPV_ERROR_GENERIC`.
 pub const MPV_ERROR_GENERIC: i64 = -20;
 
+/// `MPV_END_FILE_REASON_ERROR`: an END_FILE whose file failed (vs EOF, stop,
+/// quit or redirect); `error` then carries the mpv error code.
+pub const MPV_END_FILE_REASON_ERROR: c_int = 4;
+
 /// The client API version that introduced `mpv_stream_cb_add_ro` (mpv 0.24,
 /// client API 1.24). Shipped libmpv-2 builds are 2.x, so this is a floor, not a
 /// realistic gate; it exists so an ancient DLL degrades to the HTTP path instead
@@ -110,6 +114,7 @@ const MPV_FORMAT_NODE_ARRAY: c_int = 7;
 const MPV_FORMAT_NODE_MAP: c_int = 8;
 
 // mpv_event_id values we care about.
+const MPV_EVENT_NONE: c_int = 0;
 const MPV_EVENT_SHUTDOWN: c_int = 1;
 const MPV_EVENT_LOG_MESSAGE: c_int = 2;
 const MPV_EVENT_END_FILE: c_int = 7;
@@ -176,7 +181,10 @@ pub enum MpvEvent {
     LogMessage { prefix: String, level: String, text: String },
     /// mpv is shutting down; the event loop should stop.
     Shutdown,
-    /// Anything we don't translate (timeouts, reconfig, replies, …).
+    /// No event: the queue was empty when the timeout ran out (or a wakeup).
+    /// What tells a caller draining the queue that it is drained.
+    Empty,
+    /// Anything we don't translate (reconfig, replies, …).
     Other,
 }
 
@@ -406,6 +414,7 @@ impl Mpv {
                 return MpvEvent::Other;
             }
             match (*ev).event_id {
+                MPV_EVENT_NONE => MpvEvent::Empty,
                 MPV_EVENT_SHUTDOWN => MpvEvent::Shutdown,
                 MPV_EVENT_LOG_MESSAGE => {
                     let m = (*ev).data as *const MpvEventLogMessage;
