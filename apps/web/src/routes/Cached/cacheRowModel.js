@@ -142,11 +142,17 @@ const describeEntry = ({ entry, files, videos }) => {
         return { ...base, kind: 'movie', title: meta.name, subtitle: year };
     }
 
-    // One episode: the file's own name is what the copy holds; the sidecar's
-    // numbers (the player's record) stand in when the name says nothing.
+    // One episode: the file's own name is what the copy holds. The sidecar's
+    // numbers (the episode the player first played from this torrent) stand
+    // in only when something positively says the torrent IS one episode: its
+    // name, or a file list holding a single video. A name like
+    // "Show.Complete.Series" with no list yet (waiting, failed, loading) is
+    // shown as the title alone, never as the first-played episode.
     const parsed = parseEpisode(entry.name);
-    const season = parsed !== null && isNumber(parsed.season) ? parsed.season : (isNumber(meta.season) ? meta.season : null);
-    const episode = parsed !== null ? parsed.episode : (isNumber(meta.episode) ? meta.episode : null);
+    const singleVideo = Array.isArray(files) && files.filter((file) => file.video).length === 1;
+    const sidecar = parsed !== null || singleVideo;
+    const season = parsed !== null && isNumber(parsed.season) ? parsed.season : (sidecar && isNumber(meta.season) ? meta.season : null);
+    const episode = parsed !== null ? parsed.episode : (sidecar && isNumber(meta.episode) ? meta.episode : null);
     if (!isNumber(episode)) return { ...base, kind: 'title', title: meta.name, subtitle: null };
     const name = videoTitle(videoFor(videos, season, episode));
     const tag = episodeTag(season, episode);

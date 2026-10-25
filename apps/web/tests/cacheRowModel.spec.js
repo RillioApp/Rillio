@@ -151,6 +151,22 @@ describe('describeEntry: what the row is', () => {
         expect(describeEntry({ entry: { ...packEntry, fileIdx: 0 }, files, videos: VIDEOS })).toMatchObject({ kind: 'episode', subtitle: 'S02E03 · Who Is Alive?' });
     });
 
+    // The sidecar records the episode played first; it labels a row only when
+    // the torrent name or its file list positively says ONE episode.
+    test('a pack name without a season tag is never labelled by the sidecar\'s episode', () => {
+        const entry = { ...packEntry, name: 'Severance.Complete.Series.1080p.WEB-DL-GRP', state: 'waiting', downloaded: 0, total: 0, fileCount: 0 };
+        for (const files of [null, []]) {
+            expect(describeEntry({ entry, files, videos: VIDEOS })).toMatchObject({ kind: 'title', title: 'Severance', subtitle: null });
+        }
+    });
+
+    test('a name without SxxEyy but a file list of one video: the sidecar episode stands', () => {
+        const entry = { ...uhdEntry, name: 'Severance - Who Is Alive.mkv' };
+        const files = [{ index: 0, path: 'Severance - Who Is Alive.mkv', length: 9, downloaded: 9, selected: true, video: true }];
+        expect(describeEntry({ entry, files, videos: VIDEOS })).toMatchObject({ kind: 'episode', subtitle: 'S02E03 · Who Is Alive?' });
+        expect(describeEntry({ entry, files: null, videos: VIDEOS })).toMatchObject({ kind: 'title', subtitle: null });
+    });
+
     test('an episode carries its number and title', () => {
         expect(describeEntry({ entry: uhdEntry, files: null, videos: VIDEOS })).toMatchObject({
             kind: 'episode', title: 'Severance', subtitle: 'S02E03 · Who Is Alive?', season: 2, episode: 3,
