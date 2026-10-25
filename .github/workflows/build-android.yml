@@ -58,10 +58,6 @@ jobs:
           # The Android cdylibs are different target triples than the desktop cache.
           key: android
 
-      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
-        with:
-          version: v0.13.1
-
       # Android SDK cmdline-tools, then the exact NDK + platform + build-tools the
       # gen/android project expects. NDK 27.x matches the local toolchain that
       # produced the committed scaffold.
@@ -82,15 +78,22 @@ jobs:
           echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
-      - name: Install cargo-ndk + tauri-cli
+      - name: Install cargo-ndk + tauri-cli + wasm-pack
         uses: cargo-bins/cargo-binstall@main
         # --force: rust-cache (cache-bin: true) restores .crates.toml from the
         # prior run, so a plain binstall SKIPS the install thinking the tools are
         # present, but the actual ~/.cargo/bin binaries are not always restored ->
         # `cargo tauri` then "no such command". Force a real install every run.
+        #
+        # wasm-pack comes through binstall too, pinned to the release.yml
+        # version. jetli/wasm-pack-action unpacks into /tmp and then rename()s
+        # into ~/.cargo/bin, and since 2026-10-25 the Linux runners put /tmp on
+        # its own filesystem: EXDEV (cross-device link not permitted), the job
+        # dies. The Windows jobs keep the action; this is the only Linux use.
       - run: |
-          cargo binstall -y --force cargo-ndk tauri-cli
+          cargo binstall -y --force cargo-ndk tauri-cli wasm-pack@0.13.1
           cargo tauri --version
+          wasm-pack --version
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
