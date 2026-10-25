@@ -804,12 +804,20 @@ impl Shadow {
 /// hidden and never shown, owned by a thread of its own that pumps its
 /// messages (mpv makes its output window a child of this one, and a parent
 /// whose thread never reads its queue stalls the child's thread). Dropping it
-/// ends the thread, which destroys the window; drop the mpv that rendered into
-/// it first.
+/// signals `stop`, which ends the thread, which destroys the window; drop the
+/// mpv that rendered into it first.
+///
+/// The stop signal is an event, not a message: posting to the window can fail
+/// (a full queue among other things), and a shutdown that depends on queue
+/// space would leave a live thread holding the window. The pump waits on the
+/// event and its message queue together (`MsgWaitForMultipleObjects`).
 #[cfg(windows)]
 struct HiddenWindow {
     /// The HWND as mpv's `wid` takes it (an HWND is not `Send`; this is).
     wid: isize,
+    /// The manual-reset event that tells the pump to finish (a HANDLE, held
+    /// as `isize` for the same reason as `wid`).
+    stop: isize,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -824,15 +832,23 @@ const HIDDEN_WINDOW_PX: i32 = 1;
 impl HiddenWindow {
     fn create() -> Result<Self, String> {
         use windows::core::w;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE};
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage, MSG,
-            WM_APP, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            CreateWindowExW, DestroyWindow, DispatchMessageW, MsgWaitForMultipleObjects,
+            PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_POPUP,
         };
 
+        // Manual reset: once set it stays set, so the pump cannot miss it.
+        let stop = unsafe { CreateEventW(None, true, false, None) }
+            .map_err(|e| format!("thumbs: hidden window stop event: {e}"))?;
+        let stop_raw = stop.0 as isize;
         let (sender, receiver) = std::sync::mpsc::channel::<Result<isize, String>>();
-        let thread = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("thumbs-window".into())
             .spawn(move || {
+                let stop = HANDLE(stop_raw as *mut _);
                 // The system STATIC class: no class to register, and its
                 // window procedure is all a never-shown parent needs. No
                 // WS_VISIBLE, and nothing ever shows it.
@@ -864,23 +880,57 @@ impl HiddenWindow {
                     return;
                 }
                 let mut msg = MSG::default();
-                // GetMessageW: >0 a message, 0 WM_QUIT, -1 an error.
-                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-                    if msg.hwnd == hwnd && msg.message == WM_APP {
+                loop {
+                    // Everything queued first: the wait below only wakes for
+                    // input that arrives after the queue was last looked at.
+                    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                        unsafe {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                    let woke = unsafe {
+                        MsgWaitForMultipleObjects(Some(&[stop]), false, INFINITE, QS_ALLINPUT)
+                    };
+                    if woke == WAIT_OBJECT_0 {
+                        // `stop` was set: the shadow is going.
                         break;
                     }
-                    unsafe {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
+                    if woke.0 != WAIT_OBJECT_0.0 + 1 {
+                        // Not the event, not input: the wait itself failed and
+                        // this thread can no longer serve the window. Said
+                        // loudly; the shadow's screenshots fail from here on.
+                        tracing::error!(
+                            "thumbs: hidden window wait failed ({:#x}): {}",
+                            woke.0,
+                            windows::core::Error::from_win32()
+                        );
+                        break;
                     }
                 }
                 let _ = unsafe { DestroyWindow(hwnd) };
-            })
-            .map_err(|e| format!("thumbs: hidden window thread: {e}"))?;
-        let wid = receiver
-            .recv()
-            .map_err(|_| "thumbs: the hidden window thread died".to_string())??;
-        Ok(Self { wid, thread: Some(thread) })
+            });
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(e) => {
+                let _ = unsafe { CloseHandle(stop) };
+                return Err(format!("thumbs: hidden window thread: {e}"));
+            }
+        };
+        match receiver.recv() {
+            Ok(Ok(wid)) => Ok(Self { wid, stop: stop_raw, thread: Some(thread) }),
+            // The thread has already ended (no window): nothing to stop.
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                let _ = unsafe { CloseHandle(stop) };
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                let _ = unsafe { CloseHandle(stop) };
+                Err("thumbs: the hidden window thread died".to_string())
+            }
+        }
     }
 
     fn wid(&self) -> isize {
@@ -891,22 +941,27 @@ impl HiddenWindow {
 #[cfg(windows)]
 impl Drop for HiddenWindow {
     fn drop(&mut self) {
-        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Threading::SetEvent;
 
-        // WM_APP on our own window is the thread's cue to destroy it and end.
-        let posted = unsafe {
-            PostMessageW(Some(HWND(self.wid as *mut _)), WM_APP, WPARAM(0), LPARAM(0))
-        };
-        match posted {
+        let stop = HANDLE(self.stop as *mut _);
+        // SetEvent needs no queue space; it fails only on a handle that is
+        // not a live event, and this one is owned here and closed only below.
+        // Should it fail anyway, joining would wait forever on a thread that
+        // was never told to stop: say so and leave the thread (and the
+        // handle it still waits on) rather than hang the caller.
+        match unsafe { SetEvent(stop) } {
             Ok(()) => {
                 if let Some(thread) = self.thread.take() {
                     let _ = thread.join();
                 }
+                let _ = unsafe { CloseHandle(stop) };
             }
-            // The window is already gone; never block on a thread that may
-            // not be listening.
-            Err(e) => tracing::warn!("thumbs: hidden window {:#x}: {e}", self.wid),
+            Err(e) => tracing::error!(
+                "thumbs: hidden window {:#x} could not be told to stop, its thread is left \
+                 running: {e}",
+                self.wid
+            ),
         }
     }
 }
@@ -1246,6 +1301,28 @@ mod tests {
             ThumbRequest::Pending { start_worker: true }
         );
         assert!(!inner.disabled);
+    }
+
+    /// The hidden window lives until dropped, the drop returns (its thread
+    /// ended, not detached) and the window is gone after it, with messages
+    /// still being posted to it right up to the drop. The stop never goes
+    /// through the message queue, so a queue's state cannot keep it alive.
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_window_stops_on_drop() {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, IsWindowVisible, PostMessageW, WM_NULL};
+
+        const POSTS: usize = 1000;
+        let window = HiddenWindow::create().expect("hidden window");
+        let hwnd = HWND(window.wid() as *mut _);
+        assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool(), "never shown");
+        for _ in 0..POSTS {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+        }
+        drop(window);
+        assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool(), "destroyed with its thread");
     }
 
     /// The shipped cap, and the bound it is derived for.

@@ -126,6 +126,10 @@ windows = { version = "0.61", features = [
     # Version-resource APIs (GetFileVersionInfoW/VerQueryValueW) for the
     # stale-image self-heal: read what the exe ON DISK would run.
     "Win32_Storage_FileSystem",
+    # The thumbnail shadow's hidden window stops on an event (CreateEventW
+    # takes SECURITY_ATTRIBUTES, hence Win32_Security), never a posted message.
+    "Win32_Security",
+    "Win32_System_Threading",
 ] }
 # WebView2 COM interfaces (same 0.38.x wry already pins, so the types unify
 # with what PlatformWebview::controller() returns). Used solely to set the
