@@ -231,7 +231,24 @@ describe('episodeRows: per-episode viewing state of a pack', () => {
             library: libraryWith({ videoId: 'kitsu:46474:12', timeOffset: 0, watchedField: null }),
         });
         expect(rows[0]).toMatchObject({ title: 'A Real Hero', videoId: 'kitsu:46474:12' });
-        expect(rows[0].view.state).toBe('unwatched');
+        // No bitfield: tied, but its viewing state is unknown.
+        expect(rows[0].view).toBeNull();
+    });
+
+    // Absent or partial data says nothing.
+    test('a library entry without a bitfield (null or old shape) never reads as "not started"', () => {
+        for (const library of [
+            libraryWith({ watchedField: null, videoId: 'x', timeOffset: 0 }),
+            { removed: false, watched: true },
+        ]) {
+            const rows = episodeRows({ episodes, videos: VIDEOS, library });
+            expect(rows.map((row) => row.view)).toEqual([null, null, null, null, null]);
+        }
+    });
+
+    test('a bitfield without playback fields: watched marks hold, nothing is "in progress"', () => {
+        const rows = episodeRows({ episodes, videos: VIDEOS, library: { removed: false, watched: true, videoId: 'tt11280740:2:3', watchedField: WATCHED_E1_E2 } });
+        expect(rows.map((row) => row.view && row.view.state)).toEqual(['watched', 'watched', 'unwatched', 'unwatched', 'unwatched']);
     });
 });
 
@@ -267,6 +284,16 @@ describe('itemView: one episode or a movie', () => {
             library: { removed: false, watched: true, temp: false, lastWatched: null, videoId: 'tt15239678', timeOffset: 0, duration: 0, watchedField: null },
         });
         expect(view.state).toBe('watched');
+    });
+
+    test('a movie entry without playback fields says nothing rather than "not started"', () => {
+        const described = describeEntry({ entry: duneEntry, files: null, videos: null });
+        expect(itemView({ entry: duneEntry, described, videos: null, library: { removed: false, watched: false } })).toBeNull();
+        expect(itemView({ entry: duneEntry, described, videos: null, library: { removed: false, watched: true } })).toEqual({ state: 'watched' });
+        expect(itemView({
+            entry: duneEntry, described, videos: null,
+            library: { removed: false, watched: false, timeOffset: 0, duration: 0, videoId: 'tt15239678', watchedField: null, lastWatched: null, temp: false },
+        })).toEqual({ state: 'unwatched' });
     });
 
     test('an unidentified torrent only knows the player\'s watched mark', () => {

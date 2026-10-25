@@ -53,13 +53,18 @@ const bitAt = (bits, index) => {
 
 /**
  * Watched flags for `videoIds` (already in the core's order), or null when
- * they cannot be known: a malformed field, an empty list, or an anchor video
- * that is not in the list. A missing field (null/undefined) means nothing was
- * ever marked watched, which IS knowledge: all false.
+ * they cannot be known: a missing field, a malformed one, an empty list, or an
+ * anchor video that is not in the list.
+ *
+ * A missing field is unknown, not "nothing watched". core-web sends
+ * `watchedField: null` when the core holds no bitfield, and a library entry
+ * from before the field existed has none at all; neither proves that no
+ * episode was watched (the old entry may even say `watched: true`), and a
+ * false "Not started" is worse than saying nothing.
  */
 const decodeWatched = (serialized, videoIds) => {
     if (!Array.isArray(videoIds) || videoIds.length === 0) return null;
-    if (serialized === null || serialized === undefined) return videoIds.map(() => false);
+    if (serialized === null || serialized === undefined) return null;
     const field = parseWatchedField(serialized);
     if (field === null) return null;
     const anchorIndex = videoIds.indexOf(field.anchorVideo);

@@ -165,7 +165,8 @@ const videoState = (videoId, library, watchedFlags, orderedIds) => {
     const index = watchedFlags !== null ? orderedIds.indexOf(videoId) : -1;
     const watched = index >= 0 ? watchedFlags[index] : null;
     if (watched === true) return { state: 'watched' };
-    if (library.videoId === videoId && library.timeOffset >= MIN_OFFSET_MS && library.duration > 0) {
+    if (library.videoId === videoId && isNumber(library.timeOffset) && isNumber(library.duration) &&
+        library.timeOffset >= MIN_OFFSET_MS && library.duration > 0) {
         return { state: 'partial', offset: library.timeOffset, duration: library.duration };
     }
     if (watched === false) return { state: 'unwatched' };
@@ -242,7 +243,10 @@ const itemView = ({ entry, described, videos, library }) => {
     }
     if (described.kind === 'movie') {
         if (library === undefined || library === null) return cacheWatched(entry);
-        if (library.watched) return { state: 'watched' };
+        if (library.watched === true) return { state: 'watched' };
+        // "Not started" needs the playback fields to say so: an entry from
+        // before they were sent (or a partial one) says nothing.
+        if (!isNumber(library.timeOffset) || !isNumber(library.duration) || library.watched !== false) return cacheWatched(entry);
         if (library.timeOffset >= MIN_OFFSET_MS && library.duration > 0) {
             return { state: 'partial', offset: library.timeOffset, duration: library.duration };
         }

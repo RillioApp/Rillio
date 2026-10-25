@@ -20,8 +20,11 @@ describe('decodeWatched', () => {
         });
     });
 
-    test('no watched field means nothing was marked watched', () => {
-        expect(decodeWatched(null, ['a', 'b'])).toEqual([false, false]);
+    // core-web sends null when the core holds no bitfield, and an entry from
+    // before the field existed has none: neither proves nothing was watched.
+    test('a missing watched field is unknown, never all-unwatched', () => {
+        expect(decodeWatched(null, ['a', 'b'])).toBeNull();
+        expect(decodeWatched(undefined, ['a', 'b'])).toBeNull();
     });
 
     test('a malformed field is unknown, not "nothing watched"', () => {
