@@ -6,7 +6,7 @@
 
 const {
     splitFiles, describeEntry, episodeRows, itemView, packStrip, packSummary,
-    diskText, viewText, copyNotes, relativeTime, exactTime, clockTime, recencyOf, primaryAction, rowFacts, etaText, lastActivityOf,
+    diskText, viewText, copyNotes, relativeTime, exactTime, clockTime, recencyOf, primaryAction, rowFacts, etaText, lastActivityOf, onDisk,
 } = require('../src/routes/Cached/cacheRowModel');
 
 const NOW = Date.parse('2026-10-25T14:00:00');
@@ -374,6 +374,20 @@ describe('the right-hand lines', () => {
         expect(diskText({ ...packEntry, state: 'waiting', downloaded: 0, total: 0, issue: { kind: 'metadata-missing', reason: '' } }, null)).toBeNull();
         expect(diskText({ ...packEntry, state: 'initializing' }, episodes)).toBe('Preparing · 42 MB');
         expect(diskText({ ...uhdEntry, state: 'live', downloaded: 0, total: 0 }, null)).toBeNull();
+    });
+
+    // librqbit credits a finished piece to every file it overlaps, so an
+    // unselected neighbour of a downloading episode shows some bytes.
+    test('a partial file counts as on disk only when selected; a complete one always', () => {
+        const files = packFiles.map((file) => (file.index === 3 ? { ...file, downloaded: 200 * 1024 } : file));
+        const episodes = splitFiles(files).episodes;
+        const rows = episodeRows({ episodes, videos: null, library: undefined });
+        expect(packStrip(rows).map((bar) => bar.state)).toEqual(['disk', 'disk', 'disk', 'missing', 'missing']);
+        expect(diskText(packEntry, episodes)).toBe('3 of 5 on disk · 33 MB');
+        expect(onDisk({ length: 10, downloaded: 10, selected: false })).toBe(true);
+        expect(onDisk({ length: 10, downloaded: 4, selected: false })).toBe(false);
+        expect(onDisk({ length: 10, downloaded: 4, selected: true })).toBe(true);
+        expect(onDisk({ length: 10, downloaded: 0, selected: true })).toBe(false);
     });
 
     test('a selected episode with no bytes yet is not on disk', () => {

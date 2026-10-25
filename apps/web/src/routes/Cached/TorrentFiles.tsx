@@ -58,13 +58,15 @@ export const useFileToggle = (
 /** "Complete", "6 of 15 MB", "Not downloaded" for one file. */
 export const fileState = (file: TorrentFile): string => {
     if (file.length > 0 && file.downloaded >= file.length) return 'Complete';
-    if (!file.selected) return file.downloaded > 0 ? `Not downloading · ${formatSize(file.downloaded)} kept` : 'Not downloaded';
+    // Bytes on an unselected, incomplete file are a piece boundary's overlap
+    // credit, not a download (see cacheRowModel.onDisk).
+    if (!file.selected) return 'Not downloaded';
     return file.downloaded > 0 ? formatOf(file.downloaded, file.length) : 'Waiting';
 };
 
 /** A thin progress line for a file part-way on disk, or null. */
 export const FileProgress = ({ file, className }: { file: TorrentFile, className?: string }) => {
-    if (!(file.downloaded > 0) || file.length <= 0 || file.downloaded >= file.length) return null;
+    if (!file.selected || !(file.downloaded > 0) || file.length <= 0 || file.downloaded >= file.length) return null;
     return (
         <div className={cn('h-0.5 w-16 shrink-0 overflow-hidden rounded-full bg-surface-hover', className)}>
             <div className="h-full rounded-full bg-fg-subtle" style={{ width: `${Math.round((file.downloaded / file.length) * 100)}%` }} />

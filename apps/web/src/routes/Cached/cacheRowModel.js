@@ -289,9 +289,13 @@ const rowVideoIds = ({ entry, described, rows, videos }) => {
 // The pack strip
 // ---------------------------------------------------------------------------
 
-// On disk means bytes on disk. Being selected (queued for download, or
-// streaming) is not; that is `playable`, what Play may start.
-const onDisk = (file) => file.downloaded > 0;
+// On disk: a complete file, or a partial one that is SELECTED. librqbit
+// credits a finished piece to every file it overlaps, so an unselected file
+// next to a downloading one shows a few bytes it was never asked for; those
+// are not a download. Being selected alone (queued, or streaming) is not on
+// disk either; that is `playable`, what Play may start.
+const isComplete = (file) => file.length > 0 && file.downloaded >= file.length;
+const onDisk = (file) => isComplete(file) || (file.selected === true && file.downloaded > 0);
 const playable = (file) => file.selected === true;
 
 /**
