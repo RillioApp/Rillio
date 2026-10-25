@@ -1496,9 +1496,9 @@ mod tests {
 
     /// The drop returns even while something keeps refilling the window's
     /// queue through it: the pump checks `stop` per message, not only once the
-    /// queue is empty (Codex pass 2). The producer posts until the window is
-    /// gone (a full queue only makes a post fail, so failures are ignored),
-    /// so it cannot outlive the drop.
+    /// queue is empty (Codex pass 2). The producers post until told to stop
+    /// (a full queue only makes a post fail, so failures are ignored) and are
+    /// joined before anything is asserted, so the test cannot hang on them.
     #[cfg(windows)]
     #[test]
     fn the_hidden_window_stops_while_its_queue_is_being_refilled() {
@@ -1510,11 +1510,16 @@ mod tests {
         const PRODUCERS: usize = 4;
         let window = HiddenWindow::create().expect("hidden window");
         let wid = window.wid();
+        // The producers end on this flag, never on the window's state: a
+        // destroyed HWND can be reused by another window, which they must not
+        // keep posting to.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let producers: Vec<_> = (0..PRODUCERS)
             .map(|_| {
+                let stop = stop.clone();
                 std::thread::spawn(move || {
                     let hwnd = HWND(wid as *mut _);
-                    while unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
                     }
                 })
@@ -1527,11 +1532,16 @@ mod tests {
             drop(window);
             let _ = done.send(());
         });
-        assert!(dropped.recv_timeout(DROP_BUDGET).is_ok(), "the drop hung behind a refilled queue");
-        assert!(!unsafe { IsWindow(Some(HWND(wid as *mut _))) }.as_bool());
+        let returned = dropped.recv_timeout(DROP_BUDGET).is_ok();
+        // Destroyed right after the drop returned, before any reuse of the
+        // handle could make this check lie.
+        let destroyed = returned && !unsafe { IsWindow(Some(HWND(wid as *mut _))) }.as_bool();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for producer in producers {
             producer.join().expect("producer");
         }
+        assert!(returned, "the drop hung behind a refilled queue");
+        assert!(destroyed, "destroyed with its thread");
     }
 
     /// The shipped cap, and the bound it is derived for.
