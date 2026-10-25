@@ -108,6 +108,14 @@ pub fn confine(root: &Path, path: &Path) -> Result<PathBuf, LocationError> {
 /// the nearest existing DIRECTORY above it (never above `root`). Confined
 /// either way. A file standing where a folder is expected (a hostile
 /// `payload.exe/missing.mkv` layout) is skipped, never returned as a Folder.
+///
+/// TENSION (accepted, review pass 2 of feat/cache-cards-clarity): the shell
+/// only ever SELECTS a location, so a Folder is shown selected inside ITS
+/// parent: revealing a missing file under `Pack/` opens the cache root with
+/// `Pack` selected, and a missing torrent folder opens the root's parent with
+/// the cache root selected, one level above what a person might expect.
+/// Display only, nothing runs; opening the folder itself would go through
+/// the shell's handler for it, which is the thing selecting avoids.
 pub fn locate_path(root: &Path, target: &Path) -> Result<Location, LocationError> {
     if target.exists() {
         return confine(root, target).map(Location::Item);
