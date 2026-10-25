@@ -1408,6 +1408,11 @@ impl Engine {
         self.unrestored.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
+    /// The cache root every download lives under (absolute).
+    pub fn cache_root(&self) -> &Path {
+        self.cache_root.as_path()
+    }
+
     pub(crate) fn is_cache_root(&self, folder: &Path) -> bool {
         storage::absolutize(folder).is_ok_and(|folder| same_path(&folder, &self.cache_root))
     }
@@ -1778,6 +1783,16 @@ impl Engine {
             .lock()
             .map(|w| w.contains_key(info_hash))
             .unwrap_or(false)
+    }
+
+    /// When the player marked this torrent watched, unix epoch MILLISECONDS
+    /// (stored in seconds: the sweeper's grace clock), or None if it is not.
+    pub fn watched_at(&self, info_hash: &str) -> Option<u64> {
+        self.watched
+            .lock()
+            .ok()
+            .and_then(|w| w.get(info_hash).copied())
+            .map(|secs| secs.saturating_mul(1000))
     }
 
     /// Mark or unmark a torrent watched; persists immediately. Marking stamps

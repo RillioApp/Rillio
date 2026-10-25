@@ -51,6 +51,11 @@ pub(crate) struct CacheEntry {
     /// Whether the player marked this stream watched (streaming mode): an
     /// un-pinned watched entry is scheduled for automatic cleanup.
     pub watched: bool,
+    /// When the player marked it watched, unix epoch milliseconds; absent when
+    /// it is not marked. The Cache window's "Watched 2 days ago" for a torrent
+    /// no library title tells the time of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watched_at: Option<u64>,
     /// The addon metadata this torrent was matched to (title, artwork ids,
     /// the meta/video ids for a deep link), or absent when it has not been
     /// identified yet. Opaque to the server; see engine::CacheMeta.
@@ -287,6 +292,7 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
                 }),
                 pinned: engine.is_pinned(&info_hash),
                 watched: engine.is_watched(&info_hash),
+                watched_at: engine.watched_at(&info_hash),
                 meta: engine.meta(&info_hash),
                 added_at: engine.added_at_stamped(&info_hash, handle),
                 info_hash,
@@ -325,6 +331,7 @@ pub(crate) async fn list(State(engine): State<Engine>) -> Json<Vec<CacheEntry>> 
             cannot_remove: Some(Engine::SET_ASIDE_REMOVAL_REFUSAL.to_owned()),
             pinned: engine.is_pinned(&info_hash),
             watched: engine.is_watched(&info_hash),
+            watched_at: engine.watched_at(&info_hash),
             meta: engine.meta(&info_hash),
             file_count: 0,
             file_idx: None,

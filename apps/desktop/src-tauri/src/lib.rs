@@ -571,6 +571,7 @@ pub fn run() {
             streaming_server_url,
             streaming_server_problem,
             server_request,
+            reveal_cache_item,
             shell::shell_init,
             shell::shell_send,
             shell::shell_mpv_stats,
@@ -2049,6 +2050,84 @@ async fn server_request(
         .ok_or_else(|| "server_request: the streaming server has not bound yet".to_string())?;
     let router = server.router.clone();
     dispatch_on_engine_runtime(&server.runtime, router, method, path, body).await
+}
+
+/// "View location" in the Cache window: show a cached download (or one file of
+/// it, `file_idx`) in the file manager, selected.
+///
+/// SECURITY. The web names a download by infohash and file index, never by
+/// path: the path is resolved from the ENGINE's own data (the torrent's output
+/// folder and file list) and confined to the cache root by
+/// `Engine::locate`, which refuses `..`, absolute names and links that lead
+/// out of the cache. A file not on disk yet reveals the folder it would be in.
+/// Explorer gets the path as its own argument, never through a shell string.
+/// Desktop only: there is no file manager to show on Android.
+#[tauri::command]
+async fn reveal_cache_item(
+    state: tauri::State<'_, ServerHandle>,
+    info_hash: String,
+    file_idx: Option<usize>,
+) -> Result<(), String> {
+    #[cfg(not(desktop))]
+    {
+        let _ = (state, info_hash, file_idx);
+        return Err("Showing a download's folder is not available on this device.".to_owned());
+    }
+    #[cfg(desktop)]
+    {
+        let server = state
+            .get()
+            .ok_or_else(|| "The download service has not started yet.".to_owned())?;
+        let engine = server.engine.clone();
+        let hash = info_hash.clone();
+        let located = server
+            .runtime
+            .spawn_blocking(move || engine.locate(&hash, file_idx))
+            .await
+            .map_err(|e| format!("reveal_cache_item: the lookup task failed: {e}"))?;
+        let location = located.map_err(|e| {
+            tracing::warn!("reveal_cache_item {info_hash} {file_idx:?}: {e:?}");
+            e.to_string()
+        })?;
+        reveal_in_file_manager(&location).map_err(|e| {
+            tracing::error!("reveal_cache_item {info_hash} {file_idx:?}: {e}");
+            "Rillio could not open the folder.".to_owned()
+        })
+    }
+}
+
+#[cfg(desktop)]
+fn reveal_in_file_manager(location: &rillio_streaming_server::location::Location) -> std::io::Result<()> {
+    use rillio_streaming_server::location::{display_path, Location};
+    let (path, select) = match location {
+        Location::Item(path) => (display_path(path), true),
+        Location::Folder(path) => (display_path(path), false),
+    };
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("explorer.exe");
+        if select {
+            // "/select," then the path as a separate argument: Explorer
+            // accepts the space, and the path is never parsed by a shell.
+            command.arg("/select,");
+        }
+        // Explorer's exit code is 1 even when it worked; spawning is the check.
+        command.arg(&path).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        if select {
+            command.arg("-R");
+        }
+        command.arg(&path).spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select" on Linux file managers: open the folder.
+        let folder = if select { path.parent().map(std::path::Path::to_path_buf).unwrap_or(path) } else { path };
+        std::process::Command::new("xdg-open").arg(folder).spawn().map(|_| ())
+    }
 }
 
 /// The runtime the streaming engine lives on, and nothing else does.
