@@ -724,7 +724,7 @@ const Player = () => {
                 seriesInfo: player.seriesInfo,
             }, {
                 chromecastTransport: services.chromecast.active ? services.chromecast.transport : null,
-                shellTransport: platform.shell.active ? platform.shell : null,
+                shellTransport: platform.shell.active ? platform.shell.transport : null,
             });
         }
     }, [streamingServer.baseUrl, player.selected, player.stream, streamSubtitles, forceTranscoding, casting]);

@@ -20,6 +20,35 @@ enum ShellEventType {
     INVOKE_METHOD = 6,
 }
 
+// The Tauri API the bridge sends through, kept by whichever useShell rendered
+// last (they all see the same global). Module state so that the transport
+// below can be ONE object for the app's lifetime.
+let tauriApi: any = null;
+
+const on = (name: string, listener: (arg: any) => void) => events.on(name, listener);
+const off = (name: string, listener: (arg: any) => void) => events.off(name, listener);
+const send = (method: string, ...args: (string | number | object)[]) => {
+    if (tauriApi) {
+        tauriApi.core.invoke('shell_send', { method, args })
+            .catch((e: unknown) => console.error('Shell', 'shell_send failed', method, e));
+        return;
+    }
+
+    try {
+        IPC?.postMessage(JSON.stringify({
+            id: 0,
+            type: ShellEventType.INVOKE_METHOD,
+            args: [method, ...args],
+        }));
+    } catch (e) {
+        console.error('Shell', 'Failed to send event', e);
+    }
+};
+
+// Stable identity: the shell player owns ONE subscription per transport
+// (packages/video ShellChannel), so every render must hand it the same object.
+const transport: ShellTransport = { on, off, send };
+
 type ShellEvent = {
     id: number;
     type: ShellEventType;
@@ -47,6 +76,7 @@ const useShell = (): Shell => {
     // isShell(); the global can attach a tick after first render.
     const TAURI = useTauriApi();
     const USE_TAURI = !!TAURI;
+    tauriApi = TAURI || null;
     const [state, setState] = useState<ShellState>({
         initialized: false,
         version: null,
@@ -57,9 +87,6 @@ const useShell = (): Shell => {
         gpuVideoProcessing: false,
     });
 
-    const on = (name: string, listener: (arg: any) => void) => events.on(name, listener);
-    const off = (name: string, listener: (arg: any) => void) => events.off(name, listener);
-
     // Snapshot of mpv's live media properties (codec/HDR/bitrate/hwdec/audio…)
     // for the player's Stats panel. Native shell only; null elsewhere.
     const getMpvStats = async (): Promise<Record<string, any> | null> => {
@@ -69,24 +96,6 @@ const useShell = (): Shell => {
         } catch (e) {
             console.error('Shell', 'shell_mpv_stats failed', e);
             return null;
-        }
-    };
-
-    const send = (method: string, ...args: (string | number | object)[]) => {
-        if (USE_TAURI) {
-            TAURI.core.invoke('shell_send', { method, args })
-                .catch((e: unknown) => console.error('Shell', 'shell_send failed', method, e));
-            return;
-        }
-
-        try {
-            IPC?.postMessage(JSON.stringify({
-                id: 0,
-                type: ShellEventType.INVOKE_METHOD,
-                args: [method, ...args],
-            }));
-        } catch (e) {
-            console.error('Shell', 'Failed to send event', e);
         }
     };
 
@@ -184,6 +193,7 @@ const useShell = (): Shell => {
         send,
         on,
         off,
+        transport,
         getMpvStats,
         state,
         capabilities,

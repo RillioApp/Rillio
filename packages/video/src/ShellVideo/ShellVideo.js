@@ -2,6 +2,7 @@ var EventEmitter = require('eventemitter3');
 var cloneDeep = require('lodash.clonedeep');
 var deepFreeze = require('deep-freeze');
 var ERROR = require('../error');
+var ShellChannel = require('./ShellChannel');
 
 // Maps the profile's subtitlesSize percentage to mpv's sub-scale. Stremio shipped
 // 0.0066 (100% -> 0.66, far too small); 0.01 makes the default 100% land exactly on
@@ -10,13 +11,7 @@ var ERROR = require('../error');
 var SUBS_SCALE_FACTOR = 0.01;
 var EOF_END_TOLERANCE = 60000;
 
-// How long to wait for the shell's answer to the `rillio://` capability query
-// before assuming "no". A shell that predates the query never answers at all,
-// and an unanswered promise here would park `loadfile` forever (the exact way
-// the mpv-version handshake once broke playback), so this ALWAYS settles.
-var STREAM_CB_QUERY_TIMEOUT = 3000;
-
-// The url that makes the shell player read this torrent's bytes in-process,
+// The url that names this torrent's file on the shell's in-process byte plane,
 // or null when this stream has no such form.
 //
 // Only a stream carrying an (infoHash, fileIdx) resolved against OUR streaming
@@ -86,6 +81,10 @@ function ShellVideo(options) {
     options = options || {};
 
     var ipc = options.shellTransport;
+    // This visit's link to the app-lifetime owner of the shell IPC. Nothing
+    // here subscribes to the transport: mpv's events reach this instance only
+    // while it is the attached player (see ShellChannel).
+    var channel = ShellChannel.of(ipc);
     var observedProps = {};
     var props = {};
     // `buffering` is the OR of two independent mpv signals; track them
@@ -100,65 +99,26 @@ function ShellVideo(options) {
             stremioProps[stremioToMPVProps[key]] = key;
         }
     });
-    var resolveMPVVersion;
-    var waitForMPVVersion = new Promise(function (resolve) {
-        resolveMPVVersion = resolve;
-    });
-    // Whether this shell can serve `rillio://` (libmpv with stream_cb + the
-    // streaming engine in-process). Asked once per instance, alongside the
-    // property observers below; the answer arrives as a `rillio-stream-cb`
-    // signal. Falls back to false on any shell that does not answer.
-    var resolveStreamCb;
-    var waitForStreamCb = new Promise(function (resolve) {
-        resolveStreamCb = resolve;
-    });
-    setTimeout(function () {
-        resolveStreamCb(false);
-    }, STREAM_CB_QUERY_TIMEOUT);
+    // Which load is current. Every load and unload moves it on, so a load
+    // whose handshake answers after it was superseded (another load, an
+    // unload, destroy) is dropped instead of reaching mpv late.
+    var loadSeq = 0;
+    // The loadfile in flight, as the shell will name it on its END_FILE:
+    // { id, fallback }. `fallback` is the same argv with the stream's http url,
+    // armed only when this loadfile went out as rillio:// (the byte plane
+    // refuses a torrent its engine does not have yet, at once), so that
+    // refusal retries ONCE over the server route. It belongs to THIS loadfile:
+    // an END_FILE carrying another load's id (older, or from a visit before)
+    // can neither spend it nor be retried with it, and is not this load's
+    // error or end at all.
+    var currentLoad = null;
     command('unload');
 
     ipc.send('mpv-command', ['stop']);
-    ipc.send('mpv-observe-prop', 'path');
-
-    ipc.send('mpv-observe-prop', 'time-pos');
-    ipc.send('mpv-observe-prop', 'volume');
-    ipc.send('mpv-observe-prop', 'pause');
-    ipc.send('mpv-observe-prop', 'seeking');
-    ipc.send('mpv-observe-prop', 'eof-reached');
-
-    ipc.send('mpv-observe-prop', 'duration');
-    ipc.send('mpv-observe-prop', 'metadata');
-    ipc.send('mpv-observe-prop', 'video-params'); // video width/height
-    ipc.send('mpv-observe-prop', 'track-list');
-    ipc.send('mpv-observe-prop', 'chapter-list');
-
-    ipc.send('mpv-observe-prop', 'paused-for-cache');
-    ipc.send('mpv-observe-prop', 'cache-buffering-state');
-    ipc.send('mpv-observe-prop', 'demuxer-cache-time');
-
-    ipc.send('mpv-observe-prop', 'aid');
-    ipc.send('mpv-observe-prop', 'vid');
-    ipc.send('mpv-observe-prop', 'sid');
-    ipc.send('mpv-observe-prop', 'sub-scale');
-    ipc.send('mpv-observe-prop', 'sub-pos');
-    ipc.send('mpv-observe-prop', 'sub-delay');
-    ipc.send('mpv-observe-prop', 'audio-delay');
-    ipc.send('mpv-observe-prop', 'speed');
-
-    ipc.send('mpv-observe-prop', 'mpv-version');
-    ipc.send('mpv-observe-prop', 'ffmpeg-version');
-
-    ipc.send('rillio-stream-cb-query');
 
     var events = new EventEmitter();
     var destroyed = false;
     var stream = null;
-    // Armed while the current loadfile went out as rillio://: the same argv
-    // with the stream's http url instead, so a byte-plane refusal (end-file
-    // with error; the shell answers fast for a torrent its engine does not
-    // know) retries ONCE over the server route instead of surfacing a dead
-    // player. Cleared on use, so a failing http load errors out normally.
-    var bytePlaneFallback = null;
 
     var avgDuration = 0;
     var minClipDuration = 30;
@@ -184,15 +144,10 @@ function ShellVideo(options) {
         return args.data && args.data !== 'no' ? 'EMBEDDED_' + args.data.toString() : null;
     }
 
-    ipc.on('rillio-stream-cb', function(args) {
-        resolveStreamCb(!!(args && args.available));
-    });
-
     var last_time = 0;
-    ipc.on('mpv-prop-change', function(args) {
+    function onPropChange(args) {
         switch (args.name) {
             case 'mpv-version':
-                resolveMPVVersion(args.data);
                 props[args.name] = logProp(args);
                 break;
             case 'ffmpeg-version': {
@@ -351,16 +306,37 @@ function ShellVideo(options) {
             }
             onPropChanged(stremioProps[args.name]);
         }
-    });
-    ipc.on('mpv-event-ended', function(args) {
+    }
+    // Send a loadfile as a new load: the shell maps the mpv playlist entry it
+    // creates to `id` and puts that id on the entry's END_FILE.
+    function startLoad(loadfileArgs, fallback) {
+        currentLoad = { id: channel.nextLoadId(), fallback: fallback };
+        ipc.send('mpv-command', loadfileArgs, { loadId: currentLoad.id });
+    }
+    function onEndFile(args) {
+        // Another load's end: an older loadfile (superseded by a reload or an
+        // unload before mpv got to end it) or a previous visit's. Not this
+        // load's error, nor its end, and never a reason to spend its retry.
+        // This used to be decided by nothing: one fallback slot, any END_FILE
+        // (measured 2026-10-28: an unload between a rillio:// loadfile and its
+        // immediate refusal emptied the slot, and that superseded END_FILE
+        // showed the error screen over a stream that was fine).
+        if (currentLoad === null || args.loadId !== currentLoad.id) {
+            return;
+        }
+        // A playlist url ended by expanding into its entries: the shell carries
+        // this load's id over to them, so the load is still the one playing.
+        if (args.reason === 'redirect') {
+            return;
+        }
+        var load = currentLoad;
+        currentLoad = null;
         // older shells report 'other' for every non-error reason, including eof
         if (args.error) {
-            if (bytePlaneFallback !== null) {
-                var fallbackArgs = bytePlaneFallback;
-                bytePlaneFallback = null;
+            if (load.fallback !== null) {
                 // eslint-disable-next-line no-console
                 console.warn('ShellVideo: rillio:// load failed (' + String(args.error) + '), retrying over http');
-                ipc.send('mpv-command', fallbackArgs);
+                startLoad(load.fallback, null);
                 ipc.send('mpv-set-prop', ['pause', false]);
                 return;
             }
@@ -376,7 +352,7 @@ function ShellVideo(options) {
         } else if (!args.reason || args.reason === 'eof' || args.reason === 'other') {
             if (!isKnownEarlyEof()) onEnded();
         }
-    });
+    }
 
     function getProp(propName) {
         if (propName === 'hdrInfo') return props.hdrInfo || null;
@@ -541,17 +517,22 @@ function ShellVideo(options) {
         switch (commandName) {
             case 'load': {
                 command('unload');
+                var thisLoad = loadSeq;
                 if (commandArgs && commandArgs.stream && typeof commandArgs.stream.url === 'string') {
-                    Promise.all([waitForMPVVersion, waitForStreamCb]).then(function (handshake) {
+                    channel.handshake.then(function (handshake) {
+                        if (destroyed || thisLoad !== loadSeq) {
+                            return;
+                        }
                         var mpvVersion = handshake[0];
                         var streamCbAvailable = handshake[1];
                         stream = commandArgs.stream;
                         onPropChanged('stream');
 
-                        // What mpv opens. `stream.url` (the http form) stays the
-                        // stream's public identity - the thumbnail shadow, the
-                        // subtitle routes and the cast gate all read it - and only
-                        // the loadfile target moves to the in-process byte plane.
+                        // What mpv is asked to open. `stream.url` (the http form)
+                        // stays the stream's public identity - the thumbnail
+                        // shadow, the subtitle routes and the cast gate all read
+                        // it - and only the loadfile target moves to the
+                        // in-process byte plane.
                         var loadURL = stream.url;
                         if (streamCbAvailable) {
                             var bytePlane = bytePlaneUrl(stream);
@@ -595,11 +576,10 @@ function ShellVideo(options) {
                         } else {
                             loadfileArgs = ['loadfile', loadURL];
                         }
-                        bytePlaneFallback = loadURL !== stream.url ?
+                        startLoad(loadfileArgs, loadURL !== stream.url ?
                             loadfileArgs.map(function(arg) { return arg === loadURL ? stream.url : arg; })
                             :
-                            null;
-                        ipc.send('mpv-command', loadfileArgs);
+                            null);
                         ipc.send('mpv-set-prop', ['sid', 'no']);
                         ipc.send('mpv-set-prop', ['pause', false]);
                         ipc.send('mpv-set-prop', ['speed', props.speed]);
@@ -630,6 +610,8 @@ function ShellVideo(options) {
                 break;
             }
             case 'unload': {
+                loadSeq++;
+                currentLoad = null;
                 props = {
                     loaded: false,
                     pause: false,
@@ -645,7 +627,6 @@ function ShellVideo(options) {
                 };
                 stall = { 'seeking': false, 'paused-for-cache': false };
                 avgDuration = 0;
-                bytePlaneFallback = null;
                 ipc.send('mpv-command', ['stop']);
                 onPropChanged('loaded');
                 onPropChanged('stream');
@@ -664,11 +645,15 @@ function ShellVideo(options) {
             case 'destroy': {
                 command('unload');
                 destroyed = true;
+                channel.detach(attachment);
                 events.removeAllListeners();
                 break;
             }
         }
     }
+
+    var attachment = { onPropChange: onPropChange, onEndFile: onEndFile };
+    channel.attach(attachment);
 
     this.on = function (eventName, listener) {
         if (destroyed) {

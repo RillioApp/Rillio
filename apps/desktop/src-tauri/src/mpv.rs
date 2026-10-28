@@ -21,6 +21,11 @@ type MpvTerminateDestroy = unsafe extern "C" fn(*mut c_void);
 type MpvSetOptionString = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type MpvSetPropertyString = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type MpvCommand = unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int;
+// mpv_command_ret(handle, args, result) - mpv_command that also hands back the
+// command's result node (for `loadfile`: a map with `playlist_entry_id`).
+// The node is freed with mpv_free_node_contents.
+type MpvCommandRet = unsafe extern "C" fn(*mut c_void, *const *const c_char, *mut MpvNode) -> c_int;
+type MpvFreeNodeContents = unsafe extern "C" fn(*mut MpvNode);
 type MpvErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
 // mpv_observe_property(handle, reply_userdata, name, format) - subscribe to a
 // property; changes (and one initial value) arrive as PROPERTY_CHANGE events.
@@ -146,11 +151,18 @@ struct MpvEventProperty {
     data: *mut c_void,
 }
 
-/// `mpv_event_end_file` - payload of an END_FILE event.
+/// `mpv_event_end_file` - payload of an END_FILE event. The playlist fields
+/// arrived with client API 1.108 (mpv 0.33); every libmpv-2 build has them.
 #[repr(C)]
 struct MpvEventEndFile {
     reason: c_int,
     error: c_int,
+    /// The playlist entry that ended: what its `loadfile` returned.
+    playlist_entry_id: i64,
+    /// reason == redirect: the first entry the ended one expanded into...
+    playlist_insert_id: i64,
+    /// ...and how many consecutive ids from there.
+    playlist_insert_num_entries: c_int,
 }
 
 /// `mpv_event_log_message` - payload of a LOG_MESSAGE event.
@@ -175,8 +187,11 @@ struct MpvEventRaw {
 pub enum MpvEvent {
     /// An observed property changed (or reported its initial value).
     PropertyChange { name: String, value: serde_json::Value },
-    /// Playback of the current file ended. `reason`/`error` are mpv's raw codes.
-    EndFile { reason: c_int, error: c_int },
+    /// Playback of a playlist entry ended. `reason`/`error` are mpv's raw codes;
+    /// `entry` is the entry's id (what its `loadfile` returned, see
+    /// [`Mpv::command_entry`]); a redirect lists the `inserted` entries
+    /// (first id, count) the ended one expanded into.
+    EndFile { reason: c_int, error: c_int, entry: i64, inserted: (i64, c_int) },
     /// A line from mpv's own log (diagnostics): `prefix`, `level`, `text`.
     LogMessage { prefix: String, level: String, text: String },
     /// mpv is shutting down; the event loop should stop.
@@ -196,6 +211,8 @@ struct Api {
     set_option_string: MpvSetOptionString,
     set_property_string: MpvSetPropertyString,
     command: MpvCommand,
+    command_ret: MpvCommandRet,
+    free_node_contents: MpvFreeNodeContents,
     error_string: MpvErrorString,
     observe_property: MpvObserveProperty,
     wait_event: MpvWaitEvent,
@@ -271,6 +288,8 @@ impl Mpv {
                 set_option_string: sym!("mpv_set_option_string", MpvSetOptionString),
                 set_property_string: sym!("mpv_set_property_string", MpvSetPropertyString),
                 command: sym!("mpv_command", MpvCommand),
+                command_ret: sym!("mpv_command_ret", MpvCommandRet),
+                free_node_contents: sym!("mpv_free_node_contents", MpvFreeNodeContents),
                 error_string: sym!("mpv_error_string", MpvErrorString),
                 observe_property: sym!("mpv_observe_property", MpvObserveProperty),
                 wait_event: sym!("mpv_wait_event", MpvWaitEvent),
@@ -373,6 +392,24 @@ impl Mpv {
         self.check(unsafe { (self.api.command)(self.ctx, ptrs.as_ptr()) })
     }
 
+    /// Run a command that creates a playlist entry (`loadfile`) and return the
+    /// entry's id, the one its END_FILE will carry. Fails loud if mpv hands
+    /// back no id: without it an END_FILE cannot be told apart from another
+    /// load's, and the caller must not guess.
+    pub fn command_entry(&self, args: &[&str]) -> Result<i64, String> {
+        let cstrings: Vec<CString> = args.iter().map(|a| cstr(a)).collect::<Result<_, _>>()?;
+        let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+        ptrs.push(std::ptr::null());
+        let mut result = MpvNode { u: 0, format: 0 };
+        self.check(unsafe { (self.api.command_ret)(self.ctx, ptrs.as_ptr(), &mut result) })?;
+        let value = unsafe { node_to_json(&result) };
+        unsafe { (self.api.free_node_contents)(&mut result) };
+        value
+            .get("playlist_entry_id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| format!("mpv {:?} returned no playlist_entry_id (got {value})", args.first()))
+    }
+
     /// Read a property as a string (mpv stringifies any type). `None` when the
     /// property is unavailable (e.g. `time-pos` before anything is loaded).
     /// The C string is owned by mpv and freed with `mpv_free` after copying.
@@ -430,9 +467,14 @@ impl Mpv {
                 MPV_EVENT_END_FILE => {
                     let ef = (*ev).data as *const MpvEventEndFile;
                     if ef.is_null() {
-                        MpvEvent::EndFile { reason: 0, error: 0 }
+                        MpvEvent::EndFile { reason: 0, error: 0, entry: 0, inserted: (0, 0) }
                     } else {
-                        MpvEvent::EndFile { reason: (*ef).reason, error: (*ef).error }
+                        MpvEvent::EndFile {
+                            reason: (*ef).reason,
+                            error: (*ef).error,
+                            entry: (*ef).playlist_entry_id,
+                            inserted: ((*ef).playlist_insert_id, (*ef).playlist_insert_num_entries),
+                        }
                     }
                 }
                 MPV_EVENT_PROPERTY_CHANGE => {
@@ -669,6 +711,55 @@ mod tests {
         mpv.initialize().expect("mpv_initialize");
         // A benign runtime property set proves the live handle works.
         mpv.set_property("volume", "100").expect("set volume");
+    }
+
+    /// What lets the shell tell one load's END_FILE from another's: the id
+    /// `loadfile` returns is the id on that entry's END_FILE, also for two
+    /// loadfiles back to back (the second replacing the first while it is
+    /// still opening). The failure is the byte plane's own: a `rillio://`
+    /// open refused at once, as for a torrent the engine does not have.
+    #[test]
+    fn an_end_file_carries_the_entry_id_its_loadfile_returned() {
+        let Some(dll) = dev_dll() else {
+            eprintln!("[skip] no libmpv-2.dll found");
+            return;
+        };
+        let mpv = Mpv::load(&dll).expect("load libmpv");
+        crate::stream_cb::register(&mpv, |_ih: &str, _idx: u32| {
+            Err::<Box<dyn crate::stream_cb::ByteSource>, String>("absent".into())
+        })
+        .expect("register rillio://");
+        mpv.set_option("vo", "null").unwrap();
+        mpv.set_option("ao", "null").unwrap();
+        mpv.set_option("idle", "yes").unwrap();
+        mpv.initialize().expect("mpv_initialize");
+        let url = |idx: u32| format!("rillio://{}/{idx}", "0123456789abcdef0123456789abcdef01234567");
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let first = mpv.command_entry(&["loadfile", &url(0), "replace"]).unwrap();
+            let second = mpv.command_entry(&["loadfile", &url(1), "replace"]).unwrap();
+            assert_ne!(first, second);
+            ids.push((first, second));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut ends = Vec::new();
+        while std::time::Instant::now() < deadline {
+            if let MpvEvent::EndFile { reason, entry, .. } = mpv.wait_event(0.2) {
+                ends.push((entry, reason));
+            }
+        }
+        eprintln!("[entries] loadfile ids {ids:?}; END_FILEs (entry, reason) {ends:?}");
+        let all: Vec<i64> = ids.iter().flat_map(|&(a, b)| [a, b]).collect();
+        // Every END_FILE names an entry a loadfile returned, and every one of
+        // the replacing loadfiles' entries ends with an error of its own.
+        assert!(ends.iter().all(|(entry, _)| all.contains(entry)), "an END_FILE named an unknown entry");
+        for (_, second) in &ids {
+            assert!(
+                ends.iter().any(|&(entry, reason)| entry == *second && reason == MPV_END_FILE_REASON_ERROR),
+                "entry {second} has no error END_FILE of its own"
+            );
+        }
     }
 
     /// The stream_cb symbol is OPTIONAL: an absent one must degrade to "no

@@ -822,7 +822,7 @@ impl Shadow {
                     }
                     said.push(format!("[{prefix}] {text}"));
                 }
-                mpv::MpvEvent::EndFile { reason, error } if reason == mpv::MPV_END_FILE_REASON_ERROR => {
+                mpv::MpvEvent::EndFile { reason, error, .. } if reason == mpv::MPV_END_FILE_REASON_ERROR => {
                     return Err(load_end(
                         error,
                         &self.mpv.error_string(error),

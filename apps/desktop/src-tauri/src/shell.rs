@@ -79,9 +79,9 @@ pub enum NativePlayer {
 
 impl NativePlayer {
     /// An outbound `mpv-command` argv (already allowlist-checked by the caller).
-    fn command(&self, refs: &[&str]) -> Result<(), String> {
+    fn command(&self, refs: &[&str], load_id: Option<u64>) -> Result<(), String> {
         match self {
-            NativePlayer::Mpv(ctrl) => ctrl.run_command(refs),
+            NativePlayer::Mpv(ctrl) => ctrl.run_command(refs, load_id),
         }
     }
     fn set_property(&self, name: &str, value: &str) -> Result<(), String> {
@@ -150,7 +150,55 @@ pub struct Controller {
     /// Held across one whole compute-and-write of the blur options, so that
     /// concurrent applies cannot land out of order (see [`apply_blur`]).
     blur_apply: Mutex<()>,
+    /// Which web load each live mpv playlist entry belongs to (see [`LoadIds`]).
+    /// Held across the `loadfile` that creates an entry, so the event loop can
+    /// never see that entry's END_FILE before its load is recorded.
+    loads: Mutex<LoadIds>,
 }
+
+/// The web player's load ids by mpv playlist entry. ShellVideo sends each
+/// `loadfile` with a `loadId` of its own; mpv returns the id of the playlist
+/// entry that loadfile created, and puts that same entry id on the entry's
+/// END_FILE. Mapping one to the other here is what lets the web tell THIS
+/// load's end from an older load's: mpv processes commands in order but an
+/// END_FILE reaches the web after an IPC round trip, by which time another
+/// loadfile (a reload, an unload, the next visit) may have gone out, and
+/// only the id says which loadfile an END_FILE is about.
+#[derive(Default)]
+struct LoadIds {
+    by_entry: std::collections::BTreeMap<i64, u64>,
+}
+
+impl LoadIds {
+    /// An entry nothing ever ends (mpv drops an entry replaced before it
+    /// started without an END_FILE) must not live forever; the oldest goes
+    /// first, and a web player only ever has its latest one or two in flight.
+    const CAP: usize = 32;
+
+    fn record(&mut self, entry: i64, load: u64) {
+        self.by_entry.insert(entry, load);
+        while self.by_entry.len() > Self::CAP {
+            self.by_entry.pop_first();
+        }
+    }
+
+    /// The load an END_FILE of `entry` belongs to, if a web load created it.
+    /// A redirect (a playlist url expanding into its entries) hands the load
+    /// on to the `inserted` entries, which are what will play and end.
+    fn end(&mut self, entry: i64, reason: std::ffi::c_int, inserted: (i64, std::ffi::c_int)) -> Option<u64> {
+        let load = self.by_entry.remove(&entry)?;
+        if reason == MPV_END_FILE_REASON_REDIRECT {
+            let (first, count) = inserted;
+            for id in first..first + i64::from(count.max(0)) {
+                self.record(id, load);
+            }
+        }
+        Some(load)
+    }
+}
+
+/// `MPV_END_FILE_REASON_REDIRECT` (mpv/client.h).
+const MPV_END_FILE_REASON_REDIRECT: std::ffi::c_int = 5;
 
 /// The most recent [`player_snapshot`] result and when it was produced.
 #[derive(Default)]
@@ -630,6 +678,7 @@ impl Controller {
             snapshot: Mutex::new(SnapshotCache::default()),
             blur: Mutex::new(BlurState::default()),
             blur_apply: Mutex::new(()),
+            loads: Mutex::new(LoadIds::default()),
         })
     }
 
@@ -670,8 +719,9 @@ impl Controller {
     /// Run an already-allowlist-checked `mpv-command` argv, applying the two
     /// mpv-specific normalizations the web client's argv needs. Kept here (in the
     /// mpv backend) rather than in `shell_send` so the bridge dispatch stays
-    /// backend-agnostic.
-    fn run_command(&self, refs: &[&str]) -> Result<(), String> {
+    /// backend-agnostic. `load_id` is the web player's id for a `loadfile`
+    /// (see [`LoadIds`]).
+    fn run_command(&self, refs: &[&str], load_id: Option<u64>) -> Result<(), String> {
         // Drop cached stats when playback stops so the panel doesn't show a
         // previous title's codec/bitrate.
         // GEOMETRY_PROPS stay: they describe the mpv WINDOW, which outlives the
@@ -702,8 +752,15 @@ impl Controller {
             // Reset to "none" for fresh plays so a prior resume point doesn't leak
             // into the next title.
             let _ = self.mpv.set_property("start", start.unwrap_or("none"));
-            tracing::debug!("mpv loadfile url={url} start={start:?}");
-            return self.mpv.command(&["loadfile", url, "replace"]);
+            // The lock spans the loadfile: the entry's END_FILE (a byte-plane
+            // refusal comes within milliseconds) waits for it to be recorded.
+            let mut loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = self.mpv.command_entry(&["loadfile", url, "replace"])?;
+            tracing::debug!("mpv loadfile url={url} start={start:?} entry={entry} load={load_id:?}");
+            if let Some(load_id) = load_id {
+                loads.record(entry, load_id);
+            }
+            return Ok(());
         }
         self.mpv.command(refs)
     }
@@ -790,8 +847,11 @@ fn spawn_event_loop(ctrl: Arc<Controller>, app: AppHandle) {
                         );
                     }
                 }
-                MpvEvent::EndFile { reason, error } => {
-                    tracing::debug!("mpv end-file: reason={reason} error={error}");
+                MpvEvent::EndFile { reason, error, entry, inserted } => {
+                    // The web load this entry was created for (null for one
+                    // no web loadfile made): ShellVideo acts only on its own.
+                    let load_id = ctrl.loads.lock().unwrap_or_else(|e| e.into_inner()).end(entry, reason, inserted);
+                    tracing::debug!("mpv end-file: reason={reason} error={error} entry={entry} load={load_id:?}");
                     // mpv_end_file_reason: 0 eof, 2 stop, 3 quit, 4 error, 5 redirect.
                     let reason_str = match reason {
                         0 => "eof",
@@ -809,7 +869,7 @@ fn spawn_event_loop(ctrl: Arc<Controller>, app: AppHandle) {
                     emit(
                         &app,
                         "mpv-event-ended",
-                        serde_json::json!({ "reason": reason_str, "error": err }),
+                        serde_json::json!({ "reason": reason_str, "error": err, "loadId": load_id }),
                     );
                 }
                 MpvEvent::Other | MpvEvent::Empty => {}
@@ -1491,9 +1551,14 @@ pub fn shell_send(
             // player is even loaded, so hostile input is rejected (and logged
             // loudly) even if mpv is unavailable, and never reaches mpv.command().
             check_mpv_command(&refs)?;
+            // The web player's id for this load, echoed on its END_FILE.
+            let load_id = match args.get(1).and_then(|meta| meta.get("loadId")) {
+                None => None,
+                Some(id) => Some(id.as_u64().ok_or_else(|| format!("mpv-command: loadId {id} is not a load id"))?),
+            };
             let player = state.ensure(&app)?;
             tracing::debug!("mpv command {refs:?}");
-            player.command(&refs)
+            player.command(&refs, load_id)
         }
         "mpv-set-prop" => {
             let list = arg0.as_array().ok_or("mpv-set-prop: expected [name, value]")?;
@@ -1746,6 +1811,44 @@ fn validate_stream_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An END_FILE names the web load whose loadfile created its entry, once;
+    /// an entry no web load made names none.
+    #[test]
+    fn an_end_file_names_the_load_that_created_its_entry() {
+        let mut loads = LoadIds::default();
+        loads.record(7, 1);
+        loads.record(8, 2);
+        // Back to back: the first entry's end arrives after the second loadfile.
+        assert_eq!(loads.end(7, 2, (0, 0)), Some(1));
+        assert_eq!(loads.end(8, 4, (0, 0)), Some(2));
+        assert_eq!(loads.end(8, 4, (0, 0)), None, "an entry ends once");
+        assert_eq!(loads.end(99, 4, (0, 0)), None, "not a web load's entry");
+    }
+
+    /// A playlist url ends in a redirect; the entries it expanded into carry
+    /// the load on, so their END_FILE is still that load's.
+    #[test]
+    fn a_redirect_hands_the_load_to_the_entries_it_expanded_into() {
+        let mut loads = LoadIds::default();
+        loads.record(3, 9);
+        assert_eq!(loads.end(3, MPV_END_FILE_REASON_REDIRECT, (4, 2)), Some(9));
+        assert_eq!(loads.end(5, 4, (0, 0)), Some(9));
+        assert_eq!(loads.end(4, 2, (0, 0)), Some(9));
+    }
+
+    /// mpv drops an entry replaced before it started without an END_FILE; such
+    /// entries must not pile up for the app's lifetime.
+    #[test]
+    fn entries_that_never_end_do_not_pile_up() {
+        let mut loads = LoadIds::default();
+        for entry in 0..1000 {
+            loads.record(entry, entry as u64);
+        }
+        assert_eq!(loads.by_entry.len(), LoadIds::CAP);
+        assert_eq!(loads.end(999, 4, (0, 0)), Some(999), "the newest are kept");
+        assert_eq!(loads.end(0, 4, (0, 0)), None);
+    }
 
     /// Every command ShellVideo actually sends over the bridge must pass.
     #[test]
