@@ -260,15 +260,30 @@ struct Inner {
     scan: Option<Scan>,
     scan_requested: bool,
     worker_running: bool,
-    /// After a failed shadow spawn (no dll / broken stream), stop retrying for
-    /// this url; every later request would fail the same way.
-    disabled: bool,
+    /// Why this stream gets no previews at all ([`Inner::refuse`]): its frames
+    /// cannot be converted, or no shadow can exist here. Every later request
+    /// would end the same way, so none is made until the stream changes.
+    refused: Option<String>,
+    /// The last shadow this stream lost ([`Inner::lose_shadow`]): the stream
+    /// could not be read then, which is no verdict on its frames.
+    lost: Option<LostShadow>,
     /// What the stream's last checked frame needed ([`Inner::note_conversion`]):
     /// a frame that needs something else invalidates the cached previews.
     conversion: Option<Conversion>,
 }
 
+/// A shadow that was lost, kept to pace the next one ([`Inner::may_respawn`]).
+#[derive(Debug, Clone)]
+struct LostShadow {
+    at: Instant,
+    /// How long it lived before its load ended in error.
+    lived: Duration,
+    reason: String,
+}
+
 struct Shadow {
+    /// When it was spawned (a lost shadow's lifetime paces the next one).
+    born: Instant,
     mpv: Mpv,
     /// The width the `vf=scale` chain currently outputs.
     width: u32,
@@ -511,6 +526,45 @@ fn step_for(frame: Result<Option<Conversion>, String>, render: Render) -> Step {
     }
 }
 
+/// How a shadow's seek ended ([`Shadow::seek_settled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    Settled,
+    /// The budget ran out: a region not downloaded yet, or a dead shadow.
+    TimedOut,
+    /// Abandoned for a hover request.
+    Yielded,
+}
+
+/// How a shadow's load ended in error ([`Shadow::check_load`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadEnd {
+    /// mpv could not read the stream: unreachable, or not being served yet
+    /// (a torrent still being added). A new shadow may well succeed later.
+    Lost(String),
+    /// mpv read the stream and still could not show it: no video to play, or
+    /// a renderer that cannot start. A new shadow would end the same way.
+    Never(String),
+}
+
+/// THE decision on a load mpv ended in error, from mpv's error code. Only
+/// `MPV_ERROR_LOADING_FAILED` says the bytes could not be had; every other
+/// code is mpv judging what it did read (measured: a gpu-next that cannot
+/// start ends a load as "no audio or video data played", not as loading
+/// failed).
+fn load_end(error: std::ffi::c_int, error_text: &str, render: Render, mpv_said: &str) -> LoadEnd {
+    let what = match render {
+        Render::Software => "the shadow could not show the stream",
+        Render::Libplacebo => "gpu-next could not show the stream",
+    };
+    let reason = format!("thumbs: {what} ({error_text}); mpv said: {mpv_said}");
+    if error == mpv::MPV_ERROR_LOADING_FAILED {
+        LoadEnd::Lost(reason)
+    } else {
+        LoadEnd::Never(reason)
+    }
+}
+
 /// Whether a stream's frames now need something other than they did when
 /// last captured (`last`, `None` before the first capture).
 fn conversion_changed(last: Option<&Conversion>, now: &Conversion) -> bool {
@@ -532,6 +586,18 @@ enum Captured<T> {
     /// No correct thumbnail can be made of this stream, and why. The caller
     /// stops previews for it and logs the reason once.
     Refused(String),
+    /// The shadow is gone (mpv could not read the stream NOW: unreachable,
+    /// not served yet), and why. Nothing is wrong with the stream's frames:
+    /// the caller drops the shadow and a later request opens a new one.
+    /// `lived` is how long that shadow lasted (it paces the next one).
+    Lost { reason: String, lived: Duration },
+    /// A hover request arrived while this (sweep) seek was waiting: nothing
+    /// captured, the shadow unchanged, the same target is sampled again later.
+    Yielded(Shadow),
+    /// The seek did not settle in its budget: the shadow is parked on bytes
+    /// the swarm has not delivered, and was dropped (see [`checked_capture`]).
+    /// Nothing captured; the next job opens a new shadow.
+    Parked,
 }
 
 /// THE one path to a capture, hover thumbnail or sweep sample alike: seek to
@@ -539,20 +605,38 @@ enum Captured<T> {
 /// `capture` only when this shadow renders that conversion. Decided per frame,
 /// not once per stream: a stream can change colour along the way (an SDR
 /// segment spliced before an HDR or Dolby Vision one), and a name that must
-/// be refused can appear anywhere.
+/// be refused can appear anywhere. `yield_now` is asked while the seek waits:
+/// true abandons it (a sweep sample giving way to a hover).
 fn checked_capture<T>(
     shadow: Shadow,
     url: &str,
     target: f64,
+    yield_now: &dyn Fn() -> bool,
     capture: impl FnOnce(&Shadow) -> T,
 ) -> Captured<T> {
-    if !shadow.seek_settled(target) {
-        // mpv's own verdict still counts: a libplacebo load that mpv ended in
-        // error never settles a seek, and must not time out in silence.
-        return match shadow.check_load() {
-            Err(reason) => Captured::Refused(reason),
-            Ok(()) => Captured::Skipped(shadow),
-        };
+    let settled = shadow.seek_settled(target, yield_now);
+    // mpv's own verdict on the load comes first, settled or not: a load mpv
+    // ended in error never settles a seek, and must not time out in silence.
+    match shadow.check_load() {
+        Ok(()) => {}
+        Err(LoadEnd::Lost(reason)) => return Captured::Lost { reason, lived: shadow.born.elapsed() },
+        Err(LoadEnd::Never(reason)) => return Captured::Refused(reason),
+    }
+    match settled {
+        Settle::Settled => {}
+        Settle::TimedOut => {
+            // A seek that did not settle left the shadow's stream thread
+            // blocked in a read of bytes not downloaded yet, and mpv does not
+            // abandon that read for a later seek: every following job, even
+            // into a region long downloaded, waited behind it (measured
+            // 2026-10-28: one position failed 7 times in a row right after a
+            // hover far ahead). Dropping the shadow cancels the read; the next
+            // job starts clean. Done here, outside the worker's lock, because
+            // tearing an mpv down waits for that cancel.
+            drop(shadow);
+            return Captured::Parked;
+        }
+        Settle::Yielded => return Captured::Yielded(shadow),
     }
     match step_for(shadow.frame_conversion(), shadow.render) {
         Step::Capture(conversion) => {
@@ -644,11 +728,6 @@ impl Shadow {
                         tracing::warn!("thumbs: option {name}={value} not applied: {e}");
                     }
                 }
-                // mpv's own error lines, so a refusal can say why gpu-next
-                // failed ([`Shadow::check_load`]). Diagnostics only.
-                if let Err(e) = mpv.request_log_messages("error") {
-                    tracing::debug!("thumbs: mpv error log unavailable: {e}");
-                }
             }
         }
         for (name, value) in [
@@ -679,9 +758,15 @@ impl Shadow {
         // screenshot is a full-resolution frame (megabytes per hover).
         mpv.set_option("vf", &scale_filter(width))
             .map_err(|e| format!("thumbs: scaling to {width}px failed: {e}"))?;
+        // mpv's own error lines, so a lost or refused shadow can say why
+        // ([`Shadow::check_load`]). Diagnostics only.
+        if let Err(e) = mpv.request_log_messages("error") {
+            tracing::debug!("thumbs: mpv error log unavailable: {e}");
+        }
         mpv.initialize()?;
         mpv.command(&["loadfile", url])?;
         Ok(Self {
+            born: Instant::now(),
             mpv,
             width,
             render,
@@ -696,10 +781,10 @@ impl Shadow {
     /// `Ok(None)` while there is no decoded frame yet, or (libplacebo) while
     /// the VO is still configuring: slow, not broken (seen with the player
     /// decoding 4K and the subtitle model loading at once), so the job is
-    /// skipped and the next one asks again. `Err` when mpv ended the load in
-    /// error ([`Shadow::check_load`]) or the frame cannot be converted.
+    /// skipped and the next one asks again. `Err` when the frame cannot be
+    /// converted. (How the LOAD ended is [`Shadow::check_load`]'s to say, and
+    /// [`checked_capture`] asks it first.)
     fn frame_conversion(&self) -> Result<Option<Conversion>, String> {
-        self.check_load()?;
         let profile = self.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
         let Some(params) = (match self.mpv.get_property_string("video-params") {
             Some(json) => VideoParams::parse(&json, profile.as_deref())?,
@@ -720,13 +805,13 @@ impl Shadow {
         }
     }
 
-    /// Drain the shadow's events (nothing else reads them). For a libplacebo
-    /// shadow, a load mpv ended in error is final, and the `Err` carries mpv's
-    /// reason and its own error lines: the same stream just opened fine in
-    /// software, so what failed is the renderer (gpu-next could not start).
-    /// A software shadow keeps today's rule, a dead stream simply never shows
-    /// a frame and every job times out.
-    fn check_load(&self) -> Result<(), String> {
+    /// Drain the shadow's events (nothing else reads them) and say how its
+    /// load ended, if it did: `Ok` while it is alive. A load mpv ended in error
+    /// is final for THIS shadow either way (an idle mpv never settles a seek,
+    /// so without this every job would time out in silence, for the rest of
+    /// the video: measured 2026-10-28 on a shadow whose stream could not be
+    /// reached); [`load_end`] decides whether a new shadow may do better.
+    fn check_load(&self) -> Result<(), LoadEnd> {
         loop {
             match self.mpv.wait_event(0.0) {
                 mpv::MpvEvent::Empty => return Ok(()),
@@ -737,14 +822,12 @@ impl Shadow {
                     }
                     said.push(format!("[{prefix}] {text}"));
                 }
-                mpv::MpvEvent::EndFile { reason, error }
-                    if reason == mpv::MPV_END_FILE_REASON_ERROR
-                        && self.render == Render::Libplacebo =>
-                {
-                    return Err(format!(
-                        "thumbs: gpu-next could not show the stream ({}); mpv said: {}",
-                        self.mpv.error_string(error),
-                        self.mpv_errors.borrow().join("; ")
+                mpv::MpvEvent::EndFile { reason, error } if reason == mpv::MPV_END_FILE_REASON_ERROR => {
+                    return Err(load_end(
+                        error,
+                        &self.mpv.error_string(error),
+                        self.render,
+                        &self.mpv_errors.borrow().join("; "),
                     ));
                 }
                 _ => {}
@@ -767,23 +850,27 @@ impl Shadow {
         Ok(())
     }
 
-    /// Keyframe-seek to `target` and wait for the seek to settle. `false` on
-    /// timeout (undownloaded torrent region / dead stream) - do not capture.
-    /// mpv refuses a seek until the file is open, which is every first job on
-    /// a fresh shadow (and every first job after a renderer change): the seek
-    /// is asked again within the same budget instead of failing at once.
-    fn seek_settled(&self, target: f64) -> bool {
+    /// Keyframe-seek to `target` and wait for the seek to settle. `TimedOut`
+    /// (undownloaded torrent region / dead stream) and `Yielded` (`yield_now`
+    /// said a hover is waiting) mean do not capture. mpv refuses a seek until
+    /// the file is open, which is every first job on a fresh shadow (and every
+    /// first job after a renderer change): the seek is asked again within the
+    /// same budget instead of failing at once.
+    fn seek_settled(&self, target: f64, yield_now: &dyn Fn() -> bool) -> Settle {
         let deadline = Instant::now() + Duration::from_millis(SEEK_SETTLE_MS);
         while self.mpv.command(&["seek", &format!("{target:.3}"), "absolute+keyframes"]).is_err() {
             // No retry starts after the budget: the sleep is capped to what
             // is left, and the deadline is checked again before the next ask.
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return false;
+                return Settle::TimedOut;
             }
             std::thread::sleep(SETTLE_POLL.min(left));
+            if yield_now() {
+                return Settle::Yielded;
+            }
             if Instant::now() >= deadline {
-                return false;
+                return Settle::TimedOut;
             }
         }
         while Instant::now() < deadline {
@@ -793,14 +880,17 @@ impl Shadow {
                     // A settled seek with no frame decoded yet reports no
                     // time-pos; require one so the screenshot has a frame.
                     if self.mpv.get_property_string("time-pos").is_some() {
-                        return true;
+                        return Settle::Settled;
                     }
                 }
                 // "yes" = still seeking; None = property gone (file replaced).
                 Some(_) | None => {}
             }
+            if yield_now() {
+                return Settle::Yielded;
+            }
         }
-        false
+        Settle::TimedOut
     }
 
     /// Screenshot the current (already thumbnail-scaled) frame to a fresh temp
@@ -1362,25 +1452,87 @@ mod tests {
     #[test]
     fn a_refused_stream_gets_no_previews() {
         let url = "http://127.0.0.1:11470/dv-profile-5".to_owned();
+        let now = Instant::now();
         let mut inner = Inner::default();
         assert_eq!(
-            inner.request_thumb(url.clone(), 7, 448),
+            inner.request_thumb(url.clone(), 7, 448, now),
             ThumbRequest::Pending { start_worker: true }
         );
         // The worker refuses (e.g. libplacebo could not start), then exits.
-        inner.refuse("thumbs: Dolby Vision profile 5 needs libplacebo, which could not start");
+        let reason = "thumbs: Dolby Vision profile 5 needs libplacebo, which could not start";
+        inner.refuse(reason);
         inner.worker_running = false;
-        assert!(inner.disabled && inner.wanted.is_none() && inner.shadow.is_none());
+        assert!(inner.refused.is_some() && inner.wanted.is_none() && inner.shadow.is_none());
         for bucket in [7, 8, 9] {
-            assert_eq!(inner.request_thumb(url.clone(), bucket, 448), ThumbRequest::Refused);
+            let answer = inner.request_thumb(url.clone(), bucket, 448, now);
+            assert_eq!(answer, ThumbRequest::Refused(reason.to_owned()));
+            // ...and the web is told so, with the reason, to stop asking.
+            assert_eq!(ThumbAnswer::from(answer), ThumbAnswer::Never { reason: reason.to_owned() });
         }
         assert!(inner.wanted.is_none() && !inner.worker_running);
         // Another stream is judged on its own.
         assert_eq!(
-            inner.request_thumb("http://127.0.0.1:11470/sdr".to_owned(), 7, 448),
+            inner.request_thumb("http://127.0.0.1:11470/sdr".to_owned(), 7, 448, now),
             ThumbRequest::Pending { start_worker: true }
         );
-        assert!(!inner.disabled);
+        assert!(inner.refused.is_none());
+    }
+
+    /// A shadow that could not READ the stream (measured 2026-10-28: opened
+    /// while the torrent was not being served, its load ended in "loading
+    /// failed" and every later job timed out for the rest of the video) is no
+    /// verdict on the stream: previews stay on and a later request opens a new
+    /// shadow, never faster than the lost one took to fail.
+    #[test]
+    fn a_lost_shadow_is_replaced_not_a_refusal() {
+        let url = "http://127.0.0.1:49312/cold-torrent".to_owned();
+        let t0 = Instant::now();
+        let mut inner = Inner::default();
+        assert_eq!(inner.request_thumb(url.clone(), 7, 448, t0), ThumbRequest::Pending { start_worker: true });
+        // The worker's job comes back lost after the shadow lived 3 s.
+        inner.wanted = None;
+        let lived = Duration::from_secs(3);
+        let back = inner.take_back::<()>(Captured::Lost { reason: "thumbs: loading failed".into(), lived }, t0);
+        assert!(matches!(back, TakenBack::Lost));
+        inner.worker_running = false;
+        assert!(inner.refused.is_none(), "a lost shadow refuses nothing");
+        assert!(inner.shadow.is_none());
+        // Asked again before the lost shadow's lifetime has passed: still
+        // pending (the web keeps asking), no new shadow yet.
+        let early = t0 + lived / 2;
+        let answer = inner.request_thumb(url.clone(), 7, 448, early);
+        assert_eq!(answer, ThumbRequest::Pending { start_worker: false });
+        assert_eq!(ThumbAnswer::from(answer), ThumbAnswer::Pending);
+        assert_eq!(inner.wanted, Some(7), "the request stays queued");
+        // Once it has passed, the next request starts a worker (a new shadow).
+        assert_eq!(
+            inner.request_thumb(url.clone(), 7, 448, t0 + lived),
+            ThumbRequest::Pending { start_worker: true }
+        );
+        // A shadow that failed at once may be replaced at once.
+        let _ = inner.take_back::<()>(Captured::Lost { reason: "x".into(), lived: Duration::ZERO }, t0);
+        assert!(inner.may_respawn(t0));
+    }
+
+    /// Only mpv's "loading failed" means the bytes could not be had; anything
+    /// else mpv says after reading the stream (no video, a renderer that
+    /// cannot start) would end every new shadow the same way.
+    #[test]
+    fn a_load_that_could_not_read_is_retried_one_that_read_is_final() {
+        assert!(matches!(
+            load_end(mpv::MPV_ERROR_LOADING_FAILED, "loading failed", Render::Software, ""),
+            LoadEnd::Lost(_)
+        ));
+        assert!(matches!(
+            load_end(mpv::MPV_ERROR_LOADING_FAILED, "loading failed", Render::Libplacebo, ""),
+            LoadEnd::Lost(_)
+        ));
+        // MPV_ERROR_NOTHING_TO_PLAY (-16): what a gpu-next that cannot start
+        // ends a load with ("no audio or video data played").
+        match load_end(-16, "no audio or video data played", Render::Libplacebo, "[vo] failed") {
+            LoadEnd::Never(reason) => assert!(reason.contains("gpu-next could not show the stream"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Every settled frame is judged on its own: captured only by a shadow
@@ -1446,9 +1598,9 @@ mod tests {
         let mut inner = Inner::default();
         inner.switch_stream(Some("http://127.0.0.1:11470/spliced".to_owned()));
         inner.wanted = Some(3);
-        let back = inner.take_back::<()>(Captured::Refused("thumbs: profile 5 without RPU".into()));
+        let back = inner.take_back::<()>(Captured::Refused("thumbs: profile 5 without RPU".into()), Instant::now());
         assert!(matches!(back, TakenBack::Refused));
-        assert!(inner.disabled && inner.wanted.is_none());
+        assert!(inner.refused.is_some() && inner.wanted.is_none());
     }
 
     /// A stream that changes colour mid-file, through the real shadow: the
@@ -1481,7 +1633,11 @@ mod tests {
             let time = duration * at;
             let mut replaced = false;
             let jpeg = loop {
-                match checked_capture(shadow.take().unwrap(), &file, time, Shadow::capture_bytes) {
+                let (width, render) = shadow.as_ref().map(|s| (s.width, s.render)).unwrap();
+                match checked_capture(shadow.take().unwrap(), &file, time, &|| false, Shadow::capture_bytes) {
+                    Captured::Parked => {
+                        shadow = Some(Shadow::spawn(&file, width, render).expect("shadow respawn"));
+                    }
                     Captured::Frame(s, conversion, jpeg) => {
                         assert_eq!(s.render, expect_render, "{step}");
                         println!("{step} at {time:.1}s: {conversion} on {:?}, replaced first: {replaced}", s.render);
@@ -1495,8 +1651,10 @@ mod tests {
                         inner.note_conversion(conversion);
                         shadow = Some(s);
                     }
-                    Captured::Skipped(s) => shadow = Some(s),
-                    Captured::Refused(reason) => panic!("{step}: refused: {reason}"),
+                    Captured::Skipped(s) | Captured::Yielded(s) => shadow = Some(s),
+                    Captured::Refused(reason) | Captured::Lost { reason, .. } => {
+                        panic!("{step}: refused: {reason}")
+                    }
                 }
             };
             assert_eq!(replaced, step != "sdr", "{step}: only a change of renderer replaces");
@@ -1613,15 +1771,22 @@ mod tests {
     fn capture_at(mut shadow: Shadow, file: &str, time: f64) -> (Shadow, Conversion, Vec<u8>) {
         let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
         loop {
-            match checked_capture(shadow, file, time, Shadow::capture_bytes) {
+            let (width, render) = (shadow.width, shadow.render);
+            match checked_capture(shadow, file, time, &|| false, Shadow::capture_bytes) {
                 Captured::Frame(done, conversion, jpeg) => {
                     return (done, conversion, jpeg.expect("capture"));
                 }
-                Captured::Skipped(again) | Captured::Replaced(again, _) => {
+                Captured::Skipped(again) | Captured::Replaced(again, _) | Captured::Yielded(again) => {
                     assert!(Instant::now() < deadline, "{file} at {time:.1}s never captured");
                     shadow = again;
                 }
-                Captured::Refused(reason) => panic!("{file} refused: {reason}"),
+                Captured::Parked => {
+                    assert!(Instant::now() < deadline, "{file} at {time:.1}s never captured");
+                    shadow = Shadow::spawn(file, width, render).expect("shadow respawn");
+                }
+                Captured::Refused(reason) | Captured::Lost { reason, .. } => {
+                    panic!("{file} refused: {reason}")
+                }
             }
         }
     }
@@ -1646,33 +1811,33 @@ mod tests {
         shadow
     }
 
-    /// A libplacebo shadow whose load mpv ends in error is refused with mpv's
-    /// own reason, never left to time out job after job in silence. Driven
-    /// here by a file that does not exist, the same END_FILE error a gpu-next
-    /// that cannot start produces (measured: "no audio or video data played"
-    /// after "Error opening/initializing the selected video_out"). Needs
-    /// `libmpv-2.dll` (next to the test binary or via `RILLIO_LIBMPV`).
-    /// Run: `cargo test --lib thumbs::tests::libplacebo_load -- --ignored`.
+    /// A shadow whose load mpv ends because the stream cannot be READ is lost,
+    /// with mpv's own reason, never left to time out job after job in silence
+    /// (and never a refusal: the same stream may be readable a moment later).
+    /// Driven here by a file that does not exist ("loading failed"), on both
+    /// renderers. Needs `libmpv-2.dll` (next to the test binary or via
+    /// `RILLIO_LIBMPV`).
+    /// Run: `cargo test --lib thumbs::tests::unreadable_stream -- --ignored`.
     #[test]
     #[ignore = "needs libmpv-2.dll"]
-    fn libplacebo_load_failure_is_refused_with_mpvs_reason() {
+    fn unreadable_stream_loses_the_shadow_with_mpvs_reason() {
         let missing = std::env::temp_dir().join("rillio-thumbs-no-such-file.mkv");
         assert!(!missing.exists());
         let missing = missing.to_string_lossy().to_string();
-        // Through the worker's own path: the seek never settles, and the
-        // refusal still comes out of it.
-        let shadow = Shadow::spawn(&missing, 448, Render::Libplacebo).expect("shadow spawn");
-        let err = match checked_capture(shadow, &missing, 0.0, |_| ()) {
-            Captured::Refused(e) => e,
-            Captured::Frame(..) | Captured::Skipped(_) | Captured::Replaced(..) => {
-                panic!("a missing file was not refused")
+        for (render, says) in [
+            (Render::Libplacebo, "gpu-next could not show the stream"),
+            (Render::Software, "the shadow could not show the stream"),
+        ] {
+            // Through the worker's own path: the seek never settles, and the
+            // loss still comes out of it.
+            let shadow = Shadow::spawn(&missing, 448, render).expect("shadow spawn");
+            match checked_capture(shadow, &missing, 0.0, &|| false, |_| ()) {
+                Captured::Lost { reason, .. } => assert!(reason.contains(says), "{reason}"),
+                Captured::Refused(reason) => panic!("{render:?}: an unreadable file was refused: {reason}"),
+                Captured::Frame(..) | Captured::Skipped(_) | Captured::Replaced(..) | Captured::Yielded(_)
+                | Captured::Parked => panic!("{render:?}: an unreadable file was not noticed"),
             }
-        };
-        assert!(err.contains("gpu-next could not show the stream"), "{err}");
-        // The software shadow keeps its old rule: no frame, no verdict, the job
-        // is skipped.
-        let software = Shadow::spawn(&missing, 448, Render::Software).expect("shadow spawn");
-        assert!(matches!(checked_capture(software, &missing, 0.0, |_| ()), Captured::Skipped(_)));
+        }
     }
 
     /// The median and the 95th percentile (nearest rank) of `millis`.
@@ -1770,7 +1935,7 @@ mod tests {
             for (index, &time) in times.iter().enumerate() {
                 let t = Instant::now();
                 before.set_width(width).expect("thumb width");
-                assert!(before.seek_settled(time), "seek to {time:.1}s");
+                assert_eq!(before.seek_settled(time, &|| false), Settle::Settled, "seek to {time:.1}s");
                 let jpeg = before.capture_bytes().expect("capture");
                 before_ms.push(t.elapsed().as_secs_f64() * 1000.0);
                 std::fs::write(out.join(format!("{stem}-before-{index:02}.jpg")), &jpeg)
@@ -1834,13 +1999,13 @@ mod tests {
                     if interleave_scan {
                         let started = Instant::now();
                         shadow.set_width(SCAN_WIDTH).expect("scan width");
-                        assert!(shadow.seek_settled(time), "scan seek to {time:.0}s");
+                        assert_eq!(shadow.seek_settled(time, &|| false), Settle::Settled, "scan seek to {time:.0}s");
                         luma_grid(&shadow.capture_bytes().expect("scan capture")).expect("luma");
                         scan_millis.push(started.elapsed().as_secs_f64() * 1000.0);
                     }
                     let started = Instant::now();
                     shadow.set_width(width).expect("thumb width");
-                    assert!(shadow.seek_settled(time), "seek to {time:.0}s did not settle");
+                    assert_eq!(shadow.seek_settled(time, &|| false), Settle::Settled, "seek to {time:.0}s did not settle");
                     let jpeg = shadow.capture_bytes().expect("capture");
                     millis.push(started.elapsed().as_secs_f64() * 1000.0);
                     bytes_total += jpeg.len();
@@ -1910,9 +2075,9 @@ pub async fn player_thumb(
     url: String,
     time_sec: f64,
     width_px: u32,
-) -> Result<Option<String>, String> {
+) -> Result<ThumbAnswer, String> {
     if !time_sec.is_finite() || time_sec < 0.0 {
-        return Ok(None);
+        return Err(format!("thumbs: no preview exists at {time_sec} s"));
     }
     let url = resolve_shadow_url(&app, &url)?;
     validate_url(&url)?;
@@ -1921,18 +2086,43 @@ pub async fn player_thumb(
 
     let inner_arc = state.0.clone();
     let mut inner = inner_arc.lock().map_err(|_| "thumbs: poisoned")?;
-    match inner.request_thumb(url, bucket, width) {
-        ThumbRequest::Hit(data_url) => Ok(Some(data_url)),
-        ThumbRequest::Pending { start_worker } => {
-            if start_worker {
-                let arc = inner_arc.clone();
-                // A dedicated OS thread: every step (mpv FFI, settle polling,
-                // file IO) is blocking, and exactly one capture runs at a time.
-                std::thread::spawn(move || worker(arc));
-            }
-            Ok(None)
+    let answer = inner.request_thumb(url, bucket, width, Instant::now());
+    if let ThumbRequest::Pending { start_worker: true } = answer {
+        let arc = inner_arc.clone();
+        // A dedicated OS thread: every step (mpv FFI, settle polling, file
+        // IO) is blocking, and exactly one capture runs at a time.
+        std::thread::spawn(move || worker(arc));
+    }
+    Ok(answer.into())
+}
+
+/// What the web layer is told about one preview (`player_thumb`). The web asks
+/// again while it is `Pending` and the position is still hovered, and never
+/// again for this stream once it is `Never`: the shell, which runs the
+/// shadow, is the one that knows whether a frame is coming, so no budget of
+/// its own guesses it on the other side.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum ThumbAnswer {
+    /// The frame, as a data URL.
+    Frame {
+        #[serde(rename = "dataUrl")]
+        data_url: String,
+    },
+    /// Being made, or not readable yet (a region not downloaded, a shadow
+    /// being replaced): ask again.
+    Pending,
+    /// This stream gets no previews, and why.
+    Never { reason: String },
+}
+
+impl From<ThumbRequest> for ThumbAnswer {
+    fn from(request: ThumbRequest) -> Self {
+        match request {
+            ThumbRequest::Hit(data_url) => ThumbAnswer::Frame { data_url },
+            ThumbRequest::Pending { .. } => ThumbAnswer::Pending,
+            ThumbRequest::Refused(reason) => ThumbAnswer::Never { reason },
         }
-        ThumbRequest::Refused => Ok(None),
     }
 }
 
@@ -1944,14 +2134,15 @@ enum ThumbRequest {
     /// Queued as the latest wanted bucket; `start_worker` when no worker is
     /// running to pick it up (the caller spawns one).
     Pending { start_worker: bool },
-    /// This stream gets no previews ([`Inner::refuse`]): nothing is queued.
-    Refused,
+    /// This stream gets no previews ([`Inner::refuse`]), and why: nothing is
+    /// queued.
+    Refused(String),
 }
 
 impl Inner {
     /// The bookkeeping half of [`player_thumb`]: switch streams or widths when
     /// they changed, answer from the cache, else queue `bucket`.
-    fn request_thumb(&mut self, url: String, bucket: u32, width: u32) -> ThumbRequest {
+    fn request_thumb(&mut self, url: String, bucket: u32, width: u32, now: Instant) -> ThumbRequest {
         if self.url.as_deref() != Some(url.as_str()) {
             self.switch_stream(Some(url));
         }
@@ -1965,13 +2156,32 @@ impl Inner {
         if let Some(hit) = self.cache.get(bucket) {
             return ThumbRequest::Hit(hit.clone());
         }
-        if self.disabled {
-            return ThumbRequest::Refused;
+        if let Some(reason) = &self.refused {
+            return ThumbRequest::Refused(reason.clone());
         }
         self.wanted = Some(bucket);
-        let start_worker = !self.worker_running;
+        ThumbRequest::Pending { start_worker: self.claim_worker(now) }
+    }
+
+    /// Whether the caller should start a worker now (and if so, it is marked
+    /// running). Not while one runs, and not while a lost shadow's pacing
+    /// holds: the request stays queued and a later one starts it.
+    fn claim_worker(&mut self, now: Instant) -> bool {
+        if self.worker_running || (self.shadow.is_none() && !self.may_respawn(now)) {
+            return false;
+        }
         self.worker_running = true;
-        ThumbRequest::Pending { start_worker }
+        true
+    }
+
+    /// A new shadow may be spawned for this stream: always, unless the last
+    /// one was lost less than its own lifetime ago. A stream that cannot be
+    /// read fails each shadow at the speed it fails, so the respawns are paced
+    /// by that speed: one that refused at once is retried at once, one that
+    /// hung for a minute first is not retried for a minute. No constant of
+    /// ours guesses how long "not readable yet" lasts.
+    fn may_respawn(&self, now: Instant) -> bool {
+        self.lost.as_ref().map_or(true, |lost| now.saturating_duration_since(lost.at) >= lost.lived)
     }
 
     /// No correct thumbnail can be made for the current stream: stop its
@@ -1983,8 +2193,24 @@ impl Inner {
             "thumbs: no previews for {}: {reason}",
             self.url.as_deref().unwrap_or("(no stream)")
         );
-        self.disabled = true;
+        self.refused = Some(reason.to_owned());
         self.wanted = None;
+        self.shadow = None;
+    }
+
+    /// The shadow could not read the stream (`reason`) after living `lived`:
+    /// drop it, keep the stream's previews ON, and let a later request open a
+    /// new shadow (paced by [`Inner::may_respawn`]). Said once per reason, so
+    /// a stream that stays unreadable does not flood the log.
+    fn lose_shadow(&mut self, reason: &str, lived: Duration, now: Instant) {
+        if self.lost.as_ref().map(|lost| lost.reason.as_str()) != Some(reason) {
+            tracing::warn!(
+                "thumbs: the shadow for {} could not read it (a later request opens a new one): \
+                 {reason}",
+                self.url.as_deref().unwrap_or("(no stream)")
+            );
+        }
+        self.lost = Some(LostShadow { at: now, lived, reason: reason.to_owned() });
         self.shadow = None;
     }
 
@@ -1998,7 +2224,8 @@ impl Inner {
         self.wanted = None;
         self.scan = None;
         self.scan_requested = false;
-        self.disabled = false;
+        self.refused = None;
+        self.lost = None;
         self.conversion = None;
     }
 
@@ -2032,12 +2259,22 @@ impl Inner {
 
     /// Put the shadow back after a [`checked_capture`] and record what the
     /// frame needed. Returns what was captured, when anything was.
-    fn take_back<T>(&mut self, captured: Captured<T>) -> TakenBack<T> {
+    fn take_back<T>(&mut self, captured: Captured<T>, now: Instant) -> TakenBack<T> {
         match captured {
             Captured::Frame(shadow, conversion, value) => {
                 self.note_conversion(conversion);
                 self.shadow = Some(shadow);
+                self.lost = None;
                 TakenBack::Frame(value)
+            }
+            Captured::Yielded(shadow) => {
+                self.shadow = Some(shadow);
+                TakenBack::Yielded
+            }
+            Captured::Parked => TakenBack::Skipped,
+            Captured::Lost { reason, lived } => {
+                self.lose_shadow(&reason, lived, now);
+                TakenBack::Lost
             }
             Captured::Skipped(shadow) => {
                 self.shadow = Some(shadow);
@@ -2066,6 +2303,10 @@ enum TakenBack<T> {
     Replaced,
     /// The stream gets no previews; the worker ends.
     Refused,
+    /// The shadow was lost; the worker ends, a later request starts one.
+    Lost,
+    /// A sweep sample gave way to a hover; nothing captured.
+    Yielded,
 }
 
 /// Tear the shadow down (player unmount / playback stop). Frees the decoder
@@ -2094,15 +2335,14 @@ pub async fn player_scene_cuts(
     if inner.url.as_deref() != Some(url.as_str()) {
         inner.switch_stream(Some(url));
     }
-    if inner.disabled {
+    if inner.refused.is_some() {
         return Ok(Some(Vec::new()));
     }
     if let Some(result) = inner.scan.as_ref().and_then(|scan| scan.result.clone()) {
         return Ok(Some(result));
     }
     inner.scan_requested = true;
-    if !inner.worker_running {
-        inner.worker_running = true;
+    if inner.claim_worker(Instant::now()) {
         let arc = inner_arc.clone();
         std::thread::spawn(move || worker(arc));
     }
@@ -2142,6 +2382,15 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 inner.worker_running = false;
                 return;
             };
+            if inner.shadow.is_none() && !inner.may_respawn(Instant::now()) {
+                // A lost shadow's pacing holds: the job stays queued and the
+                // next request after it starts a worker again.
+                if let Job::Thumb(bucket, _) = job {
+                    inner.wanted.get_or_insert(bucket);
+                }
+                inner.worker_running = false;
+                return;
+            }
             (job, url, inner.generation, inner.shadow.is_none())
         };
 
@@ -2206,6 +2455,8 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                         shadow,
                         &url,
                         bucket as f64 * BUCKET_SECONDS,
+                        // A hover never gives way: it IS what the sweep yields to.
+                        &|| false,
                         Shadow::capture,
                     ),
                     Err(e) => {
@@ -2223,28 +2474,31 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                     // to the old stream; drop both.
                     continue;
                 }
-                match inner.take_back(captured) {
+                match inner.take_back(captured, Instant::now()) {
                     // The preview changed size mid-capture: this frame is the
                     // old size, and the cache now holds the new one only.
                     TakenBack::Frame(Ok(_)) if inner.width != width => {}
                     TakenBack::Frame(Ok(data_url)) => inner.cache.insert(bucket, data_url),
                     TakenBack::Frame(Err(e)) => tracing::debug!("thumbs: bucket {bucket}: {e}"),
-                    TakenBack::Skipped => tracing::debug!(
+                    TakenBack::Skipped | TakenBack::Yielded => tracing::debug!(
                         "thumbs: bucket {bucket}: no frame to judge (seek did not settle, region \
                          not downloaded yet?)"
                     ),
                     TakenBack::Replaced => {
                         tracing::debug!("thumbs: bucket {bucket}: renderer replaced, asked again")
                     }
-                    TakenBack::Refused => {
+                    TakenBack::Refused | TakenBack::Lost => {
                         inner.worker_running = false;
                         return;
                     }
                 }
             }
             Job::ScanStep => {
-                // Snapshot the scan cursor under the lock, creating the Scan
-                // from the loaded file's duration on the first step.
+                // A sweep sample gives way to any hover that is waiting.
+                let hover_waiting = || inner_arc.lock().map_or(true, |inner| inner.wanted.is_some());
+                // Snapshot the scan cursor under the lock. The sweep is laid
+                // out from the file's duration, so until the shadow has the
+                // file open there is no cursor yet.
                 let step = {
                     let mut inner = match inner_arc.lock() {
                         Ok(guard) => guard,
@@ -2254,29 +2508,40 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                         continue;
                     }
                     if inner.scan.is_none() {
-                        match shadow.duration() {
-                            Some(duration) => inner.scan = Some(Scan::new(duration)),
-                            None => {
-                                // File header not parsed yet: put the shadow
-                                // back and let the loop retry (a thumbnail
-                                // request may run in between).
-                                inner.shadow = Some(shadow);
-                                std::thread::sleep(Duration::from_millis(200));
-                                continue;
-                            }
+                        if let Some(duration) = shadow.duration() {
+                            inner.scan = Some(Scan::new(duration));
                         }
                     }
-                    let scan = inner.scan.as_ref().expect("just ensured");
-                    (scan.next, scan.spacing)
+                    inner.scan.as_ref().map(|scan| (scan.next, scan.spacing))
                 };
-                let (index, spacing) = step;
+                let Some((index, spacing)) = step else {
+                    // Not open yet. Wait for it OUTSIDE the lock, through the
+                    // same checked path a capture takes: it waits as long as
+                    // a seek may (or until a hover comes), and it is what
+                    // notices a load mpv ended, which a bare poll of the
+                    // duration never would (a dead shadow then spun here for
+                    // the rest of the video, measured 2026-10-28).
+                    let opened = checked_capture(shadow, &url, 0.0, &hover_waiting, |_| ());
+                    let mut inner = match inner_arc.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                    if inner.generation != generation {
+                        continue;
+                    }
+                    if let TakenBack::Refused | TakenBack::Lost = inner.take_back(opened, Instant::now()) {
+                        inner.worker_running = false;
+                        return;
+                    }
+                    continue;
+                };
 
                 let target = index as f64 * spacing;
                 // The sweep samples at its own small width whatever size the
                 // hover thumbnails are being cut at, through the same checked
                 // path, so it compares converted (SDR) frames only.
                 let captured = match shadow.set_width(SCAN_WIDTH) {
-                    Ok(()) => checked_capture(shadow, &url, target, |shadow| {
+                    Ok(()) => checked_capture(shadow, &url, target, &hover_waiting, |shadow| {
                         shadow.capture_bytes().ok().and_then(|bytes| luma_grid(&bytes).ok())
                     }),
                     Err(e) => {
@@ -2292,15 +2557,16 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 if inner.generation != generation {
                     continue;
                 }
-                let luma = match inner.take_back(captured) {
+                let luma = match inner.take_back(captured, Instant::now()) {
                     TakenBack::Frame(luma) => luma,
                     // An unsettled seek (undownloaded torrent region) skips the
                     // sample rather than stalling the sweep; prev resets below
                     // so no false cut spans the hole.
                     TakenBack::Skipped => None,
-                    // A new renderer: the same sample is taken again on it.
-                    TakenBack::Replaced => continue,
-                    TakenBack::Refused => {
+                    // A new renderer, or a hover went first: the same sample
+                    // is taken again later.
+                    TakenBack::Replaced | TakenBack::Yielded => continue,
+                    TakenBack::Refused | TakenBack::Lost => {
                         inner.worker_running = false;
                         return;
                     }
