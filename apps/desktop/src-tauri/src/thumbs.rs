@@ -1050,36 +1050,46 @@ pub(crate) fn validate_url(url: &str) -> Result<(), String> {
     }
 }
 
-/// The url the SHADOW should open for what the player is playing.
+/// The url the SHADOW should open for what the player is playing, and with it
+/// the stream's ONE identity in [`Inner`]: two callers naming the same stream
+/// two ways would each switch the single shadow to their spelling, and every
+/// switch drops the shadow, the cache and any capture in flight.
 ///
-/// Normally the identity: the web layer hands over `video.state.stream.url`,
-/// which stays the HTTP form even when the player itself loaded `rillio://`.
-/// This exists so the shadow survives a caller that passes the byte-plane url
-/// anyway: `rillio://<ih>/<idx>` maps back to `<base_url>/<ih>/<idx>` on the
-/// port the server really bound. Anything else is returned untouched for
-/// [`validate_url`] to judge.
+/// The web layer hands over `video.state.stream.url`, built by the core on the
+/// SYMBOLIC server address ([`rillio_streaming_server::config::default_base_url`]).
+/// On a boot whose server fell back to another port (11470 refused: held by
+/// another process, or inside a reserved range) nothing listens there, so a
+/// url on that origin maps to the port the server really bound. The byte-plane
+/// form `rillio://<ih>/<idx>` maps to `<base_url>/<ih>/<idx>` the same way.
+/// Anything else is returned untouched for [`validate_url`] to judge.
 pub(crate) fn resolve_shadow_url(app: &tauri::AppHandle, url: &str) -> Result<String, String> {
     use tauri::Manager;
 
-    if !url.trim().to_ascii_lowercase().starts_with("rillio://") {
-        return Ok(url.to_owned());
-    }
     let base_url = app.state::<crate::ServerHandle>().get().map(|s| s.base_url.clone());
-    shadow_url_for(url, base_url.as_deref())
+    let symbolic = rillio_streaming_server::config::default_base_url();
+    shadow_url_for(url, symbolic.as_str(), base_url.as_deref())
 }
 
-/// The pure half of [`resolve_shadow_url`]: `base_url` is whatever the server
-/// bound (`None` while it is still binding).
-fn shadow_url_for(url: &str, base_url: Option<&str>) -> Result<String, String> {
+/// The pure half of [`resolve_shadow_url`]: `symbolic` is the address stream
+/// urls are built on, `base_url` whatever the server bound (`None` while it is
+/// still binding).
+fn shadow_url_for(url: &str, symbolic: &str, base_url: Option<&str>) -> Result<String, String> {
     let trimmed = url.trim();
-    if !trimmed.to_ascii_lowercase().starts_with("rillio://") {
-        return Ok(url.to_owned());
+    let bound = || base_url.ok_or_else(|| "thumbs: the streaming server has not bound yet".to_string());
+    if trimmed.to_ascii_lowercase().starts_with("rillio://") {
+        let (info_hash, file_idx) = crate::stream_cb::parse_url(trimmed)
+            .map_err(|e| format!("thumbs: BLOCKED malformed rillio:// url {url}: {e}"))?;
+        return Ok(format!("{}/{info_hash}/{file_idx}", bound()?.trim_end_matches('/')));
     }
-    let (info_hash, file_idx) = crate::stream_cb::parse_url(trimmed)
-        .map_err(|e| format!("thumbs: BLOCKED malformed rillio:// url {url}: {e}"))?;
-    let base_url =
-        base_url.ok_or_else(|| "thumbs: the streaming server has not bound yet".to_string())?;
-    Ok(format!("{}/{info_hash}/{file_idx}", base_url.trim_end_matches('/')))
+    let symbolic = symbolic.trim_end_matches('/');
+    match trimmed.strip_prefix(symbolic) {
+        // Same origin only: `/path`, `?query` or nothing may follow, never
+        // more port digits or host (`:114700`, `.evil.com`).
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') => {
+            Ok(format!("{}{rest}", bound()?.trim_end_matches('/')))
+        }
+        _ => Ok(url.to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -1088,6 +1098,7 @@ mod tests {
 
     const IH: &str = "0123456789abcdef0123456789abcdef01234567";
     const BASE: &str = "http://127.0.0.1:49312/";
+    const SYMBOLIC: &str = "http://127.0.0.1:11470/";
 
     /// The shadow must open the HTTP form of whatever the player loaded, on the
     /// port the server really got - never `rillio://`, which is registered on
@@ -1095,41 +1106,64 @@ mod tests {
     #[test]
     fn shadow_maps_the_byte_plane_back_to_http() {
         assert_eq!(
-            shadow_url_for(&format!("rillio://{IH}/3"), Some(BASE)),
+            shadow_url_for(&format!("rillio://{IH}/3"), SYMBOLIC, Some(BASE)),
             Ok(format!("http://127.0.0.1:49312/{IH}/3"))
         );
         // No trailing slash on the base, same answer (no doubled separator).
         assert_eq!(
-            shadow_url_for(&format!("rillio://{IH}/0"), Some("http://127.0.0.1:11470")),
+            shadow_url_for(&format!("rillio://{IH}/0"), SYMBOLIC, Some("http://127.0.0.1:11470")),
             Ok(format!("http://127.0.0.1:11470/{IH}/0"))
         );
         // The mapped url is exactly what validate_url accepts.
-        let mapped = shadow_url_for(&format!("rillio://{IH}/1"), Some(BASE)).unwrap();
+        let mapped = shadow_url_for(&format!("rillio://{IH}/1"), SYMBOLIC, Some(BASE)).unwrap();
         validate_url(&mapped).unwrap();
+    }
+
+    /// The seek bar and the scene sweep name the stream two ways on a boot
+    /// whose server fell back off 11470 (measured 2026-10-28: the sweep asked
+    /// for `127.0.0.1:11470/...`, the seek bar for the bound port, and each ask
+    /// switched the one shadow to its spelling; 1 hover in 8 got a frame).
+    /// Both spellings must come out as ONE url, on the port really bound.
+    #[test]
+    fn the_symbolic_origin_maps_to_the_bound_port() {
+        let symbolic = format!("http://127.0.0.1:11470/{IH}/1?tr=dht%3A{IH}");
+        let bound = format!("http://127.0.0.1:49312/{IH}/1?tr=dht%3A{IH}");
+        assert_eq!(shadow_url_for(&symbolic, SYMBOLIC, Some(BASE)), Ok(bound.clone()));
+        assert_eq!(shadow_url_for(&bound, SYMBOLIC, Some(BASE)), Ok(bound.clone()));
+        // Bare origin and query-only forms keep their shape.
+        assert_eq!(
+            shadow_url_for("http://127.0.0.1:11470", SYMBOLIC, Some(BASE)),
+            Ok("http://127.0.0.1:49312".to_owned())
+        );
+        // A longer port or another host on the same prefix is not this origin.
+        for other in [format!("http://127.0.0.1:114700/{IH}/1"), "http://127.0.0.1:11470.evil.com/x".to_owned()] {
+            assert_eq!(shadow_url_for(&other, SYMBOLIC, Some(BASE)), Ok(other.clone()), "{other}");
+        }
+        // Before the server has bound, a symbolic url cannot be placed: loud.
+        assert!(shadow_url_for(&symbolic, SYMBOLIC, None).is_err());
     }
 
     /// Everything else passes through untouched for validate_url to judge.
     #[test]
     fn shadow_leaves_other_urls_alone() {
         for url in [
-            format!("http://127.0.0.1:11470/{IH}/0"),
             "https://cdn.example/a.mkv".to_owned(),
             "av://lavfi:testsrc".to_owned(),
         ] {
-            assert_eq!(shadow_url_for(&url, Some(BASE)), Ok(url.clone()), "{url:?}");
+            assert_eq!(shadow_url_for(&url, SYMBOLIC, Some(BASE)), Ok(url.clone()), "{url:?}");
         }
         // ...and the pass-through still gets rejected by the scheme rule.
-        assert!(validate_url(&shadow_url_for("av://lavfi:testsrc", Some(BASE)).unwrap()).is_err());
+        assert!(validate_url(&shadow_url_for("av://lavfi:testsrc", SYMBOLIC, Some(BASE)).unwrap()).is_err());
     }
 
     /// A malformed byte-plane url is refused here too (it never becomes a
     /// plausible-looking http url), and an unbound server fails loud.
     #[test]
     fn shadow_refuses_what_it_cannot_map() {
-        assert!(shadow_url_for(&format!("rillio://{IH}/0/movie.mkv"), Some(BASE)).is_err());
-        assert!(shadow_url_for(&format!("rillio://{IH}/-1"), Some(BASE)).is_err());
-        assert!(shadow_url_for("rillio://evil.com/0", Some(BASE)).is_err());
-        assert!(shadow_url_for(&format!("rillio://{IH}/0"), None).is_err());
+        assert!(shadow_url_for(&format!("rillio://{IH}/0/movie.mkv"), SYMBOLIC, Some(BASE)).is_err());
+        assert!(shadow_url_for(&format!("rillio://{IH}/-1"), SYMBOLIC, Some(BASE)).is_err());
+        assert!(shadow_url_for("rillio://evil.com/0", SYMBOLIC, Some(BASE)).is_err());
+        assert!(shadow_url_for(&format!("rillio://{IH}/0"), SYMBOLIC, None).is_err());
     }
 
     /// A full cache overwrites the frame unused the longest, where "used" is a

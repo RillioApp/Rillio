@@ -31,12 +31,19 @@ pub const DEFAULT_PORT: u16 = 11470;
 /// implementation; core only displays it and does not gate on a value.
 pub const SERVER_VERSION: &str = concat!("5.0.0-rust+", env!("CARGO_PKG_VERSION"));
 
+/// The address the server is NAMED by before anyone knows where it bound: the
+/// core builds every stream url from it, and a boot that fell back to another
+/// port (see `bind_with_fallback`) still sees urls on this origin. Whoever
+/// knows the real address maps this one onto it.
+pub fn default_base_url() -> Url {
+    Url::parse(&format!("http://127.0.0.1:{DEFAULT_PORT}")).expect("hardcoded base url is valid")
+}
+
 impl Config {
     /// Loopback config on the default port, cache under `app_path`.
     pub fn local(app_path: PathBuf) -> Self {
         let bind = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
-        let base_url = Url::parse(&format!("http://127.0.0.1:{DEFAULT_PORT}"))
-            .expect("hardcoded base url is valid");
+        let base_url = default_base_url();
         Self {
             bind,
             base_url,
