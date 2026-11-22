@@ -661,6 +661,55 @@ fn unsettled(demuxer_cache_state: Option<&str>, target: f64) -> Settle {
     }
 }
 
+/// How many retired values may wait behind the one being torn down. A shadow
+/// is a whole mpv with a decoder and, for libplacebo, a GPU context: letting
+/// teardowns pile up would hold their memory and VRAM on a machine whose GPU
+/// is shared. The worker holds one shadow at a time and retires it when it
+/// replaces it, so one in teardown plus one waiting covers a replacement whose
+/// predecessor is still stuck; a further retirement waits for room
+/// (backpressure), which is the old synchronous behaviour as the worst case.
+const RETIREMENTS_QUEUED: usize = 1;
+
+/// Tears values down on a thread of its own, so a caller never waits for a
+/// slow drop: a shadow's mpv tearing down waits for its blocked read to be
+/// cancelled and, under GPU load, for its VO (measured 2026-11-22: hover jobs
+/// of 46 s spent in a dropped shadow's teardown). A `Shadow` drops there whole,
+/// in its own field order (its mpv before the hidden window that mpv renders
+/// into), exactly as it would inline.
+struct Retirer {
+    queue: std::sync::mpsc::SyncSender<Box<dyn Send>>,
+}
+
+impl Retirer {
+    fn new() -> Self {
+        let (queue, retired) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(RETIREMENTS_QUEUED);
+        std::thread::Builder::new()
+            .name("thumbs-retire".into())
+            .spawn(move || {
+                for value in retired {
+                    drop(value);
+                }
+            })
+            .expect("thumbs: the retirement thread could not start");
+        Self { queue }
+    }
+
+    /// Hand `value` over for teardown; waits only while the queue is full.
+    fn retire<T: Send + 'static>(&self, value: T) {
+        if let Err(std::sync::mpsc::SendError(value)) = self.queue.send(Box::new(value)) {
+            // The thread is gone (a teardown panicked): tear down here, loudly.
+            tracing::error!("thumbs: the retirement thread is gone; tearing a shadow down inline");
+            drop(value);
+        }
+    }
+}
+
+/// Retire a shadow off the calling thread ([`Retirer`]).
+fn retire(shadow: Shadow) {
+    static RETIRER: std::sync::OnceLock<Retirer> = std::sync::OnceLock::new();
+    RETIRER.get_or_init(Retirer::new).retire(shadow);
+}
+
 /// Whether a shadow kept since `kept` (set here at the first Busy/Unknown
 /// verdict, `now`) has been kept for [`BUSY_DEADLINE_MS`] without a frame.
 fn busy_expired(kept: &std::cell::Cell<Option<Instant>>, now: Instant) -> bool {
@@ -733,6 +782,20 @@ enum Captured<T> {
     Parked,
 }
 
+impl<T> Captured<T> {
+    /// The shadow this outcome still holds, if any (to [`retire`] it when the
+    /// outcome is discarded).
+    fn into_shadow(self) -> Option<Shadow> {
+        match self {
+            Captured::Frame(shadow, ..)
+            | Captured::Skipped(shadow)
+            | Captured::Replaced(shadow, _)
+            | Captured::Yielded(shadow) => Some(shadow),
+            Captured::Refused(_) | Captured::Lost { .. } | Captured::Parked => None,
+        }
+    }
+}
+
 /// THE one path to a capture, hover thumbnail or sweep sample alike: seek to
 /// `target`, decide from what mpv reports for the frame landed on, and run
 /// `capture` only when this shadow renders that conversion. Decided per frame,
@@ -750,10 +813,19 @@ fn checked_capture<T>(
     let settled = shadow.seek_settled(target, yield_now);
     // mpv's own verdict on the load comes first, settled or not: a load mpv
     // ended in error never settles a seek, and must not time out in silence.
+    // Every exit that ends this shadow retires it ([`retire`]): its teardown
+    // can take tens of seconds and must not hold up the next hover.
     match shadow.check_load() {
         Ok(()) => {}
-        Err(LoadEnd::Lost(reason)) => return Captured::Lost { reason, lived: shadow.born.elapsed() },
-        Err(LoadEnd::Never(reason)) => return Captured::Refused(reason),
+        Err(LoadEnd::Lost(reason)) => {
+            let lived = shadow.born.elapsed();
+            retire(shadow);
+            return Captured::Lost { reason, lived };
+        }
+        Err(LoadEnd::Never(reason)) => {
+            retire(shadow);
+            return Captured::Refused(reason);
+        }
     }
     match settled {
         Settle::Settled => {}
@@ -768,6 +840,7 @@ fn checked_capture<T>(
             // retires it as unreadable (paced like any lost shadow).
             let lived = shadow.born.elapsed();
             if lived >= Duration::from_millis(OPENING_DEADLINE_MS) {
+                retire(shadow);
                 return Captured::Lost {
                     reason: format!(
                         "thumbs: the stream did not open within {OPENING_DEADLINE_MS} ms; retiring the shadow"
@@ -784,9 +857,9 @@ fn checked_capture<T>(
             // into a region long downloaded, waited behind it (measured
             // 2026-10-28: one position failed 7 times in a row right after a
             // hover far ahead). Dropping the shadow cancels the read; the next
-            // job starts clean. Done here, outside the worker's lock, because
-            // tearing an mpv down waits for that cancel.
-            drop(shadow);
+            // job starts clean. Tearing an mpv down waits for that cancel, so
+            // the teardown is retired, never waited for here.
+            retire(shadow);
             return Captured::Parked;
         }
         Settle::Yielded => return Captured::Yielded(shadow),
@@ -794,12 +867,14 @@ fn checked_capture<T>(
         // Kept, and the next job asks again on this same shadow.
         Settle::Busy | Settle::Unknown => {
             if busy_expired(&shadow.kept_since, Instant::now()) {
+                let lived = shadow.born.elapsed();
+                retire(shadow);
                 return Captured::Lost {
                     reason: format!(
                         "thumbs: no frame within {BUSY_DEADLINE_MS} ms of the seek's bytes being in hand \
                          ({settled:?}); retiring the shadow"
                     ),
-                    lived: shadow.born.elapsed(),
+                    lived,
                 };
             }
             return Captured::Skipped(shadow);
@@ -814,12 +889,16 @@ fn checked_capture<T>(
             Captured::Frame(shadow, conversion, captured)
         }
         Step::NotYet => Captured::Skipped(shadow),
-        Step::Refuse(reason) => Captured::Refused(reason),
+        Step::Refuse(reason) => {
+            retire(shadow);
+            Captured::Refused(reason)
+        }
         Step::Respawn(conversion) => {
             let (width, render) = (shadow.width, conversion.render());
-            // The old shadow's decoder and connection go before the new one
-            // opens.
-            drop(shadow);
+            // The old shadow is retired before the new one opens; its teardown
+            // runs on the retirement thread (bounded, [`RETIREMENTS_QUEUED`])
+            // instead of holding up the replacement.
+            retire(shadow);
             match Shadow::spawn(url, width, render) {
                 Ok(replacement) => Captured::Replaced(replacement, conversion),
                 Err(e) => Captured::Refused(format!(
@@ -1928,6 +2007,41 @@ mod tests {
         assert!(inner.may_respawn(t0 + lived));
     }
 
+    /// Retiring hands the teardown to the retirement thread: the caller does
+    /// not wait for a slow drop (a shadow's mpv tearing down can take tens of
+    /// seconds), and at most one retirement queues behind the one in progress
+    /// (a third waits for room), so stalled teardowns cannot pile up.
+    #[test]
+    fn retiring_does_not_wait_for_the_teardown_and_is_bounded() {
+        struct SlowDrop(Duration, Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(self.0);
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        const TEARDOWN: Duration = Duration::from_millis(600);
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retirer = Retirer::new();
+        // The first is taken by the thread at once, the second waits in the
+        // queue: neither caller waits for a teardown.
+        let t = Instant::now();
+        retirer.retire(SlowDrop(TEARDOWN, dropped.clone()));
+        std::thread::sleep(Duration::from_millis(50)); // the thread takes it
+        retirer.retire(SlowDrop(TEARDOWN, dropped.clone()));
+        assert!(t.elapsed() < TEARDOWN / 2, "a retirement waited for a teardown: {:?}", t.elapsed());
+        // A third finds the queue full: it waits until the first is done.
+        let t = Instant::now();
+        retirer.retire(SlowDrop(TEARDOWN, dropped.clone()));
+        assert!(t.elapsed() >= TEARDOWN / 2, "outstanding retirements are not bounded: {:?}", t.elapsed());
+        // All of them are torn down in the end.
+        let until = Instant::now() + TEARDOWN * 6;
+        while dropped.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            assert!(Instant::now() < until, "a retired value was never dropped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The renderer picks the decoder: GPU decode copied back before the
     /// software scale for libplacebo (bit-identical to software decode,
     /// bench_hwdec), never native d3d11va (its surfaces skip the scale:
@@ -2527,8 +2641,14 @@ mod tests {
         // A seek into the middle (held bytes) is a stuck read: dropped.
         let duration = shadow.duration().expect("a duration");
         let middle = duration / 2.0;
+        let t = Instant::now();
         let outcome = checked_capture(shadow, &url, middle, &|| false, |_| ());
+        let took = t.elapsed();
         assert!(matches!(outcome, Captured::Parked), "a seek into bytes that never come must park the shadow");
+        // Its teardown waits for mpv to cancel the held read; the worker must
+        // not: the job ends with its seek budget, not with the teardown.
+        let budget = Duration::from_millis(SEEK_SETTLE_MS) + Duration::from_secs(2);
+        assert!(took < budget, "parking waited for the shadow's teardown: {took:?}");
     }
 
     /// The evidence for [`hwdec_for`]. Per file, on the player's own hinted
@@ -3364,6 +3484,14 @@ impl Inner {
         ThumbRequest::Pending { start_worker: self.claim_worker(now) }
     }
 
+    /// Let go of the shadow, if any, without waiting for its teardown (this
+    /// runs under the lock [`player_thumb`] needs; see [`retire`]).
+    fn retire_shadow(&mut self) {
+        if let Some(shadow) = self.shadow.take() {
+            retire(shadow);
+        }
+    }
+
     /// Whether the caller should start a worker now (and if so, it is marked
     /// running). Not while one runs, and not while a lost shadow's pacing
     /// holds: the request stays queued and a later one starts it.
@@ -3396,7 +3524,7 @@ impl Inner {
         );
         self.refused = Some(reason.to_owned());
         self.wanted = None;
-        self.shadow = None;
+        self.retire_shadow();
     }
 
     /// The shadow could not read the stream (`reason`) after living `lived`:
@@ -3412,7 +3540,7 @@ impl Inner {
             );
         }
         self.lost = Some(LostShadow { at: now, lived, reason: reason.to_owned() });
-        self.shadow = None;
+        self.retire_shadow();
     }
 
     /// A new stream (or none): drop the old shadow (its decoder pipeline is
@@ -3420,7 +3548,7 @@ impl Inner {
     fn switch_stream(&mut self, url: Option<String>, hint: Option<Render>) {
         self.url = url;
         self.generation += 1;
-        self.shadow = None;
+        self.retire_shadow();
         self.cache.clear();
         self.wanted = None;
         self.scan = None;
@@ -3627,7 +3755,8 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                     };
                     if inner.generation != generation {
                         // Url changed while spawning; the shadow is for the old
-                        // stream. Drop it and loop for the new state.
+                        // stream. Retire it and loop for the new state.
+                        retire(shadow);
                         continue;
                     }
                     inner.shadow = Some(shadow);
@@ -3687,7 +3816,10 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 };
                 if inner.generation != generation {
                     // Url changed mid-capture: the shadow and the frame belong
-                    // to the old stream; drop both.
+                    // to the old stream; drop the frame, retire the shadow.
+                    if let Some(shadow) = captured.into_shadow() {
+                        retire(shadow);
+                    }
                     continue;
                 }
                 match inner.take_back(captured, Instant::now()) {
@@ -3721,6 +3853,7 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                         Err(_) => return,
                     };
                     if inner.generation != generation {
+                        retire(shadow);
                         continue;
                     }
                     if inner.scan.is_none() {
@@ -3743,6 +3876,9 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                         Err(_) => return,
                     };
                     if inner.generation != generation {
+                        if let Some(shadow) = opened.into_shadow() {
+                            retire(shadow);
+                        }
                         continue;
                     }
                     if let TakenBack::Refused | TakenBack::Lost = inner.take_back(opened, Instant::now()) {
@@ -3771,6 +3907,9 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                     Err(_) => return,
                 };
                 if inner.generation != generation {
+                    if let Some(shadow) = captured.into_shadow() {
+                        retire(shadow);
+                    }
                     continue;
                 }
                 let luma = match inner.take_back(captured, Instant::now()) {
