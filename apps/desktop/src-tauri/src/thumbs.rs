@@ -555,8 +555,16 @@ fn step_for(frame: Result<Option<Conversion>, String>, render: Render) -> Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settle {
     Settled,
-    /// The budget ran out: a region not downloaded yet, or a dead shadow.
+    /// The seek was ACCEPTED (the file is open) but did not settle within the
+    /// budget: a region not downloaded yet, or a dead shadow. mpv does not
+    /// abandon that read for a later seek, so this shadow is dropped.
     TimedOut,
+    /// The file was not open yet when the budget ran out (the seek stayed
+    /// refused the whole time): a slow first open of a valid file, still
+    /// progressing. The shadow is KEPT and given another budget, never dropped
+    /// and respawned (which would restart the open from the dll load each
+    /// time, and never finish for a file whose open exceeds one budget).
+    Opening,
     /// Abandoned for a hover request.
     Yielded,
 }
@@ -649,6 +657,14 @@ fn checked_capture<T>(
     }
     match settled {
         Settle::Settled => {}
+        Settle::Opening => {
+            // Still opening the file (valid, just slow): keep this shadow and
+            // let the next job give it another budget, rather than dropping and
+            // respawning (which restarts the open and never finishes for an
+            // open longer than one budget). A load that truly cannot be read
+            // still ends in error and is caught by check_load above (Lost).
+            return Captured::Skipped(shadow);
+        }
         Settle::TimedOut => {
             // A seek that did not settle left the shadow's stream thread
             // blocked in a read of bytes not downloaded yet, and mpv does not
@@ -883,19 +899,24 @@ impl Shadow {
     /// same budget instead of failing at once.
     fn seek_settled(&self, target: f64, yield_now: &dyn Fn() -> bool) -> Settle {
         let deadline = Instant::now() + Duration::from_millis(SEEK_SETTLE_MS);
+        // mpv refuses a seek until the file is open. Staying here to the budget
+        // means the file is STILL OPENING (a fresh shadow, a slow first decode)
+        // - progress, not a stuck read - so it returns `Opening` (keep the
+        // shadow), distinct from a seek that WAS accepted and then did not
+        // settle (`TimedOut`, below: a stuck/undownloaded read, drop it).
         while self.mpv.command(&["seek", &format!("{target:.3}"), "absolute+keyframes"]).is_err() {
             // No retry starts after the budget: the sleep is capped to what
             // is left, and the deadline is checked again before the next ask.
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Settle::TimedOut;
+                return Settle::Opening;
             }
             std::thread::sleep(SETTLE_POLL.min(left));
             if yield_now() {
                 return Settle::Yielded;
             }
             if Instant::now() >= deadline {
-                return Settle::TimedOut;
+                return Settle::Opening;
             }
         }
         while Instant::now() < deadline {
@@ -2009,6 +2030,39 @@ mod tests {
             println!("  OLD software-start: median {before_med:.0} ms, respawned {before_respawns}/{REPS}, all [{}]", ms(&before));
             println!("  NEW hint-start:     median {after_med:.0} ms, respawned {after_respawns}/{REPS}, all [{}]", ms(&after));
         }
+    }
+
+    /// A valid file that is still opening when a seek budget runs out is kept,
+    /// not dropped: `seek_settled` returns `Opening` (the seek never got past
+    /// "file not open"), and `checked_capture` keeps the shadow (Skipped) so
+    /// the next job gives it another budget instead of respawning and
+    /// restarting the open. Driven by a server that accepts the connection and
+    /// never answers, so mpv's open never completes within the budget (and does
+    /// not error, so check_load stays Ok). Needs `libmpv-2.dll`.
+    /// Run: `cargo test --lib thumbs::tests::a_still_opening -- --ignored`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll"]
+    fn a_still_opening_shadow_is_kept_not_dropped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming() {
+                held.push(s); // accept, read nothing, answer nothing
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/never-opens.mkv");
+        // seek_settled on a not-yet-open file is Opening, never TimedOut.
+        let opening = Shadow::spawn(&url, 320, Render::Software).expect("spawn");
+        assert_eq!(opening.seek_settled(0.0, &|| false), Settle::Opening);
+        drop(opening);
+        // ...and checked_capture keeps such a shadow rather than dropping it.
+        let shadow = Shadow::spawn(&url, 320, Render::Software).expect("spawn");
+        let kept = matches!(
+            checked_capture(shadow, &url, 0.0, &|| false, |_| ()),
+            Captured::Skipped(_)
+        );
+        assert!(kept, "a still-opening shadow must be kept (Skipped), not dropped");
     }
 
     /// The median and the 95th percentile (nearest rank) of `millis`.
