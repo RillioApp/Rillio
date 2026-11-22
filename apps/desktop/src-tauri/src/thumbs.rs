@@ -897,6 +897,15 @@ impl Shadow {
                 tracing::debug!("thumbs: option {name}={value}: {e}");
             }
         }
+        // Benches only: options a bench arm varies (read path, cache), applied
+        // over the ones above. Loud, since a bench must not measure a typo.
+        #[cfg(test)]
+        tests::BENCH_EXTRA_OPTIONS.with(|extra| {
+            for (name, value) in extra.borrow().iter() {
+                mpv.set_option(name, value)
+                    .unwrap_or_else(|e| panic!("bench option {name}={value}: {e}"));
+            }
+        });
         // The one option that is not optional: without the scale every
         // screenshot is a full-resolution frame (megabytes per hover).
         mpv.set_option("vf", &scale_filter(width))
@@ -2599,6 +2608,289 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "hwdec candidates failed:\n{}", failures.join("\n"));
+    }
+
+    thread_local! {
+        /// Extra mpv options the next [`Shadow::spawn_decoding`] on this thread
+        /// applies over its own (bench arms only).
+        pub(super) static BENCH_EXTRA_OPTIONS: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Where a live capture's time goes. Per file, on the player's own hinted
+    /// renderer and decoder, one warm shadow per READ ARM (the same file read
+    /// different ways: a local path, HTTP, HTTP with other cache options),
+    /// captured INTERLEAVED per time point so every arm sees the same machine
+    /// load, each capture split into seek-to-settled and screenshot ms. Run
+    /// twice: alone, and beside a "player" (a second mpv PLAYING the same file
+    /// on gpu-next with hardware decode, muted, as the shell's player does).
+    ///   RILLIO_THUMBS_BENCH_FILES  local video paths, `;` separated
+    ///   RILLIO_THUMBS_READ_ARMS    `label=url[|opt=val,opt=val]`, `;` separated;
+    ///                              `{path}` / `{name}` stand for the file's path
+    ///                              and file name (e.g. `http=http://127.0.0.1:8778/{name}`)
+    ///   RILLIO_THUMBS_BENCH_WIDTH  thumbnail width (default 640)
+    /// Run: `cargo test --lib thumbs::tests::bench_read_path -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll, RILLIO_THUMBS_BENCH_FILES and RILLIO_THUMBS_READ_ARMS"]
+    fn bench_read_path() {
+        const SAMPLES: u32 = 8;
+        let files = std::env::var("RILLIO_THUMBS_BENCH_FILES").expect("RILLIO_THUMBS_BENCH_FILES");
+        let arms_spec = std::env::var("RILLIO_THUMBS_READ_ARMS").expect("RILLIO_THUMBS_READ_ARMS");
+        let width = thumb_width(
+            std::env::var("RILLIO_THUMBS_BENCH_WIDTH").ok().and_then(|w| w.trim().parse().ok()).unwrap_or(640),
+        )
+        .expect("a usable width");
+        // (label, url template, extra options)
+        let arms: Vec<(String, String, Vec<(String, String)>)> = arms_spec
+            .split(';')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(|arm| {
+                let (label, rest) = arm.split_once('=').expect("label=url");
+                let (url, opts) = rest.split_once('|').unwrap_or((rest, ""));
+                let opts = opts
+                    .split(',')
+                    .filter(|o| !o.is_empty())
+                    .map(|o| {
+                        let (k, v) = o.split_once('=').expect("opt=val");
+                        (k.to_owned(), v.to_owned())
+                    })
+                    .collect();
+                (label.to_owned(), url.to_owned(), opts)
+            })
+            .collect();
+        let spawn_arm = |url: &str, render: Render, opts: &[(String, String)]| -> Shadow {
+            BENCH_EXTRA_OPTIONS.with(|extra| *extra.borrow_mut() = opts.to_vec());
+            let shadow = Shadow::spawn(url, width, render).expect("spawn");
+            BENCH_EXTRA_OPTIONS.with(|extra| extra.borrow_mut().clear());
+            shadow
+        };
+        // The stand-in player: what shell.rs's player is to this file, as far
+        // as load goes (gpu-next, hardware decode, playing, looping, muted).
+        let spawn_player = |path: &str| -> (Mpv, HiddenWindow) {
+            let window = HiddenWindow::create().expect("player window");
+            let mpv = Mpv::load(&mpv::default_dll_path()).expect("player dll");
+            let wid = window.wid().to_string();
+            for (name, value) in [
+                ("vo", "gpu-next"),
+                ("wid", wid.as_str()),
+                ("hwdec", "auto-copy"),
+                ("ao", "null"),
+                ("mute", "yes"),
+                ("loop-file", "inf"),
+                ("config", "no"),
+                ("load-scripts", "no"),
+                ("osc", "no"),
+            ] {
+                mpv.set_option(name, value).unwrap_or_else(|e| panic!("player {name}={value}: {e}"));
+            }
+            mpv.initialize().expect("player init");
+            mpv.command(&["loadfile", path]).expect("player loadfile");
+            (mpv, window)
+        };
+
+        for path in files.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+            let name = std::path::Path::new(path).file_name().and_then(|s| s.to_str()).expect("a file name");
+            let urls: Vec<String> =
+                arms.iter().map(|(_, url, _)| url.replace("{path}", path).replace("{name}", name)).collect();
+            // The renderer the player's frames call for (gpu-next probe, colour settled).
+            let probe = Shadow::spawn(path, width, Render::Libplacebo).expect("probe");
+            let _ = probe.seek_settled(0.0, &|| false);
+            let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
+            let (duration, render) = loop {
+                let params = probe.mpv.get_property_string("video-params");
+                let profile = probe.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
+                if let (Some(d), Some(r)) = (probe.duration(), initial_render(params.as_deref(), profile.as_deref())) {
+                    break (d, r);
+                }
+                assert!(Instant::now() < deadline, "{name} never reported duration + colour");
+                std::thread::sleep(SETTLE_POLL);
+            };
+            drop(probe);
+
+            for (phase, with_player) in [("alone", false), ("beside a playing player", true)] {
+                let _player = with_player.then(|| spawn_player(path));
+                if with_player {
+                    std::thread::sleep(Duration::from_secs(3)); // let it reach steady playback
+                }
+                // Own time points per phase (no demuxer-cache reuse across phases).
+                let offset = if with_player { 0.5 } else { 0.0 };
+                let step = duration / f64::from(SAMPLES + 1);
+                let times: Vec<f64> = (1..=SAMPLES).map(|i| step * (f64::from(i) + offset * 0.5)).collect();
+                // Spawn and warm each arm on a first frame ONE AT A TIME (four
+                // 4K opens at once park each other past the 4 s settle budget
+                // forever: measured). Open cost is not this bench's.
+                let mut shadows: Vec<Option<Shadow>> = Vec::new();
+                for (a, url) in urls.iter().enumerate() {
+                    let mut s = spawn_arm(url, render, &arms[a].2);
+                    let warm_started = Instant::now();
+                    let mut parks = 0;
+                    loop {
+                        match checked_capture(s, url, 0.0, &|| false, |_| ()) {
+                            Captured::Frame(done, ..) => { s = done; break; }
+                            Captured::Skipped(again) | Captured::Replaced(again, _) | Captured::Yielded(again) => s = again,
+                            Captured::Parked => { parks += 1; s = spawn_arm(url, render, &arms[a].2) }
+                            Captured::Refused(r) | Captured::Lost { reason: r, .. } => panic!("{name} {}: {r}", arms[a].0),
+                        }
+                        assert!(warm_started.elapsed() < Duration::from_secs(60), "{name} {} never warmed ({parks} parks)", arms[a].0);
+                    }
+                    if parks > 0 {
+                        println!("  ({} warmed after {parks} parks, {:.0} ms)", arms[a].0, warm_started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    shadows.push(Some(s));
+                }
+                // Per arm: seek ms, screenshot ms (settled captures), and misses.
+                let mut seek_ms: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+                let mut shot_ms: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+                let mut misses: Vec<Vec<String>> = vec![Vec::new(); arms.len()];
+                for (i, &time) in times.iter().enumerate() {
+                    for k in 0..arms.len() {
+                        let a = (i + k) % arms.len();
+                        let shadow = shadows[a].take().unwrap();
+                        let t = Instant::now();
+                        let settle = shadow.seek_settled(time, &|| false);
+                        let seek = t.elapsed().as_secs_f64() * 1000.0;
+                        if settle != Settle::Settled {
+                            misses[a].push(format!("{time:.1}s {settle:?} after {seek:.0} ms"));
+                            // As the worker does: a stuck read starts clean, a
+                            // busy shadow is kept.
+                            shadows[a] = Some(if settle == Settle::Busy {
+                                shadow
+                            } else {
+                                drop(shadow);
+                                spawn_arm(&urls[a], render, &arms[a].2)
+                            });
+                            continue;
+                        }
+                        match step_for(shadow.frame_conversion(), shadow.render) {
+                            Step::Capture(_) => {}
+                            other => panic!("{name} {}: frame at {time:.1}s: {other:?}", arms[a].0),
+                        }
+                        let t = Instant::now();
+                        shadow.capture_bytes().expect("capture");
+                        shot_ms[a].push(t.elapsed().as_secs_f64() * 1000.0);
+                        seek_ms[a].push(seek);
+                        shadows[a] = Some(shadow);
+                    }
+                }
+                drop(shadows);
+                println!("== {name} ({render:?}, {}) {phase}, {} points per arm", hwdec_for(render), times.len());
+                for (a, (label, _, opts)) in arms.iter().enumerate() {
+                    let fmt = |v: &mut Vec<f64>| {
+                        if v.is_empty() { return "-".to_owned(); }
+                        let (m, p) = median_p95(v);
+                        format!("median {m:.0} / p95 {p:.0}")
+                    };
+                    println!(
+                        "  {label:<14} seek {} ms | screenshot {} ms | misses {}{} {opts:?}",
+                        fmt(&mut seek_ms[a].clone()),
+                        fmt(&mut shot_ms[a].clone()),
+                        misses[a].len(),
+                        if misses[a].is_empty() { String::new() } else { format!(" [{}]", misses[a].join("; ")) },
+                    );
+                }
+            }
+        }
+    }
+
+    /// What a scene-sweep sample between two hovers costs the next hover. Per
+    /// file, on its hinted renderer and decoder, one warm shadow; per time
+    /// point, alternating which comes first: a hover capture at the hover width
+    /// on a shadow already at it ("same width"), and a hover capture right
+    /// after a sweep sample at SCAN_WIDTH ("after a flip", the width change and
+    /// back each rebuild the filter chain). Reports both and the sweep sample.
+    ///   RILLIO_THUMBS_BENCH_FILES  local video paths, `;` separated
+    /// Run: `cargo test --lib thumbs::tests::bench_width_flip -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll and RILLIO_THUMBS_BENCH_FILES"]
+    fn bench_width_flip() {
+        const SAMPLES: u32 = 8;
+        const HOVER: u32 = 640;
+        let files = std::env::var("RILLIO_THUMBS_BENCH_FILES").expect("RILLIO_THUMBS_BENCH_FILES");
+        for path in files.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+            let name = std::path::Path::new(path).file_name().and_then(|s| s.to_str()).expect("a name");
+            let probe = Shadow::spawn(path, HOVER, Render::Libplacebo).expect("probe");
+            let _ = probe.seek_settled(0.0, &|| false);
+            let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
+            let (duration, render) = loop {
+                let params = probe.mpv.get_property_string("video-params");
+                let profile = probe.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
+                if let (Some(d), Some(r)) = (probe.duration(), initial_render(params.as_deref(), profile.as_deref())) {
+                    break (d, r);
+                }
+                assert!(Instant::now() < deadline, "{name} never reported duration + colour");
+                std::thread::sleep(SETTLE_POLL);
+            };
+            drop(probe);
+            // The worker's checked path with a deadline long enough for a cold
+            // 4K frame under live load (capture_at's 8 s is not).
+            let capture_at = |mut shadow: Shadow, path: &str, at: f64| -> (Shadow, (), ()) {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    let render = shadow.render;
+                    match checked_capture(shadow, path, at, &|| false, |_| ()) {
+                        Captured::Frame(s, ..) => return (s, (), ()),
+                        Captured::Skipped(s) | Captured::Replaced(s, _) | Captured::Yielded(s) => {
+                            let p = |n: &str| s.mpv.get_property_string(n).unwrap_or_else(|| "-".into());
+                            println!(
+                                "    skipped at {at:.1}s: seeking={} time-pos={} vo-configured={} hwdec-current={} \
+                                 video-params={} errors={:?}",
+                                p("seeking"), p("time-pos"), p("vo-configured"), p("hwdec-current"),
+                                p("video-params").chars().take(80).collect::<String>(),
+                                s.mpv_errors.borrow(),
+                            );
+                            shadow = s
+                        }
+                        Captured::Parked => shadow = Shadow::spawn(path, HOVER, render).expect("respawn"),
+                        Captured::Refused(r) | Captured::Lost { reason: r, .. } => panic!("{path}: {r}"),
+                    }
+                    assert!(Instant::now() < deadline, "{path} at {at:.1}s never captured");
+                }
+            };
+            let mut shadow = Shadow::spawn(path, HOVER, render).expect("spawn");
+            let (s, _, _) = capture_at(shadow, path, 0.0);
+            shadow = s;
+            // Distinct points for each kind so neither reuses the other's cache.
+            let step = duration / f64::from(2 * SAMPLES + 1);
+            let (mut same, mut flipped, mut sweep) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..SAMPLES {
+                let a = step * f64::from(2 * i + 1);
+                let b = step * f64::from(2 * i + 2);
+                let mut hover_same = |shadow: Shadow, at: f64| {
+                    let t = Instant::now();
+                    let mut shadow = shadow;
+                    shadow.set_width(HOVER).expect("width");
+                    let (s, _, _) = capture_at(shadow, path, at);
+                    same.push(t.elapsed().as_secs_f64() * 1000.0);
+                    s
+                };
+                let mut sweep_then_hover = |shadow: Shadow, at: f64| {
+                    let mut shadow = shadow;
+                    let t = Instant::now();
+                    shadow.set_width(SCAN_WIDTH).expect("scan width");
+                    let (s, _, _) = capture_at(shadow, path, at + step / 2.0);
+                    sweep.push(t.elapsed().as_secs_f64() * 1000.0);
+                    shadow = s;
+                    let t = Instant::now();
+                    shadow.set_width(HOVER).expect("width");
+                    let (s, _, _) = capture_at(shadow, path, at);
+                    flipped.push(t.elapsed().as_secs_f64() * 1000.0);
+                    s
+                };
+                if i % 2 == 0 {
+                    shadow = hover_same(shadow, a);
+                    shadow = sweep_then_hover(shadow, b);
+                } else {
+                    shadow = sweep_then_hover(shadow, a);
+                    shadow = hover_same(shadow, b);
+                }
+            }
+            let show = |v: &mut Vec<f64>| { let (m, p) = median_p95(v); format!("median {m:.0} / p95 {p:.0} ms") };
+            println!("== {name} ({render:?}, {})", hwdec_for(render));
+            println!("  hover, same width:        {}", show(&mut same));
+            println!("  hover after a sweep flip: {}", show(&mut flipped));
+            println!("  the sweep sample itself:  {}", show(&mut sweep));
+        }
     }
 
     /// The median and the 95th percentile (nearest rank) of `millis`.
