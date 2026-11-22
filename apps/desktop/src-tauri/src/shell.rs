@@ -185,10 +185,28 @@ impl LoadIds {
     /// The load an END_FILE of `entry` belongs to, if a web load created it.
     /// A redirect (a playlist url expanding into its entries) hands the load
     /// on to the `inserted` entries, which are what will play and end.
+    ///
+    /// Rillio loads ONE media url per load (the rillio:// byte plane, an http
+    /// stream, or a direct addon url), never a playlist, EDL or CUE, so a
+    /// redirect expands into at most one entry: `count` is 0 or 1, far under
+    /// CAP, and `record` never evicts a sibling of the same redirect. The
+    /// tripwire keeps that assumption loud instead of silent: were a future
+    /// playlist feature to expand into more than CAP entries at once,
+    /// `record`'s lowest-id eviction would drop the first-playing child and its
+    /// END_FILE would go unattributed. If this ever fires, record the whole
+    /// redirect under one key (or raise CAP for it) rather than per entry.
     fn end(&mut self, entry: i64, reason: std::ffi::c_int, inserted: (i64, std::ffi::c_int)) -> Option<u64> {
         let load = self.by_entry.remove(&entry)?;
         if reason == MPV_END_FILE_REASON_REDIRECT {
             let (first, count) = inserted;
+            if count as usize > Self::CAP {
+                tracing::error!(
+                    "mpv redirect expanded into {count} entries (> CAP {}); Rillio loads single \
+                     files and must not see this. The earliest children may be evicted and their \
+                     END_FILE go unattributed",
+                    Self::CAP
+                );
+            }
             for id in first..first + i64::from(count.max(0)) {
                 self.record(id, load);
             }
