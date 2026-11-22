@@ -393,10 +393,14 @@ impl Mpv {
     }
 
     /// Run a command that creates a playlist entry (`loadfile`) and return the
-    /// entry's id, the one its END_FILE will carry. Fails loud if mpv hands
-    /// back no id: without it an END_FILE cannot be told apart from another
-    /// load's, and the caller must not guess.
-    pub fn command_entry(&self, args: &[&str]) -> Result<i64, String> {
+    /// entry's id, the one its END_FILE will carry. `Err` ONLY when mpv rejects
+    /// the command (the load did not start); `Ok(None)` when mpv ACCEPTED it
+    /// but reported no `playlist_entry_id` (so the entry cannot be tracked).
+    /// The caller must not confuse the two: a rejected load is a failure, an
+    /// accepted-but-untrackable load is playing and must not be failed.
+    /// Every shipped libmpv (client API >= 1.108 / mpv 0.33) returns the id, so
+    /// `Ok(None)` is reachable only on a future or minimal build.
+    pub fn command_entry(&self, args: &[&str]) -> Result<Option<i64>, String> {
         let cstrings: Vec<CString> = args.iter().map(|a| cstr(a)).collect::<Result<_, _>>()?;
         let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
@@ -404,10 +408,7 @@ impl Mpv {
         self.check(unsafe { (self.api.command_ret)(self.ctx, ptrs.as_ptr(), &mut result) })?;
         let value = unsafe { node_to_json(&result) };
         unsafe { (self.api.free_node_contents)(&mut result) };
-        value
-            .get("playlist_entry_id")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| format!("mpv {:?} returned no playlist_entry_id (got {value})", args.first()))
+        Ok(value.get("playlist_entry_id").and_then(serde_json::Value::as_i64))
     }
 
     /// Read a property as a string (mpv stringifies any type). `None` when the
@@ -736,8 +737,13 @@ mod tests {
         let url = |idx: u32| format!("rillio://{}/{idx}", "0123456789abcdef0123456789abcdef01234567");
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let first = mpv.command_entry(&["loadfile", &url(0), "replace"]).unwrap();
-            let second = mpv.command_entry(&["loadfile", &url(1), "replace"]).unwrap();
+            // The shipped libmpv must return the id (Ok(Some)); Ok(None) would
+            // mean this build is too old for mpv_command_ret's entry id, which
+            // is the only case run_command tolerates as untrackable.
+            let first = mpv.command_entry(&["loadfile", &url(0), "replace"]).unwrap()
+                .expect("shipped libmpv returns a playlist_entry_id");
+            let second = mpv.command_entry(&["loadfile", &url(1), "replace"]).unwrap()
+                .expect("shipped libmpv returns a playlist_entry_id");
             assert_ne!(first, second);
             ids.push((first, second));
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -751,15 +757,24 @@ mod tests {
         }
         eprintln!("[entries] loadfile ids {ids:?}; END_FILEs (entry, reason) {ends:?}");
         let all: Vec<i64> = ids.iter().flat_map(|&(a, b)| [a, b]).collect();
-        // Every END_FILE names an entry a loadfile returned, and every one of
-        // the replacing loadfiles' entries ends with an error of its own.
+        // Each loadfile returned a DISTINCT id (what lets the shell tell loads
+        // apart); every id came back Some (the shipped libmpv reports it).
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "loadfile returned a repeated entry id");
+        // Every END_FILE names an entry a loadfile returned (never a stray id).
         assert!(ends.iter().all(|(entry, _)| all.contains(entry)), "an END_FILE named an unknown entry");
-        for (_, second) in &ids {
-            assert!(
-                ends.iter().any(|&(entry, reason)| entry == *second && reason == MPV_END_FILE_REASON_ERROR),
-                "entry {second} has no error END_FILE of its own"
-            );
-        }
+        // Each loadfile REPLACES the previous, so only the last entry survives
+        // to actually fail; its error END_FILE must carry its own id. (Entries
+        // replaced before they start are dropped WITHOUT an END_FILE, which is
+        // exactly why counting or ordering END_FILEs could not attribute them -
+        // the id can.)
+        let last = ids.last().expect("three loads").1;
+        assert!(
+            ends.iter().any(|&(entry, reason)| entry == last && reason == MPV_END_FILE_REASON_ERROR),
+            "the surviving entry {last} has no error END_FILE of its own"
+        );
     }
 
     /// The stream_cb symbol is OPTIONAL: an absent one must degrade to "no

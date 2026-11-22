@@ -755,10 +755,24 @@ impl Controller {
             // The lock spans the loadfile: the entry's END_FILE (a byte-plane
             // refusal comes within milliseconds) waits for it to be recorded.
             let mut loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
+            // `?` here fails the load ONLY when mpv REJECTED the loadfile. An
+            // accepted load with no entry id (Ok(None)) is PLAYING - never fail
+            // it (that would show a dead player over a playing stream, the
+            // opposite regression). It is merely untrackable: its END_FILE will
+            // carry an entry we did not record, so a later error on it is not
+            // attributed. The shipped libmpv always returns the id, so this is
+            // a future/minimal-build guard; it is logged loud if ever hit.
             let entry = self.mpv.command_entry(&["loadfile", url, "replace"])?;
-            tracing::debug!("mpv loadfile url={url} start={start:?} entry={entry} load={load_id:?}");
-            if let Some(load_id) = load_id {
-                loads.record(entry, load_id);
+            tracing::debug!("mpv loadfile url={url} start={start:?} entry={entry:?} load={load_id:?}");
+            match (entry, load_id) {
+                (Some(entry), Some(load_id)) => loads.record(entry, load_id),
+                (None, Some(load_id)) => tracing::error!(
+                    "mpv accepted loadfile url={url} (load {load_id}) but returned no \
+                     playlist_entry_id; it is playing but untrackable, a later error on it \
+                     will not be attributed (libmpv too old for mpv_command_ret's entry id)"
+                ),
+                // No web load id (a shell-internal loadfile, if any): nothing to track.
+                (_, None) => {}
             }
             return Ok(());
         }
