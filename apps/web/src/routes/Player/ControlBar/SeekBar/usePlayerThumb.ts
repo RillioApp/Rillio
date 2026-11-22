@@ -68,6 +68,11 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, di
     useEffect(() => {
         frames.clear();
         never.current = null;
+        // Guard the async warm-up the same way the hover effect guards its
+        // poll: the previous stream's warm-up can resolve AFTER a switch, and
+        // without this it would write the OLD stream's `never` into this
+        // stream's ref and silently disable the NEW stream's previews.
+        let cancelled = false;
         const t = getTauri();
         // Warm the shadow up front: the FIRST hover otherwise pays the whole
         // shadow spawn (dll load + loadfile + first keyframe seek, ~1s) before
@@ -77,12 +82,14 @@ const usePlayerThumb = (streamUrl: string | null, hoverTimeMs: number | null, di
         if (typeof streamUrl === 'string' && t?.core?.invoke) {
             t.core.invoke('player_thumb', { url: streamUrl, timeSec: 0, widthPx: capturePixels(displayWidthRem) })
                 .then((answer: unknown) => {
+                    if (cancelled) return;
                     const read = readThumbAnswer(answer);
                     if (read.never !== null) never.current = read.never;
                 })
                 .catch((e: unknown) => console.warn('usePlayerThumb: warm-up', e));
         }
         return () => {
+            cancelled = true;
             t?.core?.invoke?.('player_thumb_stop').catch(() => { /* shell-only */ });
         };
     }, [streamUrl, displayWidthRem, frames]);
