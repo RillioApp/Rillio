@@ -676,6 +676,23 @@ const RETIREMENTS_QUEUED: usize = 1;
 /// of 46 s spent in a dropped shadow's teardown). A `Shadow` drops there whole,
 /// in its own field order (its mpv before the hidden window that mpv renders
 /// into), exactly as it would inline.
+///
+/// Lifetime and locks, stated because a teardown here runs while a caller may
+/// hold `Inner`'s lock waiting for queue space:
+/// - In a `Shadow`, `mpv` drops before `_window`. `Mpv::drop` calls
+///   `mpv_terminate_destroy` and then takes only its own `stream_cb_user_data`
+///   mutex, private to that `Mpv`. A shadow registers no stream protocol (it
+///   reads HTTP), and mpv's log lines reach it as events it polls
+///   (`check_load`), never as callbacks, so mpv's teardown calls back into
+///   none of our code. `HiddenWindow::drop` then signals the window's OWN
+///   pump thread and joins it, on this retirement thread, after mpv is gone.
+/// - A `Shadow` owns no `Arc<Mutex<Inner>>` and nothing that leads to one, so
+///   no teardown can need the lock a caller holds while it waits for room in
+///   the queue: backpressure cannot deadlock.
+/// - Shutdown: the retirement thread is detached. At process exit, a teardown
+///   in progress and any queued shadow die with the process instead of being
+///   torn down: the OS reclaims their memory, handles and GPU context. Nothing
+///   is persisted by a shadow, so nothing is lost.
 struct Retirer {
     /// `None` when the retirement thread could not start: teardown inline.
     queue: Option<std::sync::mpsc::SyncSender<Box<dyn Send>>>,
