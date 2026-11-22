@@ -594,27 +594,30 @@ enum Settle {
     Yielded,
 }
 
-/// THE decision on a seek mpv accepted that did not settle in its budget, from
-/// mpv's `demuxer-cache-state` (JSON) at that moment: `TimedOut` (drop the
-/// shadow) only when the demuxer is starved (`underrun`: waiting for bytes with
-/// none buffered), the stuck read the drop exists for; `Busy` (keep it) when it
-/// is not, because then the bytes are there and only the decode or the VO is
-/// slow. Measured 2026-11-22 in the running shell under GPU load: every
-/// not-settled DV seek had `vo-configured=no` with `underrun: false`, the cache
-/// 11 s past the target and 33 MB ahead; the one starved state was a first open
-/// with 0 bytes read (`underrun: true`). An unreadable state counts as starved:
-/// a dropped shadow is the self-correcting way to be wrong.
+/// THE decision on a seek to `target` (seconds) that mpv accepted and that did
+/// not settle in its budget, from mpv's `demuxer-cache-state` (JSON) at that
+/// moment. `Busy` (keep the shadow) only when the bytes for the target are
+/// already demuxed: not starved (`underrun: false`) AND the cache reaching the
+/// target (`cache-end >= target`), so all that is left is the decode or the VO.
+/// Anything else is `TimedOut` (drop it): a starved read, a read still on its
+/// way to the target (it may be blocked on bytes that never come), or a state
+/// that cannot be read. A dropped shadow is the self-correcting way to be
+/// wrong. Measured 2026-11-22 in the running shell under GPU load: every
+/// not-settled DV seek had `vo-configured=no`, `underrun: false` and the cache
+/// 11 s past the target with 33 MB ahead; the one starved state was a first
+/// open with 0 bytes read (`underrun: true`).
 ///
-/// No deadline bounds `Busy`: bytes in hand are not an external wait, and a VO
-/// or decoder that cannot go on ends the load in error, which
+/// No deadline bounds `Busy`: the target's bytes in hand are not an external
+/// wait, and a VO or decoder that cannot go on ends the load in error, which
 /// [`Shadow::check_load`] reports (a dead VO is a refusal, not a hang).
-fn unsettled(demuxer_cache_state: Option<&str>) -> Settle {
-    let underrun = demuxer_cache_state
-        .and_then(|state| serde_json::from_str::<serde_json::Value>(state).ok())
-        .and_then(|state| state.get("underrun").and_then(serde_json::Value::as_bool));
-    match underrun {
-        Some(false) => Settle::Busy,
-        Some(true) | None => Settle::TimedOut,
+fn unsettled(demuxer_cache_state: Option<&str>, target: f64) -> Settle {
+    let state = demuxer_cache_state.and_then(|state| serde_json::from_str::<serde_json::Value>(state).ok());
+    let field = |name: &str| state.as_ref().and_then(|state| state.get(name).cloned());
+    let starved = field("underrun").and_then(|v| v.as_bool());
+    let cached_to = field("cache-end").and_then(|v| v.as_f64());
+    match (starved, cached_to) {
+        (Some(false), Some(end)) if end >= target => Settle::Busy,
+        _ => Settle::TimedOut,
     }
 }
 
@@ -1070,7 +1073,7 @@ impl Shadow {
             }
         }
         let cache_state = self.mpv.get_property_string("demuxer-cache-state");
-        let verdict = unsettled(cache_state.as_deref());
+        let verdict = unsettled(cache_state.as_deref(), target);
         tracing::debug!(
             "thumbs: seek to {target:.1}s not settled in {SEEK_SETTLE_MS} ms ({verdict:?}): vo-configured={:?} \
              demuxer-cache-state={}",
@@ -1779,27 +1782,33 @@ mod tests {
         assert_eq!(inner.conversion, None);
     }
 
-    /// A seek that did not settle drops its shadow only when the demuxer is
-    /// starved. The states are mpv's own, recorded in the running shell
-    /// 2026-11-22 (trimmed to the fields that decide).
+    /// A seek that did not settle keeps its shadow only when the target's
+    /// bytes are already demuxed (not starved, cache reaching the target). The
+    /// states are mpv's own, recorded in the running shell 2026-11-22 (trimmed
+    /// to the fields that decide).
     #[test]
-    fn only_a_starved_read_drops_the_shadow() {
-        // A gpu-next shadow still configuring its VO: bytes 11 s past the target.
+    fn only_a_target_already_cached_keeps_the_shadow() {
+        // A gpu-next shadow still configuring its VO after a seek to 4 s: the
+        // bytes 11 s past the target. Kept.
         let vo_configuring = r#"{"cache-end":14.515,"reader-pts":3.087,"cache-duration":11.428,"eof":false,
             "underrun":false,"idle":true,"total-bytes":43703136,"fw-bytes":33580160,"raw-input-rate":2492470}"#;
-        assert_eq!(unsettled(Some(vo_configuring)), Settle::Busy);
-        // Still reading toward the target, not starved: progressing.
+        assert_eq!(unsettled(Some(vo_configuring), 4.0), Settle::Busy);
+        // The same cache after a seek past what it holds: the target's bytes
+        // are not here, so the read may be stuck. Dropped.
+        assert_eq!(unsettled(Some(vo_configuring), 20.0), Settle::TimedOut);
+        // Not starved but still reading toward a 4 s target (cache to 0.5 s):
+        // it may be blocked on bytes that never come. Dropped.
         let reading = r#"{"cache-end":0.501,"reader-pts":0.0,"cache-duration":0.501,"eof":false,
             "underrun":false,"idle":false,"total-bytes":2341936,"fw-bytes":2341936}"#;
-        assert_eq!(unsettled(Some(reading)), Settle::Busy);
+        assert_eq!(unsettled(Some(reading), 4.0), Settle::TimedOut);
         // Waiting for bytes with none buffered: the stuck read.
         let starved = r#"{"cache-duration":0.0,"eof":false,"underrun":true,"idle":false,"total-bytes":0,
             "fw-bytes":0,"seekable-ranges":[]}"#;
-        assert_eq!(unsettled(Some(starved)), Settle::TimedOut);
+        assert_eq!(unsettled(Some(starved), 0.0), Settle::TimedOut);
         // Nothing readable is treated as starved: dropping is the safe mistake.
-        assert_eq!(unsettled(None), Settle::TimedOut);
-        assert_eq!(unsettled(Some("not json")), Settle::TimedOut);
-        assert_eq!(unsettled(Some(r#"{"idle":true}"#)), Settle::TimedOut);
+        assert_eq!(unsettled(None, 0.0), Settle::TimedOut);
+        assert_eq!(unsettled(Some("not json"), 0.0), Settle::TimedOut);
+        assert_eq!(unsettled(Some(r#"{"underrun":false}"#), 0.0), Settle::TimedOut);
     }
 
     /// The renderer picks the decoder: GPU decode copied back before the
@@ -2374,7 +2383,15 @@ mod tests {
         loop {
             match checked_capture(shadow, &url, 0.0, &|| false, |_| ()) {
                 Captured::Frame(s, ..) => { shadow = s; break; }
-                Captured::Skipped(s) | Captured::Replaced(s, _) | Captured::Yielded(s) => shadow = s,
+                Captured::Skipped(s) | Captured::Replaced(s, _) | Captured::Yielded(s) => {
+                    let p = |n: &str| s.mpv.get_property_string(n).unwrap_or_else(|| "-".into());
+                    println!(
+                        "    head not shown yet: seeking={} time-pos={} video-params={} demuxer-cache-state={}",
+                        p("seeking"), p("time-pos"), p("video-params").chars().take(60).collect::<String>(),
+                        p("demuxer-cache-state"),
+                    );
+                    shadow = s
+                }
                 other => panic!("the served head did not open: {}", match other {
                     Captured::Parked => "parked".to_owned(),
                     Captured::Refused(r) | Captured::Lost { reason: r, .. } => r,
