@@ -311,6 +311,10 @@ struct Shadow {
     /// How this shadow's screenshots are rendered. Nothing is captured from a
     /// frame whose conversion this does not serve ([`checked_capture`]).
     render: Render,
+    /// The decoder asked of mpv ([`hwdec_for`]).
+    hwdec: &'static str,
+    /// Whether [`Shadow::note_decoder`] has looked yet.
+    decoder_noted: std::cell::Cell<bool>,
     /// mpv's latest error lines (a libplacebo shadow asks for them), for the
     /// refusal that says why gpu-next could not show the stream.
     mpv_errors: std::cell::RefCell<Vec<String>>,
@@ -706,6 +710,7 @@ fn checked_capture<T>(
     }
     match step_for(shadow.frame_conversion(), shadow.render) {
         Step::Capture(conversion) => {
+            shadow.note_decoder();
             let captured = capture(&shadow);
             Captured::Frame(shadow, conversion, captured)
         }
@@ -750,12 +755,49 @@ fn thumb_width(requested: u32) -> Result<u32, String> {
     Ok(requested.min(THUMB_WIDTH_MAX).next_multiple_of(2))
 }
 
+/// The decoder a shadow uses, decided by its renderer (never by the file).
+///
+/// `d3d11va-copy` for the libplacebo shadow: the GPU decodes and the frame is
+/// copied back to RAM (p010) BEFORE the software scale, so the chain, the
+/// output size and the picture are exactly the software decode's. Measured
+/// 2026-11-22 (bench_hwdec, interleaved per time point under the same load):
+/// bit-identical screenshots (mean-RGB diff 0.000, same sizes) on DV p5, DV
+/// p8.1, HDR10 and HLG, at 0.40-0.43x the software time per capture for 4K DV
+/// (debug and release alike: the decode is libmpv's, not ours) and ~0.8x for
+/// 1080p HDR; open-to-first-frame medians no slower (the hardware decoder's
+/// ~250 ms init is paid back by the faster first 4K decode). Native `d3d11va`
+/// is NOT usable here: its frames stay D3D11 surfaces, which the software
+/// scale cannot touch, so mpv drops the filter and shows the full 4K frame
+/// (and FFmpeg's `scale_d3d11` fails to configure on them in the shipped
+/// libmpv).
+///
+/// `no` for the software shadow: with `vo=null` there is no GPU interop (mpv
+/// silently decodes in software anyway for `d3d11va`), and `d3d11va-copy`
+/// there was no faster for SDR (1.02x) and moved colour (nv12 path, 0.42
+/// mean-RGB), so SDR keeps the decode it always had.
+///
+/// If mpv cannot start the hardware decoder it decodes in software, which is
+/// the colour reference above: only slower, never wrong. [`Shadow::note_decoder`]
+/// says so loudly.
+fn hwdec_for(render: Render) -> &'static str {
+    match render {
+        Render::Software => "no",
+        Render::Libplacebo => "d3d11va-copy",
+    }
+}
+
 impl Shadow {
     /// A muted mpv over `url` whose decode chain outputs `width`, rendering its
-    /// screenshots as `render` says. Options follow Harbor's shadow flags;
-    /// `hr-seek=no` + keyframe seeks are the speed. [`checked_capture`]
-    /// confirms each frame wants this `render` before it is captured.
+    /// screenshots as `render` says, decoding as [`hwdec_for`] says. Options
+    /// follow Harbor's shadow flags; `hr-seek=no` + keyframe seeks are the
+    /// speed. [`checked_capture`] confirms each frame wants this `render`
+    /// before it is captured.
     fn spawn(url: &str, width: u32, render: Render) -> Result<Self, String> {
+        Self::spawn_decoding(url, width, render, hwdec_for(render))
+    }
+
+    /// [`Shadow::spawn`] with the decoder named (the benches compare them).
+    fn spawn_decoding(url: &str, width: u32, render: Render, hwdec: &'static str) -> Result<Self, String> {
         let window = match render {
             Render::Software => None,
             Render::Libplacebo => Some(HiddenWindow::create()?),
@@ -806,7 +848,7 @@ impl Shadow {
             ("load-scripts", "no"),
             ("ytdl", "no"),
             ("osc", "no"),
-            ("hwdec", "no"),
+            ("hwdec", hwdec),
             ("cache", "yes"),
             ("demuxer-max-bytes", "32MiB"),
             ("hr-seek", "no"),
@@ -836,9 +878,30 @@ impl Shadow {
             mpv,
             width,
             render,
+            hwdec,
+            decoder_noted: std::cell::Cell::new(false),
             mpv_errors: std::cell::RefCell::new(Vec::new()),
             _window: window,
         })
+    }
+
+    /// Once per shadow, on its first captured frame: say loudly when mpv is not
+    /// decoding with the hardware decoder asked for. The frame is still right
+    /// (mpv's fallback is the software decode, the colour reference of
+    /// [`hwdec_for`]); only its time is the software one.
+    fn note_decoder(&self) {
+        if self.hwdec == "no" || self.decoder_noted.replace(true) {
+            return;
+        }
+        let current = self.mpv.get_property_string("hwdec-current");
+        if current.as_deref() != Some(self.hwdec) {
+            tracing::warn!(
+                "thumbs: asked for hwdec={} but mpv decodes with {:?}; previews stay correct \
+                 (software decode) but slower",
+                self.hwdec,
+                current.as_deref().unwrap_or("nothing"),
+            );
+        }
     }
 
     /// What the frame mpv holds right now needs ([`conversion_for`] over what
@@ -1663,6 +1726,16 @@ mod tests {
         assert_eq!(inner.conversion, None);
     }
 
+    /// The renderer picks the decoder: GPU decode copied back before the
+    /// software scale for libplacebo (bit-identical to software decode,
+    /// bench_hwdec), never native d3d11va (its surfaces skip the scale:
+    /// full-size screenshots); software decode for the SDR software shadow.
+    #[test]
+    fn the_renderer_chooses_the_decoder() {
+        assert_eq!(hwdec_for(Render::Libplacebo), "d3d11va-copy");
+        assert_eq!(hwdec_for(Render::Software), "no");
+    }
+
     /// The player's own video-params pick the first renderer, so an HDR or
     /// Dolby Vision stream opens libplacebo at once instead of starting
     /// software and respawning on the first frame (the double open). The same
@@ -2108,6 +2181,226 @@ mod tests {
         }
         assert!(kept_at_least_once, "a still-opening shadow must be kept across the first budgets");
         assert!(retired, "a never-opening shadow must be retired after the cumulative deadline, not kept forever");
+    }
+
+    /// The evidence for [`hwdec_for`]. Per file, on the player's own hinted
+    /// renderer, capture with hwdec=no (software decode, the colour reference)
+    /// and with each candidate hwdec, INTERLEAVED per time point (so the
+    /// owner's live GPU/CPU load lands on every arm alike). Reports each arm's
+    /// open-to-first-frame and per-capture ms, the paired per-point ratio to
+    /// software, and the mean per-channel RGB difference to software's image -
+    /// the colour MUST NOT move (the shipped choice measured 0.000; the earlier
+    /// SW-vs-filter noise floor was DV ~1.9, SDR ~0.7). Needs `libmpv-2.dll` and:
+    ///   RILLIO_THUMBS_BENCH_FILES  the videos, separated by `;`
+    ///   RILLIO_THUMBS_BENCH_WIDTH  the thumbnail width (default 640)
+    ///   RILLIO_THUMBS_HWDEC_CANDIDATES  the hwdecs to test, `;` separated
+    ///                                   (default `d3d11va-copy`; native
+    ///                                   `d3d11va` fails the size check: its
+    ///                                   D3D11 surfaces bypass the software
+    ///                                   scale and mpv shows the full frame)
+    ///   RILLIO_THUMBS_BENCH_OUT  optional directory to keep every jpg in
+    /// A candidate FAILS (the test panics at the end, after every file is
+    /// reported) when any image size differs from software's (a different size
+    /// is itself a behaviour change, and no colour diff is defined across it),
+    /// or when mpv did not actually decode with it (`hwdec-current` = no: the
+    /// timing would be software's).
+    /// Run: `cargo test --lib thumbs::tests::bench_hwdec -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll and RILLIO_THUMBS_BENCH_FILES"]
+    fn bench_hwdec() {
+        const SAMPLES: u32 = 8;
+        const ROUNDS: u32 = 2;
+        const OPEN_REPS: usize = 6;
+        let files = std::env::var("RILLIO_THUMBS_BENCH_FILES").expect("RILLIO_THUMBS_BENCH_FILES");
+        let width = thumb_width(
+            std::env::var("RILLIO_THUMBS_BENCH_WIDTH").ok().and_then(|w| w.trim().parse().ok()).unwrap_or(640),
+        )
+        .expect("a usable width");
+        let candidates: Vec<String> = std::env::var("RILLIO_THUMBS_HWDEC_CANDIDATES")
+            .unwrap_or_else(|_| "d3d11va-copy".to_string())
+            .split(';')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let out = std::env::var("RILLIO_THUMBS_BENCH_OUT").ok().map(std::path::PathBuf::from);
+        if let Some(dir) = &out {
+            std::fs::create_dir_all(dir).expect("the output directory");
+        }
+        let mut failures: Vec<String> = Vec::new();
+
+        // One arm = one hwdec, on the renderer the player's frames call for.
+        let spawn_arm = |file: &str, render: Render, arm: &str| -> Shadow {
+            let hwdec: &'static str = Box::leak(arm.to_owned().into_boxed_str());
+            Shadow::spawn_decoding(file, width, render, hwdec).expect("spawn")
+        };
+        // One capture at `time` on `shadow` through the worker's checked path:
+        // its ms and the decoded RGB pixels. A generous deadline: a 4K software
+        // decode under live GPU contention (the owner working) can run many
+        // seconds, and here that is slowness to measure, not a failure.
+        const HWDEC_CAPTURE_MS: u64 = 60_000;
+        let capture_one = |mut shadow: Shadow, file: &str, arm: &str, time: f64| -> (Shadow, f64, Vec<u8>) {
+            let t = Instant::now();
+            let deadline = t + Duration::from_millis(HWDEC_CAPTURE_MS);
+            let mut parked = 0;
+            let jpeg = loop {
+                let render = shadow.render;
+                match checked_capture(shadow, file, time, &|| false, Shadow::capture_bytes) {
+                    Captured::Frame(s, _c, jpeg) => {
+                        shadow = s;
+                        break jpeg.expect("capture");
+                    }
+                    Captured::Replaced(s, _) => shadow = s,
+                    Captured::Skipped(s) | Captured::Yielded(s) => {
+                        assert!(Instant::now() < deadline, "{file} arm {arm} at {time:.1}s never captured (parked {parked}x)");
+                        shadow = s;
+                    }
+                    Captured::Parked => {
+                        parked += 1;
+                        println!("     {arm} at {time:.1}s: seek did not settle in {SEEK_SETTLE_MS} ms, shadow dropped ({parked}x)");
+                        assert!(Instant::now() < deadline, "{file} arm {arm} at {time:.1}s never captured (parked {parked}x)");
+                        shadow = spawn_arm(file, render, arm);
+                    }
+                    Captured::Refused(reason) | Captured::Lost { reason, .. } => panic!("{file} arm {arm}: {reason}"),
+                }
+            };
+            (shadow, t.elapsed().as_secs_f64() * 1000.0, jpeg)
+        };
+        let decode = |jpeg: &[u8]| {
+            image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).expect("jpg").to_rgb8()
+        };
+
+        // Mean per-channel absolute difference between two images of the SAME
+        // size (the caller has checked; there is no diff across sizes).
+        let mean_rgb_diff = |a: &image::RgbImage, b: &image::RgbImage| -> f64 {
+            assert_eq!(a.dimensions(), b.dimensions(), "mean_rgb_diff across sizes");
+            let (sum, n) = a.pixels().zip(b.pixels()).fold((0u64, 0u64), |(s, n), (p, q)| {
+                (s + p.0.iter().zip(q.0).map(|(x, y)| x.abs_diff(y) as u64).sum::<u64>(), n + 3)
+            });
+            sum as f64 / n as f64
+        };
+
+        // Arm 0 is the reference: software decode, software scale.
+        let arms: Vec<String> = std::iter::once("no".to_string()).chain(candidates.iter().cloned()).collect();
+        for file in files.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+            let stem = std::path::Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or(file);
+            // The renderer the player uses for this file (libplacebo for DV/HDR).
+            // Decide it from a gpu-next probe, waiting for the colour to SETTLE:
+            // a DV stream reports colormatrix "dolbyvision" only once the VO has
+            // the RPU, so reading it once (before that) misclassifies DV as SDR.
+            let probe = Shadow::spawn(file, width, Render::Libplacebo).expect("probe");
+            let _ = probe.seek_settled(0.0, &|| false);
+            let deadline = Instant::now() + Duration::from_millis(BENCH_OPEN_MS);
+            let (duration, render) = loop {
+                let d = probe.duration();
+                let params = probe.mpv.get_property_string("video-params");
+                let profile = probe.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
+                let hint = initial_render(params.as_deref(), profile.as_deref());
+                if let (Some(d), Some(render)) = (d, hint) {
+                    break (d, render);
+                }
+                assert!(Instant::now() < deadline, "{stem} never reported duration + colour");
+                std::thread::sleep(SETTLE_POLL);
+            };
+            drop(probe);
+
+            // INTERLEAVED: every arm keeps its own warm shadow, and each time
+            // point is captured by every arm back to back (order rotated per
+            // point), so the owner's live GPU/CPU load lands on all arms alike.
+            // Each round uses its own time points (no demuxer-cache reuse).
+            let step = duration / f64::from(SAMPLES * ROUNDS + 1);
+            let times: Vec<f64> = (1..=SAMPLES * ROUNDS).map(|i| step * f64::from(i)).collect();
+            // Open-to-first-frame per arm (spawn + first capture at 0, the
+            // first-hover cost), OPEN_REPS times, arms alternated.
+            let mut open_ms: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+            for rep in 0..OPEN_REPS {
+                for k in 0..arms.len() {
+                    let a = (rep + k) % arms.len();
+                    let t = Instant::now();
+                    let (s, _, _) = capture_one(spawn_arm(file, render, &arms[a]), file, &arms[a], 0.0);
+                    open_ms[a].push(t.elapsed().as_secs_f64() * 1000.0);
+                    drop(s);
+                }
+            }
+            let mut shadows: Vec<Option<Shadow>> = arms.iter().map(|arm| Some(spawn_arm(file, render, arm))).collect();
+            // Warm every arm on a first frame (open cost is measured above).
+            for (a, arm) in arms.iter().enumerate() {
+                let (s, _, _) = capture_one(shadows[a].take().unwrap(), file, arm, 0.0);
+                shadows[a] = Some(s);
+            }
+            let mut ms: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+            let mut imgs: Vec<Vec<image::RgbImage>> = vec![Vec::new(); arms.len()];
+            for (i, &time) in times.iter().enumerate() {
+                for k in 0..arms.len() {
+                    let a = (i + k) % arms.len();
+                    let (s, took, jpeg) = capture_one(shadows[a].take().unwrap(), file, &arms[a], time);
+                    shadows[a] = Some(s);
+                    ms[a].push(took);
+                    if let Some(dir) = &out {
+                        std::fs::write(dir.join(format!("{stem}-{}-{i:02}.jpg", arms[a])), &jpeg).expect("writing the jpg");
+                    }
+                    imgs[a].push(decode(&jpeg));
+                }
+            }
+            let state: Vec<String> = shadows
+                .iter()
+                .map(|s| {
+                    let s = s.as_ref().unwrap();
+                    let prop = |name: &str| s.mpv.get_property_string(name).unwrap_or_else(|| "-".into());
+                    let vop: serde_json::Value = serde_json::from_str(&prop("video-out-params")).unwrap_or_default();
+                    format!(
+                        "hwdec-current={} vo-params: {} {}x{} chroma-location={}",
+                        prop("hwdec-current"),
+                        vop["pixelformat"],
+                        vop["w"],
+                        vop["h"],
+                        vop["chroma-location"],
+                    )
+                })
+                .collect();
+            drop(shadows);
+
+            println!("== {stem} ({render:?}), {} interleaved captures per arm at {width}px", times.len());
+            for (a, arm) in arms.iter().enumerate() {
+                // Per point, this arm's time over software's at the same point
+                // (same moment, same load): the contention-robust comparison.
+                let mut ratio: Vec<f64> = ms[a].iter().zip(&ms[0]).map(|(x, sw)| x / sw).collect();
+                let (med, p95) = median_p95(&mut ms[a].clone());
+                let (ratio_med, _) = median_p95(&mut ratio);
+                let sizes: std::collections::BTreeSet<_> = imgs[a].iter().map(|i| i.dimensions()).collect();
+                let opens: Vec<String> = open_ms[a].iter().map(|m| format!("{m:.0}")).collect();
+                let (open_med, _) = median_p95(&mut open_ms[a].clone());
+                println!(
+                    "  {arm}: median {med:.0} ms, p95 {p95:.0} ms, paired ratio vs no {ratio_med:.2}; sizes {sizes:?}; \
+                     open-to-first-frame median {open_med:.0} ms, all [{}]",
+                    opens.join(", ")
+                );
+                println!("     {}", state[a]);
+                if a == 0 {
+                    continue;
+                }
+                if state[a].starts_with("hwdec-current=no") || state[a].starts_with("hwdec-current=-") {
+                    failures.push(format!("{stem}/{arm}: mpv did not decode with it ({})", state[a]));
+                }
+                let mismatched: Vec<String> = imgs[0]
+                    .iter()
+                    .zip(&imgs[a])
+                    .enumerate()
+                    .filter(|(_, (x, y))| x.dimensions() != y.dimensions())
+                    .map(|(i, (x, y))| format!("#{i} {:?} vs {:?}", x.dimensions(), y.dimensions()))
+                    .collect();
+                if !mismatched.is_empty() {
+                    println!("  {arm}: SIZE MISMATCH vs software: {} of {}", mismatched.len(), times.len());
+                    failures.push(format!("{stem}/{arm}: size differs from software: {}", mismatched[0]));
+                    continue;
+                }
+                let diffs: Vec<f64> = imgs[0].iter().zip(&imgs[a]).map(|(x, y)| mean_rgb_diff(x, y)).collect();
+                let worst = diffs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
+                println!("  {arm}: mean-RGB diff vs software: mean {mean:.3}, worst {worst:.3}");
+            }
+        }
+        assert!(failures.is_empty(), "hwdec candidates failed:\n{}", failures.join("\n"));
     }
 
     /// The median and the 95th percentile (nearest rank) of `millis`.
