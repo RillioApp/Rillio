@@ -82,6 +82,45 @@ function load(video, ih = IH, idx = 5) {
 
 const destroy = (video) => video.dispatch({ type: 'command', commandName: 'destroy' });
 
+test('a superseded visit, torn down, drives nothing on the shared mpv', async () => {
+    // The shell has ONE mpv. When a new player visit (B) takes over, the old
+    // visit (A) being destroyed must not send `stop` (or anything) to it: that
+    // would halt B's playback on the shared instance. A resets only its own
+    // state. (Measured risk: A.destroy -> command('unload') -> stop -> B stops.)
+    const shell = fakeShell();
+    const a = build(shell);
+    load(a.video, IH, 5);
+    await flush();
+    const b = build(shell); // attaching B detaches A (the singleton owner moves)
+    load(b.video, IH2, 1);
+    await flush();
+    const stopsBefore = stops(shell);
+    const loadfilesBefore = loadfiles(shell).length;
+
+    destroy(a.video);
+    expect(stops(shell)).toBe(stopsBefore);
+    expect(loadfiles(shell).length).toBe(loadfilesBefore);
+
+    // B is unharmed: its own load still retries over http on a byte-plane
+    // refusal, and A's teardown surfaced no error on B.
+    ended(shell, lastLoadId(shell), 'loading failed');
+    expect(loadfiles(shell).slice(-1)).toEqual([httpUrl(IH2, 1)]);
+    expect(b.errors).toEqual([]);
+    expect(a.errors).toEqual([]);
+});
+
+test('the live visit still stops the shared mpv on a normal unload', async () => {
+    // The real single-visit case must keep working: a visit that is the owner
+    // stops mpv when the user navigates away with nothing after it.
+    const shell = fakeShell();
+    const { video } = build(shell);
+    load(video);
+    await flush();
+    const stopsBefore = stops(shell);
+    video.dispatch({ type: 'command', commandName: 'unload' });
+    expect(stops(shell)).toBe(stopsBefore + 1);
+});
+
 test('a cold byte-plane refusal retries once over http, and a failing retry is the error', async () => {
     const shell = fakeShell();
     const { video, errors } = build(shell);

@@ -85,6 +85,21 @@ function ShellVideo(options) {
     // here subscribes to the transport: mpv's events reach this instance only
     // while it is the attached player (see ShellChannel).
     var channel = ShellChannel.of(ipc);
+    // This visit's handle on the channel, and the gate on driving the one
+    // shared mpv: `drive` sends a command/prop ONLY while this visit is the
+    // attached owner. A superseded or destroyed visit resets its own state and
+    // emits its own prop updates (below), but must send nothing to mpv, or its
+    // teardown `stop` would halt the visit that took over. The handle is
+    // attached at the END of construction (see `channel.attach`); during
+    // construction this visit is not yet the owner, so its initial stop is not
+    // driven (the next load's `loadfile replace` resets mpv anyway).
+    var attachment = { onPropChange: onPropChange, onEndFile: onEndFile };
+    function drive() {
+        if (!channel.isAttached(attachment)) {
+            return;
+        }
+        ipc.send.apply(ipc, arguments);
+    }
     var observedProps = {};
     var props = {};
     // `buffering` is the OR of two independent mpv signals; track them
@@ -114,7 +129,7 @@ function ShellVideo(options) {
     var currentLoad = null;
     command('unload');
 
-    ipc.send('mpv-command', ['stop']);
+    drive('mpv-command', ['stop']);
 
     var events = new EventEmitter();
     var destroyed = false;
@@ -311,7 +326,7 @@ function ShellVideo(options) {
     // creates to `id` and puts that id on the entry's END_FILE.
     function startLoad(loadfileArgs, fallback) {
         currentLoad = { id: channel.nextLoadId(), fallback: fallback };
-        ipc.send('mpv-command', loadfileArgs, { loadId: currentLoad.id });
+        drive('mpv-command', loadfileArgs, { loadId: currentLoad.id });
     }
     function onEndFile(args) {
         // Another load's end: an older loadfile (superseded by a reload or an
@@ -337,7 +352,7 @@ function ShellVideo(options) {
                 // eslint-disable-next-line no-console
                 console.warn('ShellVideo: rillio:// load failed (' + String(args.error) + '), retrying over http');
                 startLoad(load.fallback, null);
-                ipc.send('mpv-set-prop', ['pause', false]);
+                drive('mpv-set-prop', ['pause', false]);
                 return;
             }
             // mpv reports a bare string ("loading failed"). Playback cannot
@@ -393,7 +408,7 @@ function ShellVideo(options) {
         switch (propName) {
             case 'paused': {
                 if (stream !== null) {
-                    ipc.send('mpv-set-prop', ['pause', propValue]);
+                    drive('mpv-set-prop', ['pause', propValue]);
                     // Reflect the new state immediately instead of waiting for the
                     // mpv -> IPC round-trip (like volume/muted/videoScale below do).
                     // Otherwise the play/pause icon and the controls auto-hide
@@ -407,14 +422,14 @@ function ShellVideo(options) {
             }
             case 'time': {
                 if (stream !== null && propValue !== null && isFinite(propValue)) {
-                    ipc.send('mpv-set-prop', ['time-pos', propValue/1000]);
+                    drive('mpv-set-prop', ['time-pos', propValue/1000]);
                 }
 
                 break;
             }
             case 'playbackSpeed': {
                 if (stream !== null && propValue !== null && isFinite(propValue)) {
-                    ipc.send('mpv-set-prop', ['speed', propValue]);
+                    drive('mpv-set-prop', ['speed', propValue]);
                 }
                 break;
             }
@@ -422,16 +437,16 @@ function ShellVideo(options) {
                 if (stream !== null) {
                     switch (propValue) {
                         case 'cover':
-                            ipc.send('mpv-set-prop', ['keepaspect', true]);
-                            ipc.send('mpv-set-prop', ['panscan', 1.0]);
+                            drive('mpv-set-prop', ['keepaspect', true]);
+                            drive('mpv-set-prop', ['panscan', 1.0]);
                             break;
                         case 'fill':
-                            ipc.send('mpv-set-prop', ['keepaspect', false]);
-                            ipc.send('mpv-set-prop', ['panscan', 0.0]);
+                            drive('mpv-set-prop', ['keepaspect', false]);
+                            drive('mpv-set-prop', ['panscan', 0.0]);
                             break;
                         default:
-                            ipc.send('mpv-set-prop', ['keepaspect', true]);
-                            ipc.send('mpv-set-prop', ['panscan', 0.0]);
+                            drive('mpv-set-prop', ['keepaspect', true]);
+                            drive('mpv-set-prop', ['panscan', 0.0]);
                             break;
                     }
                     props.videoScale = propValue;
@@ -442,8 +457,8 @@ function ShellVideo(options) {
             case 'volume': {
                 if (stream !== null && propValue !== null && isFinite(propValue)) {
                     props.mute = false;
-                    ipc.send('mpv-set-prop', ['mute', 'no']);
-                    ipc.send('mpv-set-prop', ['volume', propValue]);
+                    drive('mpv-set-prop', ['mute', 'no']);
+                    drive('mpv-set-prop', ['volume', propValue]);
                     onPropChanged('muted');
                     onPropChanged('volume');
                 }
@@ -451,7 +466,7 @@ function ShellVideo(options) {
             }
             case 'muted': {
                 if (stream !== null) {
-                    ipc.send('mpv-set-prop', ['mute', propValue ? 'yes' : 'no']);
+                    drive('mpv-set-prop', ['mute', propValue ? 'yes' : 'no']);
                     props.mute = propValue;
                     onPropChanged('muted');
                 }
@@ -460,7 +475,7 @@ function ShellVideo(options) {
             case 'selectedAudioTrackId': {
                 if (stream !== null) {
                     var actualId = propValue.slice('EMBEDDED_'.length);
-                    ipc.send('mpv-set-prop', ['aid', actualId]);
+                    drive('mpv-set-prop', ['aid', actualId]);
                 }
                 break;
             }
@@ -468,11 +483,11 @@ function ShellVideo(options) {
                 if (stream !== null) {
                     if(propValue) {
                         var actualId = propValue.slice('EMBEDDED_'.length);
-                        ipc.send('mpv-set-prop', ['sid', actualId]);
+                        drive('mpv-set-prop', ['sid', actualId]);
                         events.emit('subtitlesTrackLoaded', propValue);
                     } else {
                         // turn off subs
-                        ipc.send('mpv-set-prop', ['sid', 'no']);
+                        drive('mpv-set-prop', ['sid', 'no']);
                         props.sid = null;
                     }
                 }
@@ -480,7 +495,7 @@ function ShellVideo(options) {
                 break;
             }
             case 'subtitlesSize': {
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue * SUBS_SCALE_FACTOR]);
+                drive('mpv-set-prop', [stremioToMPVProps[propName], propValue * SUBS_SCALE_FACTOR]);
                 break;
             }
             case 'subtitlesDelay':
@@ -490,12 +505,12 @@ function ShellVideo(options) {
                 // the raw value here would have set a 250ms nudge to 250 SECONDS,
                 // which is why embedded-track delay was never wired before.
                 if (propValue !== null && isFinite(propValue)) {
-                    ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue / 1000]);
+                    drive('mpv-set-prop', [stremioToMPVProps[propName], propValue / 1000]);
                 }
                 break;
             }
             case 'subtitlesOffset': {
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], 100 - propValue]);
+                drive('mpv-set-prop', [stremioToMPVProps[propName], 100 - propValue]);
                 break;
             }
             case 'subtitlesTextColor':
@@ -504,7 +519,7 @@ function ShellVideo(options) {
             {
                 // MPV accepts color in #AARRGGBB
                 var argb = propValue.replace(/^#(\w{6})(\w{2})$/, '#$2$1');
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], argb]);
+                drive('mpv-set-prop', [stremioToMPVProps[propName], argb]);
                 break;
             }
             default: {
@@ -542,28 +557,28 @@ function ShellVideo(options) {
                         }
 
                         var subAssOverride = commandArgs.assSubtitlesStyling ? 'strip' : 'no';
-                        ipc.send('mpv-set-prop', ['sub-ass-override', subAssOverride]);
+                        drive('mpv-set-prop', ['sub-ass-override', subAssOverride]);
 
                         var gpuProcessing = !!commandArgs.gpuVideoProcessing &&
                             !!commandArgs.hardwareDecoding;
 
                         // Hardware decoding
                         var hwdecValue = commandArgs.hardwareDecoding ? (gpuProcessing ? 'd3d11va' : 'auto-copy') : 'no';
-                        ipc.send('mpv-set-prop', ['hwdec', hwdecValue]);
+                        drive('mpv-set-prop', ['hwdec', hwdecValue]);
 
                         // GPU video processing
                         if (typeof commandArgs.gpuVideoProcessing === 'boolean') {
-                            ipc.send('mpv-set-gpu-video-processing', gpuProcessing);
+                            drive('mpv-set-gpu-video-processing', gpuProcessing);
                         }
 
                         // Video output
                         var videoOutput = commandArgs.platform === 'windows' ? (commandArgs.videoMode === null ? 'gpu-next' : 'gpu') : 'libmpv';
-                        ipc.send('mpv-set-prop', ['vo', videoOutput]);
+                        drive('mpv-set-prop', ['vo', videoOutput]);
 
                         var separateWindow = options.mpvSeparateWindow ? 'yes' : 'no';
-                        ipc.send('mpv-set-prop', ['osc', separateWindow]);
-                        ipc.send('mpv-set-prop', ['input-default-bindings', separateWindow]);
-                        ipc.send('mpv-set-prop', ['input-vo-keyboard', separateWindow]);
+                        drive('mpv-set-prop', ['osc', separateWindow]);
+                        drive('mpv-set-prop', ['input-default-bindings', separateWindow]);
+                        drive('mpv-set-prop', ['input-vo-keyboard', separateWindow]);
 
                         var startAt = Math.floor(parseInt(commandArgs.time, 10) / 1000) || 0;
                         var loadfileArgs;
@@ -580,17 +595,17 @@ function ShellVideo(options) {
                             loadfileArgs.map(function(arg) { return arg === loadURL ? stream.url : arg; })
                             :
                             null);
-                        ipc.send('mpv-set-prop', ['sid', 'no']);
-                        ipc.send('mpv-set-prop', ['pause', false]);
-                        ipc.send('mpv-set-prop', ['speed', props.speed]);
+                        drive('mpv-set-prop', ['sid', 'no']);
+                        drive('mpv-set-prop', ['pause', false]);
+                        drive('mpv-set-prop', ['speed', props.speed]);
                         if (props.aid) {
                             if (typeof props.aid === 'string' && props.aid.startsWith('EMBEDDED_')) {
-                                ipc.send('mpv-set-prop', ['aid', props.aid.slice('EMBEDDED_'.length)]);
+                                drive('mpv-set-prop', ['aid', props.aid.slice('EMBEDDED_'.length)]);
                             } else {
-                                ipc.send('mpv-set-prop', ['aid', props.aid]);
+                                drive('mpv-set-prop', ['aid', props.aid]);
                             }
                         }
-                        ipc.send('mpv-set-prop', ['mute', 'no']);
+                        drive('mpv-set-prop', ['mute', 'no']);
 
                         onPropChanged('paused');
                         onPropChanged('time');
@@ -627,7 +642,7 @@ function ShellVideo(options) {
                 };
                 stall = { 'seeking': false, 'paused-for-cache': false };
                 avgDuration = 0;
-                ipc.send('mpv-command', ['stop']);
+                drive('mpv-command', ['stop']);
                 onPropChanged('loaded');
                 onPropChanged('stream');
                 onPropChanged('paused');
@@ -652,7 +667,8 @@ function ShellVideo(options) {
         }
     }
 
-    var attachment = { onPropChange: onPropChange, onEndFile: onEndFile };
+    // Become the owner now that this visit is fully built. Attaching detaches
+    // the previous visit, so from here its teardown drives nothing (see `drive`).
     channel.attach(attachment);
 
     this.on = function (eventName, listener) {

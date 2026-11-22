@@ -94,6 +94,14 @@ function ShellChannel(ipc) {
             attached = null;
         }
     };
+    // Whether `player` is the current owner. A visit may drive the one shared
+    // mpv (loadfile, stop, set-prop) ONLY while this is true: a superseded or
+    // torn-down visit that still sent `stop` would halt the live visit's
+    // playback on the shared instance (the cross-visit interference the
+    // singleton ends, at the command layer, not just the event layer).
+    this.isAttached = function(player) {
+        return attached === player;
+    };
     this.nextLoadId = function() {
         return nextLoadId++;
     };
