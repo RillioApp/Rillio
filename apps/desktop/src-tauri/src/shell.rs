@@ -177,8 +177,26 @@ impl LoadIds {
 
     fn record(&mut self, entry: i64, load: u64) {
         self.by_entry.insert(entry, load);
+        self.trim(i64::MAX);
+    }
+
+    /// Evict oldest entries down to CAP, but NEVER one with id >= `keep_from`:
+    /// those are a redirect's just-inserted children, and a load's own entries
+    /// must not evict each other (mpv entry ids only increase, so "oldest" is
+    /// "lowest id"). With `keep_from = i64::MAX` (a plain record) nothing is
+    /// protected and this is the ordinary oldest-first trim.
+    fn trim(&mut self, keep_from: i64) {
         while self.by_entry.len() > Self::CAP {
-            self.by_entry.pop_first();
+            match self.by_entry.keys().next().copied() {
+                Some(oldest) if oldest < keep_from => {
+                    self.by_entry.remove(&oldest);
+                }
+                // Only protected (just-inserted) entries remain: stop, rather
+                // than drop a child of the active redirect. The map may then
+                // sit above CAP until those children end - bounded by one
+                // redirect's child count, and Rillio's is 0 or 1 (below).
+                _ => break,
+            }
         }
     }
 
@@ -188,28 +206,20 @@ impl LoadIds {
     ///
     /// Rillio loads ONE media url per load (the rillio:// byte plane, an http
     /// stream, or a direct addon url), never a playlist, EDL or CUE, so a
-    /// redirect expands into at most one entry: `count` is 0 or 1, far under
-    /// CAP, and `record` never evicts a sibling of the same redirect. The
-    /// tripwire keeps that assumption loud instead of silent: were a future
-    /// playlist feature to expand into more than CAP entries at once,
-    /// `record`'s lowest-id eviction would drop the first-playing child and its
-    /// END_FILE would go unattributed. If this ever fires, record the whole
-    /// redirect under one key (or raise CAP for it) rather than per entry.
+    /// redirect expands into at most one entry and `count` is 0 or 1. Even so
+    /// the children are inserted together and trimmed as a protected range, so
+    /// a redirect larger than CAP could never evict its own first-playing
+    /// child (it would hold the map briefly above CAP instead): correct, not
+    /// merely warned about.
     fn end(&mut self, entry: i64, reason: std::ffi::c_int, inserted: (i64, std::ffi::c_int)) -> Option<u64> {
         let load = self.by_entry.remove(&entry)?;
         if reason == MPV_END_FILE_REASON_REDIRECT {
             let (first, count) = inserted;
-            if count as usize > Self::CAP {
-                tracing::error!(
-                    "mpv redirect expanded into {count} entries (> CAP {}); Rillio loads single \
-                     files and must not see this. The earliest children may be evicted and their \
-                     END_FILE go unattributed",
-                    Self::CAP
-                );
-            }
             for id in first..first + i64::from(count.max(0)) {
-                self.record(id, load);
+                self.by_entry.insert(id, load);
             }
+            // Trim older entries but never these children (id >= first).
+            self.trim(first);
         }
         Some(load)
     }
@@ -1898,6 +1908,29 @@ mod tests {
         assert_eq!(loads.by_entry.len(), LoadIds::CAP);
         assert_eq!(loads.end(999, 4, (0, 0)), Some(999), "the newest are kept");
         assert_eq!(loads.end(0, 4, (0, 0)), None);
+    }
+
+    /// A redirect larger than CAP must never evict its OWN first-playing child:
+    /// older entries go, the children stay (the map sits briefly above CAP).
+    /// Unreachable for Rillio's single-file streams, but correct if it ever is.
+    #[test]
+    fn a_redirect_never_evicts_its_own_children() {
+        let mut loads = LoadIds::default();
+        // Older entries from prior loads (low ids), a full cap of them.
+        for entry in 0..LoadIds::CAP as i64 {
+            loads.record(entry, 1);
+        }
+        // A redirect expanding into 2*CAP children (pathological).
+        let children = (LoadIds::CAP * 2) as i64;
+        loads.record(1000, 9);
+        assert_eq!(
+            loads.end(1000, MPV_END_FILE_REASON_REDIRECT, (1001, children as std::ffi::c_int)),
+            Some(9)
+        );
+        // Every child, the first-playing (1001) included, is still load 9's.
+        for id in 1001..1001 + children {
+            assert_eq!(loads.end(id, 4, (0, 0)), Some(9), "child {id} was evicted");
+        }
     }
 
     /// Every command ShellVideo actually sends over the bridge must pass.
