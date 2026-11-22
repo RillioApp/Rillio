@@ -2799,7 +2799,7 @@ mod tests {
     #[test]
     fn a_route_that_holds_its_thread_does_not_hold_the_callers_runtime() {
         use rillio_streaming_server::axum::{routing::get, Router};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         const HOLD: Duration = Duration::from_millis(1_500);
         let one_worker = || {
@@ -2818,27 +2818,37 @@ mod tests {
             }),
         );
         let engine_handle = engine.handle().clone();
-        let (worst, answer) = ui.block_on(async move {
+        let (ran_while_held, answer) = ui.block_on(async move {
             let request = tokio::spawn(async move {
                 dispatch_on_engine_runtime(&engine_handle, router, "GET".into(), "/held".into(), None).await
             });
-            // Stand-in for window commands arriving meanwhile: each is a task
-            // on the caller's runtime that must run promptly.
-            let started = Instant::now();
-            let mut worst = Duration::ZERO;
-            while started.elapsed() < HOLD {
-                let asked = Instant::now();
+            // Stand-in for window commands arriving meanwhile: tasks on the
+            // caller's runtime. Count how many complete WHILE the held route is
+            // still running (the request future still pending). A caller runtime
+            // frozen by the route (the bug: the route ran on the caller's single
+            // worker) would complete ~none until the hold ended; an isolated one
+            // completes many. This measures PROGRESS, not wall-clock latency, so
+            // CPU saturation only lowers the count, it never trips a time
+            // threshold - the old `worst < 300ms` flaked under load for that
+            // reason. The route's own HOLD is a real thread::sleep, so the
+            // request stays pending ~HOLD regardless of CPU, giving the caller a
+            // fixed wall-clock window to make progress in.
+            let mut ran_while_held = 0u32;
+            while !request.is_finished() {
                 tokio::spawn(async {}).await.expect("the stand-in command ran");
-                worst = worst.max(asked.elapsed());
+                ran_while_held += 1;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            (worst, request.await.expect("the request task"))
+            (ran_while_held, request.await.expect("the request task"))
         });
         assert_eq!(answer.expect("GET /held").body, "done");
+        // Normal isolation runs ~HOLD/10ms stand-ins (~150); a frozen caller
+        // runs 0-1. Five is far below the isolated count and far above the
+        // frozen one, so starvation cannot cross it either way.
         assert!(
-            worst < Duration::from_millis(300),
-            "a task on the caller's runtime waited {worst:?} while a route held its thread: \
-             the request ran on the caller's runtime instead of the engine's"
+            ran_while_held >= 5,
+            "the caller's runtime completed only {ran_while_held} tasks while a route held its \
+             thread: the request ran on the caller's runtime instead of the engine's"
         );
     }
 
