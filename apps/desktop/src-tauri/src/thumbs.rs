@@ -2163,33 +2163,76 @@ mod tests {
     /// (a third waits for room), so stalled teardowns cannot pile up.
     #[test]
     fn retiring_does_not_wait_for_the_teardown_and_is_bounded() {
-        struct SlowDrop(Duration, Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for SlowDrop {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::mpsc;
+        // Teardowns block on a gate the test opens, so what is asserted is
+        // ORDER (which retirement could return while a teardown was still
+        // running), never a duration a loaded machine stretches (the earlier
+        // 50 ms sleep + 300 ms bound failed at a merge gate under load).
+        type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+        struct GatedDrop {
+            gate: Gate,
+            started: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for GatedDrop {
             fn drop(&mut self) {
-                std::thread::sleep(self.0);
-                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.started.fetch_add(1, SeqCst);
+                let (open, opened) = &*self.gate;
+                let mut is_open = open.lock().unwrap();
+                while !*is_open {
+                    is_open = opened.wait(is_open).unwrap();
+                }
+                self.dropped.fetch_add(1, SeqCst);
             }
         }
-        const TEARDOWN: Duration = Duration::from_millis(600);
-        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let retirer = Retirer::new();
-        // The first is taken by the thread at once, the second waits in the
-        // queue: neither caller waits for a teardown.
-        let t = Instant::now();
-        retirer.retire(SlowDrop(TEARDOWN, dropped.clone()));
-        std::thread::sleep(Duration::from_millis(50)); // the thread takes it
-        retirer.retire(SlowDrop(TEARDOWN, dropped.clone()));
-        assert!(t.elapsed() < TEARDOWN / 2, "a retirement waited for a teardown: {:?}", t.elapsed());
-        // A third finds the queue full: it waits until the first is done.
-        let t = Instant::now();
-        retirer.retire(SlowDrop(TEARDOWN, dropped.clone()));
-        assert!(t.elapsed() >= TEARDOWN / 2, "outstanding retirements are not bounded: {:?}", t.elapsed());
-        // All of them are torn down in the end.
-        let until = Instant::now() + TEARDOWN * 6;
-        while dropped.load(std::sync::atomic::Ordering::SeqCst) < 3 {
-            assert!(Instant::now() < until, "a retired value was never dropped");
-            std::thread::sleep(Duration::from_millis(20));
+        // Only an upper bound for a hang, never the thing measured.
+        const WAIT: Duration = Duration::from_secs(30);
+        // How long the third retirement must stay blocked while the gate is
+        // shut. A correct retirer never returns here at all; this only bounds
+        // how long the test looks.
+        const BLOCKED: Duration = Duration::from_millis(200);
+        let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let value = || GatedDrop { gate: gate.clone(), started: started.clone(), dropped: dropped.clone() };
+        let retirer = Arc::new(Retirer::new());
+        // Retire on a helper thread; the channel says when the call returned.
+        let retire = |v: GatedDrop| {
+            let (done, returned) = mpsc::channel();
+            let retirer = retirer.clone();
+            std::thread::spawn(move || {
+                retirer.retire(v);
+                let _ = done.send(());
+            });
+            returned
+        };
+        let wait_until = |what: &str, done: &dyn Fn() -> bool| {
+            let until = Instant::now() + WAIT;
+            while !done() {
+                assert!(Instant::now() < until, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // The thread takes the first and blocks tearing it down.
+        retire(value()).recv_timeout(WAIT).expect("the first retirement returned");
+        wait_until("the retirement thread never took a value", &|| started.load(SeqCst) == 1);
+        // The second fills the free queue slot: it returns while the first
+        // teardown is still blocked, so retiring never waits for a teardown.
+        retire(value()).recv_timeout(WAIT).expect("a retirement waited for a teardown");
+        assert_eq!(dropped.load(SeqCst), 0, "the gate let a teardown finish early");
+        // A third finds the queue full: it cannot return while the first
+        // teardown is blocked (the bound), and does once it ends.
+        let third = retire(value());
+        assert!(third.recv_timeout(BLOCKED).is_err(), "outstanding retirements are not bounded");
+        {
+            let (open, opened) = &*gate;
+            *open.lock().unwrap() = true;
+            opened.notify_all();
         }
+        third.recv_timeout(WAIT).expect("the third retirement never got room");
+        // All of them are torn down in the end.
+        wait_until("a retired value was never dropped", &|| dropped.load(SeqCst) == 3);
     }
 
     /// A fall-back from the hardware decoder to software is reported whenever
