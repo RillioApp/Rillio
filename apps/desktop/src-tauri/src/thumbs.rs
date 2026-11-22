@@ -677,28 +677,54 @@ const RETIREMENTS_QUEUED: usize = 1;
 /// in its own field order (its mpv before the hidden window that mpv renders
 /// into), exactly as it would inline.
 struct Retirer {
-    queue: std::sync::mpsc::SyncSender<Box<dyn Send>>,
+    /// `None` when the retirement thread could not start: teardown inline.
+    queue: Option<std::sync::mpsc::SyncSender<Box<dyn Send>>>,
+    /// Whether the fall-back to inline teardown has been said (once).
+    said_inline: std::sync::atomic::AtomicBool,
 }
+
+/// The retirement thread's body: drop every retired value, in order, until
+/// every sender is gone.
+type Teardown = Box<dyn FnOnce() + Send>;
 
 impl Retirer {
     fn new() -> Self {
+        Self::with_thread(|teardown| {
+            std::thread::Builder::new().name("thumbs-retire".into()).spawn(teardown).map(|_| ())
+        })
+    }
+
+    /// A retirer whose thread `spawn` starts. A thread that cannot start is
+    /// not a panic (the first retirement can run while `Inner` is locked, and
+    /// unwinding there would poison it): teardown happens inline, said once.
+    fn with_thread(spawn: impl FnOnce(Teardown) -> std::io::Result<()>) -> Self {
         let (queue, retired) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(RETIREMENTS_QUEUED);
-        std::thread::Builder::new()
-            .name("thumbs-retire".into())
-            .spawn(move || {
-                for value in retired {
-                    drop(value);
-                }
-            })
-            .expect("thumbs: the retirement thread could not start");
-        Self { queue }
+        let started = spawn(Box::new(move || {
+            for value in retired {
+                drop(value);
+            }
+        }));
+        let queue = match started {
+            Ok(()) => Some(queue),
+            Err(e) => {
+                tracing::error!("thumbs: the retirement thread could not start ({e}); shadows tear down inline");
+                None
+            }
+        };
+        Self { queue, said_inline: std::sync::atomic::AtomicBool::new(false) }
     }
 
     /// Hand `value` over for teardown; waits only while the queue is full.
     fn retire<T: Send + 'static>(&self, value: T) {
-        if let Err(std::sync::mpsc::SendError(value)) = self.queue.send(Box::new(value)) {
-            // The thread is gone (a teardown panicked): tear down here, loudly.
-            tracing::error!("thumbs: the retirement thread is gone; tearing a shadow down inline");
+        let Some(queue) = &self.queue else {
+            drop(value); // said when the thread failed to start
+            return;
+        };
+        if let Err(std::sync::mpsc::SendError(value)) = queue.send(Box::new(value)) {
+            // The thread is gone (a teardown panicked): tear down here, said once.
+            if !self.said_inline.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("thumbs: the retirement thread is gone; shadows tear down inline");
+            }
             drop(value);
         }
     }
@@ -2168,6 +2194,25 @@ mod tests {
         assert!(decoder_fallback("d3d11va-copy", None, &std::cell::Cell::new(false)).is_some());
         // Software decode asked for: never a fall-back.
         assert_eq!(decoder_fallback("no", Some("no"), &std::cell::Cell::new(false)), None);
+    }
+
+    /// A retirement thread that cannot start must not panic (the first
+    /// retirement can run while Inner is locked, and a panic there would
+    /// poison it): the retirer tears down inline instead, said once.
+    #[test]
+    fn a_retirer_without_its_thread_tears_down_inline() {
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let retirer = Retirer::with_thread(|_teardown| Err(std::io::Error::other("no threads left")));
+        retirer.retire(Counted(dropped.clone()));
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1, "not torn down inline");
+        retirer.retire(Counted(dropped.clone()));
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// The renderer picks the decoder: GPU decode copied back before the
