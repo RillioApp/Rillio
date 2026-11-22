@@ -109,6 +109,21 @@ const SEEK_SETTLE_MS: u64 = 4000;
 /// stops a dead/hung source (whose mpv error is a 600 s network-timeout away)
 /// from leaking a shadow for as long as the user keeps hovering.
 const OPENING_DEADLINE_MS: u64 = 3 * SEEK_SETTLE_MS;
+/// How long a shadow may stay KEPT without showing a frame because its seeks
+/// are `Settle::Busy` (the target's bytes in hand, the decode or the VO still
+/// at work) or `Settle::Unknown`, counted from the first such verdict and not
+/// restarted by later accepted seeks; only a captured frame clears it
+/// ([`busy_expired`]). Cached bytes do not guarantee a stalled decoder or VO
+/// ever ends the load in error, so this is the bound.
+///
+/// The same allowance a whole first open gets ([`OPENING_DEADLINE_MS`]),
+/// counted from when the bytes were in hand, so at least one seek budget more
+/// in all: measured 2026-11-22, four cold 4K DV shadows opened together showed
+/// their first frames within 1-16 s at 29-41% GPU. Under heavier GPU load
+/// (minutes to a first frame) a shadow is retired here, and the loss paces
+/// the next one by the retired one's lifetime ([`Inner::may_respawn`]): slow
+/// retries, never the rapid respawn loop dropping on every timeout made.
+const BUSY_DEADLINE_MS: u64 = OPENING_DEADLINE_MS;
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 /// How many of mpv's error lines a libplacebo shadow keeps for its refusal: a
 /// gpu-next start failure ends in four that say why (measured with a window
@@ -315,6 +330,9 @@ struct Shadow {
     hwdec: &'static str,
     /// Whether [`Shadow::note_decoder`] has looked yet.
     decoder_noted: std::cell::Cell<bool>,
+    /// Since when this shadow has been kept without a frame by Busy/Unknown
+    /// seeks ([`busy_expired`]); `None` while it shows frames.
+    kept_since: std::cell::Cell<Option<Instant>>,
     /// mpv's latest error lines (a libplacebo shadow asks for them), for the
     /// refusal that says why gpu-next could not show the stream.
     mpv_errors: std::cell::RefCell<Vec<String>>,
@@ -643,6 +661,14 @@ fn unsettled(demuxer_cache_state: Option<&str>, target: f64) -> Settle {
     }
 }
 
+/// Whether a shadow kept since `kept` (set here at the first Busy/Unknown
+/// verdict, `now`) has been kept for [`BUSY_DEADLINE_MS`] without a frame.
+fn busy_expired(kept: &std::cell::Cell<Option<Instant>>, now: Instant) -> bool {
+    let since = *kept.get().get_or_insert(now);
+    kept.set(Some(since));
+    now.saturating_duration_since(since) >= Duration::from_millis(BUSY_DEADLINE_MS)
+}
+
 /// How a shadow's load ended in error ([`Shadow::check_load`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoadEnd {
@@ -766,10 +792,23 @@ fn checked_capture<T>(
         Settle::Yielded => return Captured::Yielded(shadow),
         // The bytes are in hand; the frame is still being decoded or shown.
         // Kept, and the next job asks again on this same shadow.
-        Settle::Busy | Settle::Unknown => return Captured::Skipped(shadow),
+        Settle::Busy | Settle::Unknown => {
+            if busy_expired(&shadow.kept_since, Instant::now()) {
+                return Captured::Lost {
+                    reason: format!(
+                        "thumbs: no frame within {BUSY_DEADLINE_MS} ms of the seek's bytes being in hand \
+                         ({settled:?}); retiring the shadow"
+                    ),
+                    lived: shadow.born.elapsed(),
+                };
+            }
+            return Captured::Skipped(shadow);
+        }
     }
     match step_for(shadow.frame_conversion(), shadow.render) {
         Step::Capture(conversion) => {
+            // A frame is progress: a later Busy run starts its own clock.
+            shadow.kept_since.set(None);
             shadow.note_decoder();
             let captured = capture(&shadow);
             Captured::Frame(shadow, conversion, captured)
@@ -949,6 +988,7 @@ impl Shadow {
             render,
             hwdec,
             decoder_noted: std::cell::Cell::new(false),
+            kept_since: std::cell::Cell::new(None),
             mpv_errors: std::cell::RefCell::new(Vec::new()),
             _window: window,
         })
@@ -1858,6 +1898,36 @@ mod tests {
         );
     }
 
+    /// A shadow kept because its seek is Busy or Unknown is kept for at most
+    /// BUSY_DEADLINE_MS from the FIRST such verdict: later accepted seeks do
+    /// not restart the clock, only a captured frame does. On expiry it is
+    /// retired as lost, and the loss paces the next shadow by the retired one's
+    /// lifetime, so a retirement cannot turn into a rapid respawn loop.
+    #[test]
+    fn a_kept_shadow_is_retired_after_the_busy_deadline_and_paced() {
+        let deadline = Duration::from_millis(BUSY_DEADLINE_MS);
+        let t0 = Instant::now();
+        let kept = std::cell::Cell::new(None);
+        // The first verdict starts the clock; repeated verdicts (each a newly
+        // accepted seek) do not restart it.
+        assert!(!busy_expired(&kept, t0));
+        assert!(!busy_expired(&kept, t0 + deadline / 2));
+        assert!(!busy_expired(&kept, t0 + deadline - Duration::from_millis(1)));
+        assert!(busy_expired(&kept, t0 + deadline), "kept past the cumulative deadline");
+        // A captured frame is progress: the clock starts over.
+        kept.set(None);
+        assert!(!busy_expired(&kept, t0 + deadline * 2));
+
+        // The retirement is a loss paced by the shadow's own lifetime (at least
+        // one seek budget plus the deadline): no new shadow before that passes.
+        let lived = Duration::from_millis(SEEK_SETTLE_MS) + deadline;
+        let mut inner = Inner::default();
+        inner.switch_stream(Some("http://127.0.0.1:1/x.mkv".into()), None);
+        inner.lose_shadow("thumbs: no frame within the busy deadline", lived, t0);
+        assert!(!inner.may_respawn(t0 + lived - Duration::from_millis(1)));
+        assert!(inner.may_respawn(t0 + lived));
+    }
+
     /// The renderer picks the decoder: GPU decode copied back before the
     /// software scale for libplacebo (bit-identical to software decode,
     /// bench_hwdec), never native d3d11va (its surfaces skip the scale:
@@ -2333,6 +2403,7 @@ mod tests {
             (0..SHADOWS).map(|_| Some(Shadow::spawn(&file, 640, Render::Libplacebo).expect("spawn"))).collect();
         let mut warmed = vec![None; SHADOWS];
         let mut parks = vec![0; SHADOWS];
+        let mut retired = vec![0; SHADOWS];
         let start = Instant::now();
         while warmed.iter().any(Option::is_none) && start.elapsed() < WITHIN {
             let cold: Vec<usize> = (0..SHADOWS).filter(|&i| warmed[i].is_none()).collect();
@@ -2347,11 +2418,17 @@ mod tests {
                         parks[i] += 1;
                         shadows[i] = Some(Shadow::spawn(&file, 640, Render::Libplacebo).expect("respawn"));
                     }
-                    Captured::Refused(r) | Captured::Lost { reason: r, .. } => panic!("shadow {i}: {r}"),
+                    // Kept past the busy deadline: retired, and the worker
+                    // would open another once the pacing allows.
+                    Captured::Lost { .. } => {
+                        retired[i] += 1;
+                        shadows[i] = Some(Shadow::spawn(&file, 640, Render::Libplacebo).expect("respawn"));
+                    }
+                    Captured::Refused(r) => panic!("shadow {i}: {r}"),
                 }
             }
         }
-        println!("first frames at {warmed:?}, parks {parks:?}");
+        println!("first frames at {warmed:?}, parks {parks:?}, retired {retired:?}");
         assert!(warmed.iter().all(Option::is_some), "not every cold shadow showed a frame in {WITHIN:?}: {warmed:?}, parks {parks:?}");
     }
 
