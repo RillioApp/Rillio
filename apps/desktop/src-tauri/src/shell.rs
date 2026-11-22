@@ -786,10 +786,21 @@ impl Controller {
             // `?` here fails the load ONLY when mpv REJECTED the loadfile. An
             // accepted load with no entry id (Ok(None)) is PLAYING - never fail
             // it (that would show a dead player over a playing stream, the
-            // opposite regression). It is merely untrackable: its END_FILE will
-            // carry an entry we did not record, so a later error on it is not
-            // attributed. The shipped libmpv always returns the id, so this is
-            // a future/minimal-build guard; it is logged loud if ever hit.
+            // opposite regression).
+            //
+            // DELIBERATE, EVIDENCED TENSION (not a silent gap): a load with no
+            // entry id is untrackable - its END_FILE carries an entry we never
+            // recorded, so a LATER error on it is not attributed and would not
+            // reach the web's loadId-based error/retry path. We accept that
+            // because we do not ship a libmpv that hits it: mpv_command_ret has
+            // returned loadfile's playlist_entry_id since client API 1.108 (mpv
+            // 0.33), every shipped libmpv-2 is 2.x, and the test
+            // `mpv::tests::an_end_file_carries_the_entry_id_its_loadfile_returned`
+            // asserts the shipped dll returns Some for every loadfile. On a
+            // future or stripped build that returned None, that one load loses
+            // later-error attribution (it still PLAYS, and the None is logged
+            // loud below) - a knowingly accepted cost, chosen over refusing
+            // playback on such a build.
             let entry = self.mpv.command_entry(&["loadfile", url, "replace"])?;
             tracing::debug!("mpv loadfile url={url} start={start:?} entry={entry:?} load={load_id:?}");
             match (entry, load_id) {
