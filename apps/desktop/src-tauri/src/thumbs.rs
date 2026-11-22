@@ -113,7 +113,7 @@ const OPENING_DEADLINE_MS: u64 = 3 * SEEK_SETTLE_MS;
 /// are `Settle::Busy` (the target's bytes in hand, the decode or the VO still
 /// at work) or `Settle::Unknown`, counted from the first such verdict and not
 /// restarted by later accepted seeks; only a captured frame clears it
-/// ([`busy_expired`]). Cached bytes do not guarantee a stalled decoder or VO
+/// ([`kept_overdue`]). Cached bytes do not guarantee a stalled decoder or VO
 /// ever ends the load in error, so this is the bound.
 ///
 /// The same allowance a whole first open gets ([`OPENING_DEADLINE_MS`]),
@@ -331,7 +331,7 @@ struct Shadow {
     /// Whether [`Shadow::note_decoder`] has reported a decoder fall-back.
     fallback_reported: std::cell::Cell<bool>,
     /// Since when this shadow has been kept without a frame by Busy/Unknown
-    /// seeks ([`busy_expired`]); `None` while it shows frames.
+    /// seeks ([`kept_overdue`]); `None` while it delivers frames.
     kept_since: std::cell::Cell<Option<Instant>>,
     /// mpv's latest error lines (a libplacebo shadow asks for them), for the
     /// refusal that says why gpu-next could not show the stream.
@@ -728,12 +728,64 @@ fn decoder_fallback(asked: &str, current: Option<&str>, reported: &std::cell::Ce
     ))
 }
 
-/// Whether a shadow kept since `kept` (set here at the first Busy/Unknown
-/// verdict, `now`) has been kept for [`BUSY_DEADLINE_MS`] without a frame.
-fn busy_expired(kept: &std::cell::Cell<Option<Instant>>, now: Instant) -> bool {
-    let since = *kept.get().get_or_insert(now);
-    kept.set(Some(since));
-    now.saturating_duration_since(since) >= Duration::from_millis(BUSY_DEADLINE_MS)
+/// What one job showed of a shadow's progress, for its busy allowance
+/// ([`kept_overdue`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    /// The seek was `Busy` or `Unknown`: the shadow is kept (starts the clock).
+    Kept,
+    /// The job ended without a frame for some other reason: a settled seek
+    /// with no capturable frame yet (`Step::NotYet`), or a capture that ran
+    /// and failed. Checks a running clock, never starts or resets one.
+    NoFrame,
+    /// A frame was captured: the clock stops.
+    Frame,
+}
+
+/// Whether a shadow's busy allowance has run out after a job that showed
+/// `progress` at `now`. `kept` is when the shadow was first kept by a `Busy`
+/// / `Unknown` seek without a frame since; only a delivered frame clears it,
+/// so neither later seeks nor jobs that end with no frame escape
+/// [`BUSY_DEADLINE_MS`].
+fn kept_overdue(kept: &std::cell::Cell<Option<Instant>>, progress: Progress, now: Instant) -> bool {
+    let limit = Duration::from_millis(BUSY_DEADLINE_MS);
+    match progress {
+        Progress::Frame => {
+            kept.set(None);
+            false
+        }
+        Progress::Kept => {
+            let since = *kept.get().get_or_insert(now);
+            kept.set(Some(since));
+            now.saturating_duration_since(since) >= limit
+        }
+        Progress::NoFrame => kept.get().is_some_and(|since| now.saturating_duration_since(since) >= limit),
+    }
+}
+
+/// Whether what a capture closure returned is a delivered frame (so the
+/// shadow's busy allowance resets), or a capture that ran and failed.
+trait Delivered {
+    fn delivered(&self) -> bool;
+}
+
+impl<T, E> Delivered for Result<T, E> {
+    fn delivered(&self) -> bool {
+        self.is_ok()
+    }
+}
+
+impl<T> Delivered for Option<T> {
+    fn delivered(&self) -> bool {
+        self.is_some()
+    }
+}
+
+/// A closure that only wants the seek (a bench, the sweep's open wait).
+impl Delivered for () {
+    fn delivered(&self) -> bool {
+        true
+    }
 }
 
 /// How a shadow's load ended in error ([`Shadow::check_load`]).
@@ -821,13 +873,25 @@ impl<T> Captured<T> {
 /// segment spliced before an HDR or Dolby Vision one), and a name that must
 /// be refused can appear anywhere. `yield_now` is asked while the seek waits:
 /// true abandons it (a sweep sample giving way to a hover).
-fn checked_capture<T>(
+fn checked_capture<T: Delivered>(
     shadow: Shadow,
     url: &str,
     target: f64,
     yield_now: &dyn Fn() -> bool,
     capture: impl FnOnce(&Shadow) -> T,
 ) -> Captured<T> {
+    // A shadow whose busy allowance ran out ([`kept_overdue`]) is retired as
+    // lost: paced by its lifetime, never respawned at once.
+    let overdue = |shadow: Shadow, why: &str| -> Captured<T> {
+        let lived = shadow.born.elapsed();
+        retire(shadow);
+        Captured::Lost {
+            reason: format!(
+                "thumbs: no frame within {BUSY_DEADLINE_MS} ms of first being kept ({why}); retiring the shadow"
+            ),
+            lived,
+        }
+    };
     let settled = shadow.seek_settled(target, yield_now);
     // mpv's own verdict on the load comes first, settled or not: a load mpv
     // ended in error never settles a seek, and must not time out in silence.
@@ -884,29 +948,30 @@ fn checked_capture<T>(
         // The bytes are in hand; the frame is still being decoded or shown.
         // Kept, and the next job asks again on this same shadow.
         Settle::Busy | Settle::Unknown => {
-            if busy_expired(&shadow.kept_since, Instant::now()) {
-                let lived = shadow.born.elapsed();
-                retire(shadow);
-                return Captured::Lost {
-                    reason: format!(
-                        "thumbs: no frame within {BUSY_DEADLINE_MS} ms of the seek's bytes being in hand \
-                         ({settled:?}); retiring the shadow"
-                    ),
-                    lived,
-                };
+            if kept_overdue(&shadow.kept_since, Progress::Kept, Instant::now()) {
+                return overdue(shadow, &format!("{settled:?} seek"));
             }
             return Captured::Skipped(shadow);
         }
     }
     match step_for(shadow.frame_conversion(), shadow.render) {
         Step::Capture(conversion) => {
-            // A frame is progress: a later Busy run starts its own clock.
-            shadow.kept_since.set(None);
             shadow.note_decoder();
             let captured = capture(&shadow);
+            // Only a delivered frame is progress; a capture that ran and
+            // failed leaves a running clock running.
+            let progress = if captured.delivered() { Progress::Frame } else { Progress::NoFrame };
+            if kept_overdue(&shadow.kept_since, progress, Instant::now()) {
+                return overdue(shadow, "the capture failed");
+            }
             Captured::Frame(shadow, conversion, captured)
         }
-        Step::NotYet => Captured::Skipped(shadow),
+        Step::NotYet => {
+            if kept_overdue(&shadow.kept_since, Progress::NoFrame, Instant::now()) {
+                return overdue(shadow, "settled with no frame to capture");
+            }
+            Captured::Skipped(shadow)
+        }
         Step::Refuse(reason) => {
             retire(shadow);
             Captured::Refused(reason)
@@ -2001,15 +2066,43 @@ mod tests {
         let deadline = Duration::from_millis(BUSY_DEADLINE_MS);
         let t0 = Instant::now();
         let kept = std::cell::Cell::new(None);
+        let just_before = deadline - Duration::from_millis(1);
         // The first verdict starts the clock; repeated verdicts (each a newly
         // accepted seek) do not restart it.
-        assert!(!busy_expired(&kept, t0));
-        assert!(!busy_expired(&kept, t0 + deadline / 2));
-        assert!(!busy_expired(&kept, t0 + deadline - Duration::from_millis(1)));
-        assert!(busy_expired(&kept, t0 + deadline), "kept past the cumulative deadline");
-        // A captured frame is progress: the clock starts over.
-        kept.set(None);
-        assert!(!busy_expired(&kept, t0 + deadline * 2));
+        assert!(!kept_overdue(&kept, Progress::Kept, t0));
+        assert!(!kept_overdue(&kept, Progress::Kept, t0 + deadline / 2));
+        assert!(!kept_overdue(&kept, Progress::Kept, t0 + just_before));
+        assert!(kept_overdue(&kept, Progress::Kept, t0 + deadline), "kept past the cumulative deadline");
+        // A delivered frame is progress: the clock stops.
+        assert!(!kept_overdue(&kept, Progress::Frame, t0 + deadline));
+        assert_eq!(kept.get(), None);
+
+        // Busy, then seeks that settle on no capturable frame (NotYet) again
+        // and again: the running clock still applies.
+        let kept = std::cell::Cell::new(None);
+        assert!(!kept_overdue(&kept, Progress::Kept, t0));
+        assert!(!kept_overdue(&kept, Progress::NoFrame, t0 + deadline / 2));
+        assert!(!kept_overdue(&kept, Progress::NoFrame, t0 + just_before));
+        assert!(kept_overdue(&kept, Progress::NoFrame, t0 + deadline), "NotYet escaped the busy deadline");
+        // Busy, then a capture that runs but fails: no reset, still bounded.
+        let kept = std::cell::Cell::new(None);
+        assert!(!kept_overdue(&kept, Progress::Kept, t0));
+        assert!(!kept_overdue(&kept, Progress::NoFrame, t0 + just_before));
+        assert!(kept.get().is_some(), "a failed capture reset the allowance");
+        assert!(kept_overdue(&kept, Progress::NoFrame, t0 + deadline), "a failed capture escaped the busy deadline");
+        // Busy, then a capture that succeeds: cleared; a later no-frame job
+        // has no clock to check.
+        let kept = std::cell::Cell::new(None);
+        assert!(!kept_overdue(&kept, Progress::Kept, t0));
+        assert!(!kept_overdue(&kept, Progress::Frame, t0 + just_before));
+        assert!(!kept_overdue(&kept, Progress::NoFrame, t0 + deadline * 3));
+        // A no-frame job on a shadow never kept starts no clock.
+        let fresh = std::cell::Cell::new(None);
+        assert!(!kept_overdue(&fresh, Progress::NoFrame, t0));
+        assert_eq!(fresh.get(), None);
+        // What a capture closure returns says whether it delivered a frame.
+        assert!(Ok::<_, String>(()).delivered() && !Err::<(), _>("x").delivered());
+        assert!(Some(1).delivered() && !None::<u8>.delivered() && ().delivered());
 
         // The retirement is a loss paced by the shadow's own lifetime (at least
         // one seek budget plus the deadline): no new shadow before that passes.
