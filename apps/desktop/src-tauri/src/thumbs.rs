@@ -328,8 +328,8 @@ struct Shadow {
     render: Render,
     /// The decoder asked of mpv ([`hwdec_for`]).
     hwdec: &'static str,
-    /// Whether [`Shadow::note_decoder`] has looked yet.
-    decoder_noted: std::cell::Cell<bool>,
+    /// Whether [`Shadow::note_decoder`] has reported a decoder fall-back.
+    fallback_reported: std::cell::Cell<bool>,
     /// Since when this shadow has been kept without a frame by Busy/Unknown
     /// seeks ([`busy_expired`]); `None` while it shows frames.
     kept_since: std::cell::Cell<Option<Instant>>,
@@ -710,6 +710,24 @@ fn retire(shadow: Shadow) {
     RETIRER.get_or_init(Retirer::new).retire(shadow);
 }
 
+/// The warning for a shadow that asked for hardware decoder `asked` while mpv
+/// decodes with `current` (`hwdec-current`, `None` when mpv reports none):
+/// `Some` the first time they differ, then never again for this shadow
+/// (`reported` latches only once a fall-back has been said, so one that
+/// happens after hardware-decoded captures is still caught). Nothing when
+/// software decode was asked for.
+fn decoder_fallback(asked: &str, current: Option<&str>, reported: &std::cell::Cell<bool>) -> Option<String> {
+    if asked == "no" || reported.get() || current == Some(asked) {
+        return None;
+    }
+    reported.set(true);
+    Some(format!(
+        "thumbs: asked for hwdec={asked} but mpv decodes with {:?}; previews stay correct \
+         (software decode) but slower",
+        current.unwrap_or("nothing"),
+    ))
+}
+
 /// Whether a shadow kept since `kept` (set here at the first Busy/Unknown
 /// verdict, `now`) has been kept for [`BUSY_DEADLINE_MS`] without a frame.
 fn busy_expired(kept: &std::cell::Cell<Option<Instant>>, now: Instant) -> bool {
@@ -1066,29 +1084,25 @@ impl Shadow {
             width,
             render,
             hwdec,
-            decoder_noted: std::cell::Cell::new(false),
+            fallback_reported: std::cell::Cell::new(false),
             kept_since: std::cell::Cell::new(None),
             mpv_errors: std::cell::RefCell::new(Vec::new()),
             _window: window,
         })
     }
 
-    /// Once per shadow, on its first captured frame: say loudly when mpv is not
-    /// decoding with the hardware decoder asked for. The frame is still right
-    /// (mpv's fallback is the software decode, the colour reference of
-    /// [`hwdec_for`]); only its time is the software one.
+    /// On every captured frame: say loudly, once per shadow, when mpv is not
+    /// (or no longer) decoding with the hardware decoder asked for
+    /// ([`decoder_fallback`]). The frame is still right (mpv's fallback is the
+    /// software decode, the colour reference of [`hwdec_for`]); only its time
+    /// is the software one.
     fn note_decoder(&self) {
-        if self.hwdec == "no" || self.decoder_noted.replace(true) {
+        if self.hwdec == "no" || self.fallback_reported.get() {
             return;
         }
         let current = self.mpv.get_property_string("hwdec-current");
-        if current.as_deref() != Some(self.hwdec) {
-            tracing::warn!(
-                "thumbs: asked for hwdec={} but mpv decodes with {:?}; previews stay correct \
-                 (software decode) but slower",
-                self.hwdec,
-                current.as_deref().unwrap_or("nothing"),
-            );
+        if let Some(warning) = decoder_fallback(self.hwdec, current.as_deref(), &self.fallback_reported) {
+            tracing::warn!("{warning}");
         }
     }
 
@@ -2040,6 +2054,27 @@ mod tests {
             assert!(Instant::now() < until, "a retired value was never dropped");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A fall-back from the hardware decoder to software is reported whenever
+    /// it happens, also after captures that did decode in hardware, and once
+    /// per shadow. A shadow that asked for software decode reports nothing.
+    #[test]
+    fn a_decoder_fallback_is_reported_once_whenever_it_happens() {
+        let reported = std::cell::Cell::new(false);
+        // Hardware decode as asked: nothing to say, and it keeps watching.
+        assert_eq!(decoder_fallback("d3d11va-copy", Some("d3d11va-copy"), &reported), None);
+        assert_eq!(decoder_fallback("d3d11va-copy", Some("d3d11va-copy"), &reported), None);
+        // A later fall-back to software is reported...
+        let said = decoder_fallback("d3d11va-copy", Some("no"), &reported).expect("a fallback is reported");
+        assert!(said.contains("d3d11va-copy") && said.contains("\"no\""), "{said}");
+        // ...once.
+        assert_eq!(decoder_fallback("d3d11va-copy", Some("no"), &reported), None);
+        assert_eq!(decoder_fallback("d3d11va-copy", None, &reported), None);
+        // mpv reporting no decoder at all counts as a fall-back too.
+        assert!(decoder_fallback("d3d11va-copy", None, &std::cell::Cell::new(false)).is_some());
+        // Software decode asked for: never a fall-back.
+        assert_eq!(decoder_fallback("no", Some("no"), &std::cell::Cell::new(false)), None);
     }
 
     /// The renderer picks the decoder: GPU decode copied back before the
