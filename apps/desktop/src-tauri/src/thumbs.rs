@@ -573,9 +573,17 @@ fn step_for(frame: Result<Option<Conversion>, String>, render: Render) -> Step {
 enum Settle {
     Settled,
     /// The seek was ACCEPTED (the file is open) but did not settle within the
-    /// budget: a region not downloaded yet, or a dead shadow. mpv does not
-    /// abandon that read for a later seek, so this shadow is dropped.
+    /// budget, and the demuxer is starved ([`unsettled`]): a region not
+    /// downloaded yet, or a dead shadow. mpv does not abandon that read for a
+    /// later seek, so this shadow is dropped.
     TimedOut,
+    /// The seek was accepted and did not settle within the budget, but the
+    /// bytes are in hand ([`unsettled`]): the decoder or the VO is still at work
+    /// (a gpu-next shadow configuring its VO under GPU load). The shadow is KEPT
+    /// and the job skipped: dropping it would throw that work away, block the
+    /// worker while its mpv tears down, and make the replacement pay the whole
+    /// open again.
+    Busy,
     /// The file was not open yet when the budget ran out (the seek stayed
     /// refused the whole time): a slow first open of a valid file, still
     /// progressing. The shadow is KEPT and given another budget, never dropped
@@ -584,6 +592,30 @@ enum Settle {
     Opening,
     /// Abandoned for a hover request.
     Yielded,
+}
+
+/// THE decision on a seek mpv accepted that did not settle in its budget, from
+/// mpv's `demuxer-cache-state` (JSON) at that moment: `TimedOut` (drop the
+/// shadow) only when the demuxer is starved (`underrun`: waiting for bytes with
+/// none buffered), the stuck read the drop exists for; `Busy` (keep it) when it
+/// is not, because then the bytes are there and only the decode or the VO is
+/// slow. Measured 2026-11-22 in the running shell under GPU load: every
+/// not-settled DV seek had `vo-configured=no` with `underrun: false`, the cache
+/// 11 s past the target and 33 MB ahead; the one starved state was a first open
+/// with 0 bytes read (`underrun: true`). An unreadable state counts as starved:
+/// a dropped shadow is the self-correcting way to be wrong.
+///
+/// No deadline bounds `Busy`: bytes in hand are not an external wait, and a VO
+/// or decoder that cannot go on ends the load in error, which
+/// [`Shadow::check_load`] reports (a dead VO is a refusal, not a hang).
+fn unsettled(demuxer_cache_state: Option<&str>) -> Settle {
+    let underrun = demuxer_cache_state
+        .and_then(|state| serde_json::from_str::<serde_json::Value>(state).ok())
+        .and_then(|state| state.get("underrun").and_then(serde_json::Value::as_bool));
+    match underrun {
+        Some(false) => Settle::Busy,
+        Some(true) | None => Settle::TimedOut,
+    }
 }
 
 /// How a shadow's load ended in error ([`Shadow::check_load`]).
@@ -707,6 +739,9 @@ fn checked_capture<T>(
             return Captured::Parked;
         }
         Settle::Yielded => return Captured::Yielded(shadow),
+        // The bytes are in hand; the frame is still being decoded or shown.
+        // Kept, and the next job asks again on this same shadow.
+        Settle::Busy => return Captured::Skipped(shadow),
     }
     match step_for(shadow.frame_conversion(), shadow.render) {
         Step::Capture(conversion) => {
@@ -980,8 +1015,9 @@ impl Shadow {
     }
 
     /// Keyframe-seek to `target` and wait for the seek to settle. `TimedOut`
-    /// (undownloaded torrent region / dead stream) and `Yielded` (`yield_now`
-    /// said a hover is waiting) mean do not capture. mpv refuses a seek until
+    /// (undownloaded torrent region / dead stream), `Busy` (bytes in hand, the
+    /// frame not shown yet: [`unsettled`] tells the two apart) and `Yielded`
+    /// (`yield_now` said a hover is waiting) mean do not capture. mpv refuses a seek until
     /// the file is open, which is every first job on a fresh shadow (and every
     /// first job after a renderer change): the seek is asked again within the
     /// same budget instead of failing at once.
@@ -1024,7 +1060,15 @@ impl Shadow {
                 return Settle::Yielded;
             }
         }
-        Settle::TimedOut
+        let cache_state = self.mpv.get_property_string("demuxer-cache-state");
+        let verdict = unsettled(cache_state.as_deref());
+        tracing::debug!(
+            "thumbs: seek to {target:.1}s not settled in {SEEK_SETTLE_MS} ms ({verdict:?}): vo-configured={:?} \
+             demuxer-cache-state={}",
+            self.mpv.get_property_string("vo-configured"),
+            cache_state.as_deref().unwrap_or("-"),
+        );
+        verdict
     }
 
     /// Screenshot the current (already thumbnail-scaled) frame to a fresh temp
@@ -1726,6 +1770,29 @@ mod tests {
         assert_eq!(inner.conversion, None);
     }
 
+    /// A seek that did not settle drops its shadow only when the demuxer is
+    /// starved. The states are mpv's own, recorded in the running shell
+    /// 2026-11-22 (trimmed to the fields that decide).
+    #[test]
+    fn only_a_starved_read_drops_the_shadow() {
+        // A gpu-next shadow still configuring its VO: bytes 11 s past the target.
+        let vo_configuring = r#"{"cache-end":14.515,"reader-pts":3.087,"cache-duration":11.428,"eof":false,
+            "underrun":false,"idle":true,"total-bytes":43703136,"fw-bytes":33580160,"raw-input-rate":2492470}"#;
+        assert_eq!(unsettled(Some(vo_configuring)), Settle::Busy);
+        // Still reading toward the target, not starved: progressing.
+        let reading = r#"{"cache-end":0.501,"reader-pts":0.0,"cache-duration":0.501,"eof":false,
+            "underrun":false,"idle":false,"total-bytes":2341936,"fw-bytes":2341936}"#;
+        assert_eq!(unsettled(Some(reading)), Settle::Busy);
+        // Waiting for bytes with none buffered: the stuck read.
+        let starved = r#"{"cache-duration":0.0,"eof":false,"underrun":true,"idle":false,"total-bytes":0,
+            "fw-bytes":0,"seekable-ranges":[]}"#;
+        assert_eq!(unsettled(Some(starved)), Settle::TimedOut);
+        // Nothing readable is treated as starved: dropping is the safe mistake.
+        assert_eq!(unsettled(None), Settle::TimedOut);
+        assert_eq!(unsettled(Some("not json")), Settle::TimedOut);
+        assert_eq!(unsettled(Some(r#"{"idle":true}"#)), Settle::TimedOut);
+    }
+
     /// The renderer picks the decoder: GPU decode copied back before the
     /// software scale for libplacebo (bit-identical to software decode,
     /// bench_hwdec), never native d3d11va (its surfaces skip the scale:
@@ -2181,6 +2248,137 @@ mod tests {
         }
         assert!(kept_at_least_once, "a still-opening shadow must be kept across the first budgets");
         assert!(retired, "a never-opening shadow must be retired after the cumulative deadline, not kept forever");
+    }
+
+    /// Cold shadows that are slow to show their first frame (several 4K DV
+    /// opens at once, a GPU busy with other work) must still get there: a seek
+    /// whose bytes are in hand but whose frame the VO has not shown yet is
+    /// progress, not a stuck read. Measured before the fix: four dv-p5 shadows
+    /// opened together never warmed in 60 s on a LOCAL FILE (each timed out,
+    /// was dropped, and its replacement paid the whole open again). Needs
+    /// `libmpv-2.dll` and RILLIO_THUMBS_BENCH_FILE (a 4K DV/HDR file).
+    /// Run: `cargo test --lib thumbs::tests::cold_shadows_opened_together -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll and RILLIO_THUMBS_BENCH_FILE"]
+    fn cold_shadows_opened_together_all_show_a_frame() {
+        const SHADOWS: usize = 4;
+        const WITHIN: Duration = Duration::from_secs(60);
+        let file = std::env::var("RILLIO_THUMBS_BENCH_FILE").expect("RILLIO_THUMBS_BENCH_FILE");
+        let mut shadows: Vec<Option<Shadow>> =
+            (0..SHADOWS).map(|_| Some(Shadow::spawn(&file, 640, Render::Libplacebo).expect("spawn"))).collect();
+        let mut warmed = vec![None; SHADOWS];
+        let mut parks = vec![0; SHADOWS];
+        let start = Instant::now();
+        while warmed.iter().any(Option::is_none) && start.elapsed() < WITHIN {
+            let cold: Vec<usize> = (0..SHADOWS).filter(|&i| warmed[i].is_none()).collect();
+            for i in cold {
+                match checked_capture(shadows[i].take().unwrap(), &file, 0.0, &|| false, |_| ()) {
+                    Captured::Frame(s, ..) => {
+                        warmed[i] = Some(start.elapsed());
+                        shadows[i] = Some(s);
+                    }
+                    Captured::Skipped(s) | Captured::Replaced(s, _) | Captured::Yielded(s) => shadows[i] = Some(s),
+                    Captured::Parked => {
+                        parks[i] += 1;
+                        shadows[i] = Some(Shadow::spawn(&file, 640, Render::Libplacebo).expect("respawn"));
+                    }
+                    Captured::Refused(r) | Captured::Lost { reason: r, .. } => panic!("shadow {i}: {r}"),
+                }
+            }
+        }
+        println!("first frames at {warmed:?}, parks {parks:?}");
+        assert!(warmed.iter().all(Option::is_some), "not every cold shadow showed a frame in {WITHIN:?}: {warmed:?}, parks {parks:?}");
+    }
+
+    /// A seek into a region whose bytes do NOT come (a torrent region not
+    /// downloaded yet) must still time out and drop the shadow (Parked): mpv
+    /// does not abandon that read, and every later job would wait behind it.
+    /// Driven by an HTTP server that serves the file's head and tail (so it
+    /// opens) and holds every read in the middle forever. Needs
+    /// `libmpv-2.dll` and RILLIO_THUMBS_STALL_FILE (a small mkv, e.g. the
+    /// hdr10-cll or sdr sample).
+    /// Run: `cargo test --lib thumbs::tests::a_seek_into_bytes_that_never_come -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll and RILLIO_THUMBS_STALL_FILE"]
+    fn a_seek_into_bytes_that_never_come_is_still_parked() {
+        use std::io::{Read, Write};
+        let path = std::env::var("RILLIO_THUMBS_STALL_FILE").expect("RILLIO_THUMBS_STALL_FILE");
+        let bytes = std::sync::Arc::new(std::fs::read(&path).expect("the file"));
+        let len = bytes.len();
+        // Served: the first and last quarter. Held forever: the middle half.
+        let (stall_from, stall_to) = (len / 4, len - len / 4);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let bytes = bytes.clone();
+                std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let from: usize = request
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .and_then(|r| r.split('-').next())
+                        .and_then(|a| a.trim().parse().ok())
+                        .unwrap_or(0);
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Type: video/x-matroska\r\n\
+                         Content-Range: bytes {from}-{}/{len}\r\nContent-Length: {}\r\n\r\n",
+                        len - 1,
+                        len - from
+                    );
+                    if stream.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    let mut at = from;
+                    while at < len {
+                        if (stall_from..stall_to).contains(&at) {
+                            // Bytes that never come: hold the connection open.
+                            loop {
+                                std::thread::sleep(Duration::from_secs(1));
+                                if stream.write_all(&[]).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        let end = if at < stall_from { stall_from.min(len) } else { len }.min(at + 64 * 1024);
+                        if stream.write_all(&bytes[at..end]).is_err() {
+                            return;
+                        }
+                        at = end;
+                    }
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/stall.mkv");
+        let mut shadow = Shadow::spawn(&url, 320, Render::Software).expect("spawn");
+        // It opens and shows the head (the served first quarter).
+        let open_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match checked_capture(shadow, &url, 0.0, &|| false, |_| ()) {
+                Captured::Frame(s, ..) => { shadow = s; break; }
+                Captured::Skipped(s) | Captured::Replaced(s, _) | Captured::Yielded(s) => shadow = s,
+                other => panic!("the served head did not open: {}", match other {
+                    Captured::Parked => "parked".to_owned(),
+                    Captured::Refused(r) | Captured::Lost { reason: r, .. } => r,
+                    _ => unreachable!(),
+                }),
+            }
+            assert!(Instant::now() < open_deadline, "the served head never showed a frame");
+        }
+        // A seek into the middle (held bytes) is a stuck read: dropped.
+        let duration = shadow.duration().expect("a duration");
+        let middle = duration / 2.0;
+        let outcome = checked_capture(shadow, &url, middle, &|| false, |_| ());
+        assert!(matches!(outcome, Captured::Parked), "a seek into bytes that never come must park the shadow");
     }
 
     /// The evidence for [`hwdec_for`]. Per file, on the player's own hinted
