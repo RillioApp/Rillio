@@ -96,6 +96,16 @@ const CACHE_MAX_THUMBS: usize = 256;
 /// How long a keyframe seek may take before the capture is abandoned (a live
 /// torrent region that is not downloaded yet stalls exactly here).
 const SEEK_SETTLE_MS: u64 = 4000;
+/// How long a shadow may stay in the FIRST-OPEN phase (the file never opened,
+/// `Settle::Opening`) across seek budgets before it is retired as unreadable.
+/// Wall-clock from spawn, SEPARATE from the per-seek budget: a slow first open
+/// (loadfile + demux init + first keyframe software-decode, measured up to a
+/// few seconds for 4K HEVC 10-bit under load) is kept, but a stream that never
+/// opens and never errors (a dead/hung source whose mpv error is 600 s away)
+/// is not held forever. Three seek budgets: generous for any real open (they
+/// finish within one or two), short enough not to leak a shadow for a dead
+/// stream the whole time the user keeps hovering.
+const OPENING_DEADLINE_MS: u64 = 3 * SEEK_SETTLE_MS;
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 /// How many of mpv's error lines a libplacebo shadow keeps for its refusal: a
 /// gpu-next start failure ends in four that say why (measured with a window
@@ -658,11 +668,23 @@ fn checked_capture<T>(
     match settled {
         Settle::Settled => {}
         Settle::Opening => {
-            // Still opening the file (valid, just slow): keep this shadow and
-            // let the next job give it another budget, rather than dropping and
-            // respawning (which restarts the open and never finishes for an
-            // open longer than one budget). A load that truly cannot be read
-            // still ends in error and is caught by check_load above (Lost).
+            // Still opening the file. Keep a shadow that is progressing toward
+            // open (valid, just slow) across seek budgets rather than dropping
+            // and respawning it (which restarts the open and never finishes for
+            // an open longer than one budget). But a stream that NEVER opens and
+            // never errors (a dead/hung source; mpv's own error is a 600 s
+            // network-timeout away) must not be held for the whole time the
+            // user keeps hovering, so a cumulative opening deadline from spawn
+            // retires it as unreadable (paced like any lost shadow).
+            let lived = shadow.born.elapsed();
+            if lived >= Duration::from_millis(OPENING_DEADLINE_MS) {
+                return Captured::Lost {
+                    reason: format!(
+                        "thumbs: the stream did not open within {OPENING_DEADLINE_MS} ms; retiring the shadow"
+                    ),
+                    lived,
+                };
+            }
             return Captured::Skipped(shadow);
         }
         Settle::TimedOut => {
@@ -2032,13 +2054,13 @@ mod tests {
         }
     }
 
-    /// A valid file that is still opening when a seek budget runs out is kept,
-    /// not dropped: `seek_settled` returns `Opening` (the seek never got past
-    /// "file not open"), and `checked_capture` keeps the shadow (Skipped) so
-    /// the next job gives it another budget instead of respawning and
-    /// restarting the open. Driven by a server that accepts the connection and
-    /// never answers, so mpv's open never completes within the budget (and does
-    /// not error, so check_load stays Ok). Needs `libmpv-2.dll`.
+    /// A file still opening when a seek budget runs out is KEPT across budgets
+    /// (`seek_settled` returns `Opening`, `checked_capture` returns Skipped) so
+    /// a slow open is not restarted every request - UNTIL the cumulative
+    /// opening deadline, after which a stream that never opens is retired (Lost),
+    /// not held forever. Driven by a server that accepts the connection and
+    /// never answers, so mpv's open never completes and never errors (check_load
+    /// stays Ok). Needs `libmpv-2.dll`. Runs ~OPENING_DEADLINE_MS.
     /// Run: `cargo test --lib thumbs::tests::a_still_opening -- --ignored`.
     #[test]
     #[ignore = "needs libmpv-2.dll"]
@@ -2056,13 +2078,33 @@ mod tests {
         let opening = Shadow::spawn(&url, 320, Render::Software).expect("spawn");
         assert_eq!(opening.seek_settled(0.0, &|| false), Settle::Opening);
         drop(opening);
-        // ...and checked_capture keeps such a shadow rather than dropping it.
-        let shadow = Shadow::spawn(&url, 320, Render::Software).expect("spawn");
-        let kept = matches!(
-            checked_capture(shadow, &url, 0.0, &|| false, |_| ()),
-            Captured::Skipped(_)
-        );
-        assert!(kept, "a still-opening shadow must be kept (Skipped), not dropped");
+        // A fresh shadow is kept (Skipped) early, and retired (Lost) once its
+        // cumulative opening deadline passes - kept across budgets, not forever.
+        let mut shadow = Some(Shadow::spawn(&url, 320, Render::Software).expect("spawn"));
+        let start = Instant::now();
+        let mut kept_at_least_once = false;
+        let mut retired = false;
+        // Bound the loop well past the deadline so a bug (kept forever) fails
+        // rather than hangs.
+        while start.elapsed() < Duration::from_millis(OPENING_DEADLINE_MS * 3) {
+            match checked_capture(shadow.take().unwrap(), &url, 0.0, &|| false, |_| ()) {
+                Captured::Skipped(s) => {
+                    kept_at_least_once = true;
+                    shadow = Some(s);
+                }
+                Captured::Lost { .. } => {
+                    retired = true;
+                    assert!(
+                        start.elapsed() >= Duration::from_millis(OPENING_DEADLINE_MS),
+                        "retired before the cumulative opening deadline"
+                    );
+                    break;
+                }
+                _ => panic!("a still-opening shadow was neither kept nor retired"),
+            }
+        }
+        assert!(kept_at_least_once, "a still-opening shadow must be kept across the first budgets");
+        assert!(retired, "a never-opening shadow must be retired after the cumulative deadline, not kept forever");
     }
 
     /// The median and the 95th percentile (nearest rank) of `millis`.
