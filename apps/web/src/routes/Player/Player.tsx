@@ -281,9 +281,17 @@ const Player = () => {
         const track = (extraSubtitleTracks as any[]).find((t: any) => t?.id === selectedExtraSubtitleTrackId);
         return typeof track?.url === 'string' ? track.url : null;
     }, [extraSubtitleTracks, selectedExtraSubtitleTrackId]);
+    // The url the shell's shadow player opens, for the scene sweep here and
+    // the seek-bar previews below alike: ONE spelling, or each caller switches
+    // the single shadow to its own (measured 2026-10-28 on a boot whose
+    // server fell back off 11470: the sweep asked for the symbolic port, the
+    // seek bar for the bound one, 1 hover in 8 got a frame). rewriteServerUrl:
+    // the core serializes stream urls with the SYMBOLIC server port; the shell
+    // maps it too (thumbs.rs resolve_shadow_url), this keeps the two equal.
+    const shadowStreamUrl = typeof video.state.stream?.url === 'string' ? rewriteServerUrl(video.state.stream.url) : null;
     const timelineChapters = useTimelineChapters(
         video.state.chapters ?? [],
-        typeof video.state.stream?.url === 'string' ? video.state.stream.url : null,
+        shadowStreamUrl,
         selectedExtraSubtitleTrackUrl,
     );
 
@@ -716,7 +724,7 @@ const Player = () => {
                 seriesInfo: player.seriesInfo,
             }, {
                 chromecastTransport: services.chromecast.active ? services.chromecast.transport : null,
-                shellTransport: platform.shell.active ? platform.shell : null,
+                shellTransport: platform.shell.active ? platform.shell.transport : null,
             });
         }
     }, [streamingServer.baseUrl, player.selected, player.stream, streamSubtitles, forceTranscoding, casting]);
@@ -1227,14 +1235,7 @@ const Player = () => {
                 metaItem={player.metaItem}
                 nextVideo={player.nextVideo}
                 stream={player.selected !== null ? player.selected.stream : null}
-                thumbStreamUrl={
-                    // rewriteServerUrl: the core serializes stream urls with the
-                    // SYMBOLIC server port; on a fallback-port boot the trickplay
-                    // shadow must be handed the bound one or every preview request
-                    // dies on a dead socket (playback itself rides rillio:// and
-                    // never sees this url).
-                    typeof video.state.stream?.url === 'string' ? rewriteServerUrl(video.state.stream.url) : null
-                }
+                thumbStreamUrl={shadowStreamUrl}
                 chapters={timelineChapters}
                 onPlayRequested={onPlayRequested}
                 onPauseRequested={onPauseRequested}

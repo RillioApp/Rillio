@@ -2,6 +2,7 @@ var EventEmitter = require('eventemitter3');
 var cloneDeep = require('lodash.clonedeep');
 var deepFreeze = require('deep-freeze');
 var ERROR = require('../error');
+var ShellChannel = require('./ShellChannel');
 
 // Maps the profile's subtitlesSize percentage to mpv's sub-scale. Stremio shipped
 // 0.0066 (100% -> 0.66, far too small); 0.01 makes the default 100% land exactly on
@@ -10,13 +11,7 @@ var ERROR = require('../error');
 var SUBS_SCALE_FACTOR = 0.01;
 var EOF_END_TOLERANCE = 60000;
 
-// How long to wait for the shell's answer to the `rillio://` capability query
-// before assuming "no". A shell that predates the query never answers at all,
-// and an unanswered promise here would park `loadfile` forever (the exact way
-// the mpv-version handshake once broke playback), so this ALWAYS settles.
-var STREAM_CB_QUERY_TIMEOUT = 3000;
-
-// The url that makes the shell player read this torrent's bytes in-process,
+// The url that names this torrent's file on the shell's in-process byte plane,
 // or null when this stream has no such form.
 //
 // Only a stream carrying an (infoHash, fileIdx) resolved against OUR streaming
@@ -86,6 +81,25 @@ function ShellVideo(options) {
     options = options || {};
 
     var ipc = options.shellTransport;
+    // This visit's link to the app-lifetime owner of the shell IPC. Nothing
+    // here subscribes to the transport: mpv's events reach this instance only
+    // while it is the attached player (see ShellChannel).
+    var channel = ShellChannel.of(ipc);
+    // This visit's handle on the channel, and the gate on driving the one
+    // shared mpv: `drive` sends a command/prop ONLY while this visit is the
+    // attached owner. A superseded or destroyed visit resets its own state and
+    // emits its own prop updates (below), but must send nothing to mpv, or its
+    // teardown `stop` would halt the visit that took over. The handle is
+    // attached at the END of construction (see `channel.attach`); during
+    // construction this visit is not yet the owner, so its initial stop is not
+    // driven (the next load's `loadfile replace` resets mpv anyway).
+    var attachment = { onPropChange: onPropChange, onEndFile: onEndFile };
+    function drive() {
+        if (!channel.isAttached(attachment)) {
+            return;
+        }
+        ipc.send.apply(ipc, arguments);
+    }
     var observedProps = {};
     var props = {};
     // `buffering` is the OR of two independent mpv signals; track them
@@ -100,65 +114,26 @@ function ShellVideo(options) {
             stremioProps[stremioToMPVProps[key]] = key;
         }
     });
-    var resolveMPVVersion;
-    var waitForMPVVersion = new Promise(function (resolve) {
-        resolveMPVVersion = resolve;
-    });
-    // Whether this shell can serve `rillio://` (libmpv with stream_cb + the
-    // streaming engine in-process). Asked once per instance, alongside the
-    // property observers below; the answer arrives as a `rillio-stream-cb`
-    // signal. Falls back to false on any shell that does not answer.
-    var resolveStreamCb;
-    var waitForStreamCb = new Promise(function (resolve) {
-        resolveStreamCb = resolve;
-    });
-    setTimeout(function () {
-        resolveStreamCb(false);
-    }, STREAM_CB_QUERY_TIMEOUT);
+    // Which load is current. Every load and unload moves it on, so a load
+    // whose handshake answers after it was superseded (another load, an
+    // unload, destroy) is dropped instead of reaching mpv late.
+    var loadSeq = 0;
+    // The loadfile in flight, as the shell will name it on its END_FILE:
+    // { id, fallback }. `fallback` is the same argv with the stream's http url,
+    // armed only when this loadfile went out as rillio:// (the byte plane
+    // refuses a torrent its engine does not have yet, at once), so that
+    // refusal retries ONCE over the server route. It belongs to THIS loadfile:
+    // an END_FILE carrying another load's id (older, or from a visit before)
+    // can neither spend it nor be retried with it, and is not this load's
+    // error or end at all.
+    var currentLoad = null;
     command('unload');
 
-    ipc.send('mpv-command', ['stop']);
-    ipc.send('mpv-observe-prop', 'path');
-
-    ipc.send('mpv-observe-prop', 'time-pos');
-    ipc.send('mpv-observe-prop', 'volume');
-    ipc.send('mpv-observe-prop', 'pause');
-    ipc.send('mpv-observe-prop', 'seeking');
-    ipc.send('mpv-observe-prop', 'eof-reached');
-
-    ipc.send('mpv-observe-prop', 'duration');
-    ipc.send('mpv-observe-prop', 'metadata');
-    ipc.send('mpv-observe-prop', 'video-params'); // video width/height
-    ipc.send('mpv-observe-prop', 'track-list');
-    ipc.send('mpv-observe-prop', 'chapter-list');
-
-    ipc.send('mpv-observe-prop', 'paused-for-cache');
-    ipc.send('mpv-observe-prop', 'cache-buffering-state');
-    ipc.send('mpv-observe-prop', 'demuxer-cache-time');
-
-    ipc.send('mpv-observe-prop', 'aid');
-    ipc.send('mpv-observe-prop', 'vid');
-    ipc.send('mpv-observe-prop', 'sid');
-    ipc.send('mpv-observe-prop', 'sub-scale');
-    ipc.send('mpv-observe-prop', 'sub-pos');
-    ipc.send('mpv-observe-prop', 'sub-delay');
-    ipc.send('mpv-observe-prop', 'audio-delay');
-    ipc.send('mpv-observe-prop', 'speed');
-
-    ipc.send('mpv-observe-prop', 'mpv-version');
-    ipc.send('mpv-observe-prop', 'ffmpeg-version');
-
-    ipc.send('rillio-stream-cb-query');
+    drive('mpv-command', ['stop']);
 
     var events = new EventEmitter();
     var destroyed = false;
     var stream = null;
-    // Armed while the current loadfile went out as rillio://: the same argv
-    // with the stream's http url instead, so a byte-plane refusal (end-file
-    // with error; the shell answers fast for a torrent its engine does not
-    // know) retries ONCE over the server route instead of surfacing a dead
-    // player. Cleared on use, so a failing http load errors out normally.
-    var bytePlaneFallback = null;
 
     var avgDuration = 0;
     var minClipDuration = 30;
@@ -184,15 +159,10 @@ function ShellVideo(options) {
         return args.data && args.data !== 'no' ? 'EMBEDDED_' + args.data.toString() : null;
     }
 
-    ipc.on('rillio-stream-cb', function(args) {
-        resolveStreamCb(!!(args && args.available));
-    });
-
     var last_time = 0;
-    ipc.on('mpv-prop-change', function(args) {
+    function onPropChange(args) {
         switch (args.name) {
             case 'mpv-version':
-                resolveMPVVersion(args.data);
                 props[args.name] = logProp(args);
                 break;
             case 'ffmpeg-version': {
@@ -351,17 +321,38 @@ function ShellVideo(options) {
             }
             onPropChanged(stremioProps[args.name]);
         }
-    });
-    ipc.on('mpv-event-ended', function(args) {
+    }
+    // Send a loadfile as a new load: the shell maps the mpv playlist entry it
+    // creates to `id` and puts that id on the entry's END_FILE.
+    function startLoad(loadfileArgs, fallback) {
+        currentLoad = { id: channel.nextLoadId(), fallback: fallback };
+        drive('mpv-command', loadfileArgs, { loadId: currentLoad.id });
+    }
+    function onEndFile(args) {
+        // Another load's end: an older loadfile (superseded by a reload or an
+        // unload before mpv got to end it) or a previous visit's. Not this
+        // load's error, nor its end, and never a reason to spend its retry.
+        // This used to be decided by nothing: one fallback slot, any END_FILE
+        // (measured 2026-10-28: an unload between a rillio:// loadfile and its
+        // immediate refusal emptied the slot, and that superseded END_FILE
+        // showed the error screen over a stream that was fine).
+        if (currentLoad === null || args.loadId !== currentLoad.id) {
+            return;
+        }
+        // A playlist url ended by expanding into its entries: the shell carries
+        // this load's id over to them, so the load is still the one playing.
+        if (args.reason === 'redirect') {
+            return;
+        }
+        var load = currentLoad;
+        currentLoad = null;
         // older shells report 'other' for every non-error reason, including eof
         if (args.error) {
-            if (bytePlaneFallback !== null) {
-                var fallbackArgs = bytePlaneFallback;
-                bytePlaneFallback = null;
+            if (load.fallback !== null) {
                 // eslint-disable-next-line no-console
                 console.warn('ShellVideo: rillio:// load failed (' + String(args.error) + '), retrying over http');
-                ipc.send('mpv-command', fallbackArgs);
-                ipc.send('mpv-set-prop', ['pause', false]);
+                startLoad(load.fallback, null);
+                drive('mpv-set-prop', ['pause', false]);
                 return;
             }
             // mpv reports a bare string ("loading failed"). Playback cannot
@@ -376,7 +367,7 @@ function ShellVideo(options) {
         } else if (!args.reason || args.reason === 'eof' || args.reason === 'other') {
             if (!isKnownEarlyEof()) onEnded();
         }
-    });
+    }
 
     function getProp(propName) {
         if (propName === 'hdrInfo') return props.hdrInfo || null;
@@ -417,7 +408,7 @@ function ShellVideo(options) {
         switch (propName) {
             case 'paused': {
                 if (stream !== null) {
-                    ipc.send('mpv-set-prop', ['pause', propValue]);
+                    drive('mpv-set-prop', ['pause', propValue]);
                     // Reflect the new state immediately instead of waiting for the
                     // mpv -> IPC round-trip (like volume/muted/videoScale below do).
                     // Otherwise the play/pause icon and the controls auto-hide
@@ -431,14 +422,14 @@ function ShellVideo(options) {
             }
             case 'time': {
                 if (stream !== null && propValue !== null && isFinite(propValue)) {
-                    ipc.send('mpv-set-prop', ['time-pos', propValue/1000]);
+                    drive('mpv-set-prop', ['time-pos', propValue/1000]);
                 }
 
                 break;
             }
             case 'playbackSpeed': {
                 if (stream !== null && propValue !== null && isFinite(propValue)) {
-                    ipc.send('mpv-set-prop', ['speed', propValue]);
+                    drive('mpv-set-prop', ['speed', propValue]);
                 }
                 break;
             }
@@ -446,16 +437,16 @@ function ShellVideo(options) {
                 if (stream !== null) {
                     switch (propValue) {
                         case 'cover':
-                            ipc.send('mpv-set-prop', ['keepaspect', true]);
-                            ipc.send('mpv-set-prop', ['panscan', 1.0]);
+                            drive('mpv-set-prop', ['keepaspect', true]);
+                            drive('mpv-set-prop', ['panscan', 1.0]);
                             break;
                         case 'fill':
-                            ipc.send('mpv-set-prop', ['keepaspect', false]);
-                            ipc.send('mpv-set-prop', ['panscan', 0.0]);
+                            drive('mpv-set-prop', ['keepaspect', false]);
+                            drive('mpv-set-prop', ['panscan', 0.0]);
                             break;
                         default:
-                            ipc.send('mpv-set-prop', ['keepaspect', true]);
-                            ipc.send('mpv-set-prop', ['panscan', 0.0]);
+                            drive('mpv-set-prop', ['keepaspect', true]);
+                            drive('mpv-set-prop', ['panscan', 0.0]);
                             break;
                     }
                     props.videoScale = propValue;
@@ -466,8 +457,8 @@ function ShellVideo(options) {
             case 'volume': {
                 if (stream !== null && propValue !== null && isFinite(propValue)) {
                     props.mute = false;
-                    ipc.send('mpv-set-prop', ['mute', 'no']);
-                    ipc.send('mpv-set-prop', ['volume', propValue]);
+                    drive('mpv-set-prop', ['mute', 'no']);
+                    drive('mpv-set-prop', ['volume', propValue]);
                     onPropChanged('muted');
                     onPropChanged('volume');
                 }
@@ -475,7 +466,7 @@ function ShellVideo(options) {
             }
             case 'muted': {
                 if (stream !== null) {
-                    ipc.send('mpv-set-prop', ['mute', propValue ? 'yes' : 'no']);
+                    drive('mpv-set-prop', ['mute', propValue ? 'yes' : 'no']);
                     props.mute = propValue;
                     onPropChanged('muted');
                 }
@@ -484,7 +475,7 @@ function ShellVideo(options) {
             case 'selectedAudioTrackId': {
                 if (stream !== null) {
                     var actualId = propValue.slice('EMBEDDED_'.length);
-                    ipc.send('mpv-set-prop', ['aid', actualId]);
+                    drive('mpv-set-prop', ['aid', actualId]);
                 }
                 break;
             }
@@ -492,11 +483,11 @@ function ShellVideo(options) {
                 if (stream !== null) {
                     if(propValue) {
                         var actualId = propValue.slice('EMBEDDED_'.length);
-                        ipc.send('mpv-set-prop', ['sid', actualId]);
+                        drive('mpv-set-prop', ['sid', actualId]);
                         events.emit('subtitlesTrackLoaded', propValue);
                     } else {
                         // turn off subs
-                        ipc.send('mpv-set-prop', ['sid', 'no']);
+                        drive('mpv-set-prop', ['sid', 'no']);
                         props.sid = null;
                     }
                 }
@@ -504,7 +495,7 @@ function ShellVideo(options) {
                 break;
             }
             case 'subtitlesSize': {
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue * SUBS_SCALE_FACTOR]);
+                drive('mpv-set-prop', [stremioToMPVProps[propName], propValue * SUBS_SCALE_FACTOR]);
                 break;
             }
             case 'subtitlesDelay':
@@ -514,12 +505,12 @@ function ShellVideo(options) {
                 // the raw value here would have set a 250ms nudge to 250 SECONDS,
                 // which is why embedded-track delay was never wired before.
                 if (propValue !== null && isFinite(propValue)) {
-                    ipc.send('mpv-set-prop', [stremioToMPVProps[propName], propValue / 1000]);
+                    drive('mpv-set-prop', [stremioToMPVProps[propName], propValue / 1000]);
                 }
                 break;
             }
             case 'subtitlesOffset': {
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], 100 - propValue]);
+                drive('mpv-set-prop', [stremioToMPVProps[propName], 100 - propValue]);
                 break;
             }
             case 'subtitlesTextColor':
@@ -528,7 +519,7 @@ function ShellVideo(options) {
             {
                 // MPV accepts color in #AARRGGBB
                 var argb = propValue.replace(/^#(\w{6})(\w{2})$/, '#$2$1');
-                ipc.send('mpv-set-prop', [stremioToMPVProps[propName], argb]);
+                drive('mpv-set-prop', [stremioToMPVProps[propName], argb]);
                 break;
             }
             default: {
@@ -541,17 +532,22 @@ function ShellVideo(options) {
         switch (commandName) {
             case 'load': {
                 command('unload');
+                var thisLoad = loadSeq;
                 if (commandArgs && commandArgs.stream && typeof commandArgs.stream.url === 'string') {
-                    Promise.all([waitForMPVVersion, waitForStreamCb]).then(function (handshake) {
+                    channel.handshake.then(function (handshake) {
+                        if (destroyed || thisLoad !== loadSeq) {
+                            return;
+                        }
                         var mpvVersion = handshake[0];
                         var streamCbAvailable = handshake[1];
                         stream = commandArgs.stream;
                         onPropChanged('stream');
 
-                        // What mpv opens. `stream.url` (the http form) stays the
-                        // stream's public identity - the thumbnail shadow, the
-                        // subtitle routes and the cast gate all read it - and only
-                        // the loadfile target moves to the in-process byte plane.
+                        // What mpv is asked to open. `stream.url` (the http form)
+                        // stays the stream's public identity - the thumbnail
+                        // shadow, the subtitle routes and the cast gate all read
+                        // it - and only the loadfile target moves to the
+                        // in-process byte plane.
                         var loadURL = stream.url;
                         if (streamCbAvailable) {
                             var bytePlane = bytePlaneUrl(stream);
@@ -561,28 +557,28 @@ function ShellVideo(options) {
                         }
 
                         var subAssOverride = commandArgs.assSubtitlesStyling ? 'strip' : 'no';
-                        ipc.send('mpv-set-prop', ['sub-ass-override', subAssOverride]);
+                        drive('mpv-set-prop', ['sub-ass-override', subAssOverride]);
 
                         var gpuProcessing = !!commandArgs.gpuVideoProcessing &&
                             !!commandArgs.hardwareDecoding;
 
                         // Hardware decoding
                         var hwdecValue = commandArgs.hardwareDecoding ? (gpuProcessing ? 'd3d11va' : 'auto-copy') : 'no';
-                        ipc.send('mpv-set-prop', ['hwdec', hwdecValue]);
+                        drive('mpv-set-prop', ['hwdec', hwdecValue]);
 
                         // GPU video processing
                         if (typeof commandArgs.gpuVideoProcessing === 'boolean') {
-                            ipc.send('mpv-set-gpu-video-processing', gpuProcessing);
+                            drive('mpv-set-gpu-video-processing', gpuProcessing);
                         }
 
                         // Video output
                         var videoOutput = commandArgs.platform === 'windows' ? (commandArgs.videoMode === null ? 'gpu-next' : 'gpu') : 'libmpv';
-                        ipc.send('mpv-set-prop', ['vo', videoOutput]);
+                        drive('mpv-set-prop', ['vo', videoOutput]);
 
                         var separateWindow = options.mpvSeparateWindow ? 'yes' : 'no';
-                        ipc.send('mpv-set-prop', ['osc', separateWindow]);
-                        ipc.send('mpv-set-prop', ['input-default-bindings', separateWindow]);
-                        ipc.send('mpv-set-prop', ['input-vo-keyboard', separateWindow]);
+                        drive('mpv-set-prop', ['osc', separateWindow]);
+                        drive('mpv-set-prop', ['input-default-bindings', separateWindow]);
+                        drive('mpv-set-prop', ['input-vo-keyboard', separateWindow]);
 
                         var startAt = Math.floor(parseInt(commandArgs.time, 10) / 1000) || 0;
                         var loadfileArgs;
@@ -595,22 +591,21 @@ function ShellVideo(options) {
                         } else {
                             loadfileArgs = ['loadfile', loadURL];
                         }
-                        bytePlaneFallback = loadURL !== stream.url ?
+                        startLoad(loadfileArgs, loadURL !== stream.url ?
                             loadfileArgs.map(function(arg) { return arg === loadURL ? stream.url : arg; })
                             :
-                            null;
-                        ipc.send('mpv-command', loadfileArgs);
-                        ipc.send('mpv-set-prop', ['sid', 'no']);
-                        ipc.send('mpv-set-prop', ['pause', false]);
-                        ipc.send('mpv-set-prop', ['speed', props.speed]);
+                            null);
+                        drive('mpv-set-prop', ['sid', 'no']);
+                        drive('mpv-set-prop', ['pause', false]);
+                        drive('mpv-set-prop', ['speed', props.speed]);
                         if (props.aid) {
                             if (typeof props.aid === 'string' && props.aid.startsWith('EMBEDDED_')) {
-                                ipc.send('mpv-set-prop', ['aid', props.aid.slice('EMBEDDED_'.length)]);
+                                drive('mpv-set-prop', ['aid', props.aid.slice('EMBEDDED_'.length)]);
                             } else {
-                                ipc.send('mpv-set-prop', ['aid', props.aid]);
+                                drive('mpv-set-prop', ['aid', props.aid]);
                             }
                         }
-                        ipc.send('mpv-set-prop', ['mute', 'no']);
+                        drive('mpv-set-prop', ['mute', 'no']);
 
                         onPropChanged('paused');
                         onPropChanged('time');
@@ -630,6 +625,8 @@ function ShellVideo(options) {
                 break;
             }
             case 'unload': {
+                loadSeq++;
+                currentLoad = null;
                 props = {
                     loaded: false,
                     pause: false,
@@ -645,8 +642,7 @@ function ShellVideo(options) {
                 };
                 stall = { 'seeking': false, 'paused-for-cache': false };
                 avgDuration = 0;
-                bytePlaneFallback = null;
-                ipc.send('mpv-command', ['stop']);
+                drive('mpv-command', ['stop']);
                 onPropChanged('loaded');
                 onPropChanged('stream');
                 onPropChanged('paused');
@@ -664,11 +660,16 @@ function ShellVideo(options) {
             case 'destroy': {
                 command('unload');
                 destroyed = true;
+                channel.detach(attachment);
                 events.removeAllListeners();
                 break;
             }
         }
     }
+
+    // Become the owner now that this visit is fully built. Attaching detaches
+    // the previous visit, so from here its teardown drives nothing (see `drive`).
+    channel.attach(attachment);
 
     this.on = function (eventName, listener) {
         if (destroyed) {

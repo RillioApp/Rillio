@@ -951,7 +951,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut end = None;
         while std::time::Instant::now() < deadline && end.is_none() {
-            if let crate::mpv::MpvEvent::EndFile { reason, error } = mpv.wait_event(0.5) {
+            if let crate::mpv::MpvEvent::EndFile { reason, error, .. } = mpv.wait_event(0.5) {
                 end = Some((reason, error));
             }
         }

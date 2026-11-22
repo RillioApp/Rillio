@@ -284,7 +284,7 @@ pub(crate) fn decode_pcm(url: &str, start_s: f64, length_s: f64) -> Result<Vec<i
         let deadline = Instant::now() + DECODE_TIMEOUT;
         loop {
             match mpv.wait_event(0.5) {
-                MpvEvent::EndFile { reason, error } => {
+                MpvEvent::EndFile { reason, error, .. } => {
                     // mpv_end_file_reason: 0 EOF, 2 STOP, 3 QUIT, 4 ERROR, 5 REDIRECT.
                     if reason == 4 {
                         return Err(format!("autosync: decode failed: {}", mpv.error_string(error)));
