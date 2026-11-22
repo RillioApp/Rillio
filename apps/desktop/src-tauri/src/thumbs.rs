@@ -98,13 +98,16 @@ const CACHE_MAX_THUMBS: usize = 256;
 const SEEK_SETTLE_MS: u64 = 4000;
 /// How long a shadow may stay in the FIRST-OPEN phase (the file never opened,
 /// `Settle::Opening`) across seek budgets before it is retired as unreadable.
-/// Wall-clock from spawn, SEPARATE from the per-seek budget: a slow first open
-/// (loadfile + demux init + first keyframe software-decode, measured up to a
-/// few seconds for 4K HEVC 10-bit under load) is kept, but a stream that never
-/// opens and never errors (a dead/hung source whose mpv error is 600 s away)
-/// is not held forever. Three seek budgets: generous for any real open (they
-/// finish within one or two), short enough not to leak a shadow for a dead
-/// stream the whole time the user keeps hovering.
+/// Wall-clock from spawn (`Shadow::born`, set fresh per spawn, so a respawn
+/// gets its own full deadline), SEPARATE from the per-seek budget.
+///
+/// A real first open completes within ONE seek budget: the double-open bench
+/// measured a cold DV/HDR open at ~1.3-1.8 s, well under SEEK_SETTLE_MS (4 s),
+/// so 3x is headroom for a loaded machine, not a guess. Retiring past it is
+/// SELF-CORRECTING, not data loss: the shadow is dropped (Lost, paced) and the
+/// next hover opens a fresh one; it never fails the stream. The bound only
+/// stops a dead/hung source (whose mpv error is a 600 s network-timeout away)
+/// from leaking a shadow for as long as the user keeps hovering.
 const OPENING_DEADLINE_MS: u64 = 3 * SEEK_SETTLE_MS;
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 /// How many of mpv's error lines a libplacebo shadow keeps for its refusal: a

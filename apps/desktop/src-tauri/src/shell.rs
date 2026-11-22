@@ -192,9 +192,10 @@ impl LoadIds {
                     self.by_entry.remove(&oldest);
                 }
                 // Only protected (just-inserted) entries remain: stop, rather
-                // than drop a child of the active redirect. The map may then
-                // sit above CAP until those children end - bounded by one
-                // redirect's child count, and Rillio's is 0 or 1 (below).
+                // than drop a child of the active redirect. Post-trim size is
+                // then at most max(CAP, count) - it never grows unbounded,
+                // bounded by one redirect's child count, and Rillio's is 0 or 1
+                // (below).
                 _ => break,
             }
         }
@@ -204,13 +205,18 @@ impl LoadIds {
     /// A redirect (a playlist url expanding into its entries) hands the load
     /// on to the `inserted` entries, which are what will play and end.
     ///
-    /// Rillio loads ONE media url per load (the rillio:// byte plane, an http
-    /// stream, or a direct addon url), never a playlist, EDL or CUE, so a
-    /// redirect expands into at most one entry and `count` is 0 or 1. Even so
-    /// the children are inserted together and trimmed as a protected range, so
-    /// a redirect larger than CAP could never evict its own first-playing
-    /// child (it would hold the map briefly above CAP instead): correct, not
-    /// merely warned about.
+    /// INVARIANT: Rillio loads ONE validated http(s)/rillio:// stream per
+    /// loadfile, never a playlist, EDL or CUE, so a REDIRECT END_FILE is not
+    /// expected and `inserted.count` is 0 or 1. The >CAP and nested-redirect
+    /// paths below are DEFENSIVE ONLY; they cannot arise from a single-file
+    /// load. A nested redirect (a child that itself redirects) would re-enter
+    /// `end` for that child's own END_FILE and expand again under the same
+    /// protected-range trim, so it is bounded the same way and out of scope as
+    /// a source Rillio does not open. Still, the trim keeps it correct if it
+    /// ever did: children are inserted together and `trim(first)` never evicts
+    /// one of them, so a redirect larger than CAP cannot drop its own
+    /// first-playing child - post-trim size is at most max(CAP, count), never
+    /// unbounded.
     fn end(&mut self, entry: i64, reason: std::ffi::c_int, inserted: (i64, std::ffi::c_int)) -> Option<u64> {
         let load = self.by_entry.remove(&entry)?;
         if reason == MPV_END_FILE_REASON_REDIRECT {
@@ -789,17 +795,18 @@ impl Controller {
             // opposite regression).
             //
             // DELIBERATE, EVIDENCED TENSION (not a silent gap): a load with no
-            // entry id is untrackable - its END_FILE carries an entry we never
-            // recorded, so a LATER error on it is not attributed and would not
-            // reach the web's loadId-based error/retry path. We accept that
-            // because we do not ship a libmpv that hits it: mpv_command_ret has
-            // returned loadfile's playlist_entry_id since client API 1.108 (mpv
-            // 0.33), every shipped libmpv-2 is 2.x, and the test
+            // entry id is accepted and ALLOWED TO PLAY, rather than failed; what
+            // is lost is attribution of a LATER failure on it (its END_FILE
+            // carries an entry we never recorded, so a loadId-less END_FILE does
+            // not reach the web's error/retry path), and the missing id is
+            // logged loud below. We accept that because we do not ship a libmpv
+            // that hits it: mpv_command_ret has returned loadfile's
+            // playlist_entry_id since client API 1.108 (mpv 0.33), every shipped
+            // libmpv-2 is 2.x, and the test
             // `mpv::tests::an_end_file_carries_the_entry_id_its_loadfile_returned`
-            // asserts the shipped dll returns Some for every loadfile. On a
-            // future or stripped build that returned None, that one load loses
-            // later-error attribution (it still PLAYS, and the None is logged
-            // loud below) - a knowingly accepted cost, chosen over refusing
+            // asserts the shipped dll returns Some for every loadfile. A future
+            // or stripped build that returned None would let that one load play
+            // untracked - a knowingly accepted cost, chosen over refusing
             // playback on such a build.
             let entry = self.mpv.command_entry(&["loadfile", url, "replace"])?;
             tracing::debug!("mpv loadfile url={url} start={start:?} entry={entry:?} load={load_id:?}");
