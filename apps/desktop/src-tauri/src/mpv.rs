@@ -748,14 +748,6 @@ mod tests {
             ids.push((first, second));
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut ends = Vec::new();
-        while std::time::Instant::now() < deadline {
-            if let MpvEvent::EndFile { reason, entry, .. } = mpv.wait_event(0.2) {
-                ends.push((entry, reason));
-            }
-        }
-        eprintln!("[entries] loadfile ids {ids:?}; END_FILEs (entry, reason) {ends:?}");
         let all: Vec<i64> = ids.iter().flat_map(|&(a, b)| [a, b]).collect();
         // Each loadfile returned a DISTINCT id (what lets the shell tell loads
         // apart); every id came back Some (the shipped libmpv reports it).
@@ -763,18 +755,33 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "loadfile returned a repeated entry id");
-        // Every END_FILE names an entry a loadfile returned (never a stray id).
-        assert!(ends.iter().all(|(entry, _)| all.contains(entry)), "an END_FILE named an unknown entry");
         // Each loadfile REPLACES the previous, so only the last entry survives
         // to actually fail; its error END_FILE must carry its own id. (Entries
         // replaced before they start are dropped WITHOUT an END_FILE, which is
         // exactly why counting or ordering END_FILEs could not attribute them -
-        // the id can.)
+        // the id can.) Pump wait_event UNTIL that event arrives rather than for
+        // a fixed window: the byte-plane refusal runs on a background thread
+        // that a saturated machine can starve well past a few seconds, so a
+        // fixed deadline flaked under load. The event always comes; the 15 s
+        // safety bound only keeps a genuine never-arriving event from hanging.
         let last = ids.last().expect("three loads").1;
-        assert!(
-            ends.iter().any(|&(entry, reason)| entry == last && reason == MPV_END_FILE_REASON_ERROR),
-            "the surviving entry {last} has no error END_FILE of its own"
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ends = Vec::new();
+        let found = loop {
+            if let MpvEvent::EndFile { reason, entry, .. } = mpv.wait_event(0.2) {
+                ends.push((entry, reason));
+                if entry == last && reason == MPV_END_FILE_REASON_ERROR {
+                    break true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+        };
+        eprintln!("[entries] loadfile ids {ids:?}; END_FILEs (entry, reason) {ends:?}");
+        // Every END_FILE seen names an entry a loadfile returned (never a stray id).
+        assert!(ends.iter().all(|(entry, _)| all.contains(entry)), "an END_FILE named an unknown entry");
+        assert!(found, "the surviving entry {last} never got its own error END_FILE within 15s");
     }
 
     /// The stream_cb symbol is OPTIONAL: an absent one must degrade to "no
