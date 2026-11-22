@@ -270,6 +270,14 @@ struct Inner {
     /// What the stream's last checked frame needed ([`Inner::note_conversion`]):
     /// a frame that needs something else invalidates the cached previews.
     conversion: Option<Conversion>,
+    /// The renderer the player's own video-params call for, carried so the
+    /// FIRST shadow of a stream opens as that renderer instead of always
+    /// starting Software and respawning on the first HDR/DV frame (the double
+    /// open). Seeded from what the player already decoded; `None` until the
+    /// player reports a frame, and then the Software default starts and
+    /// [`checked_capture`] still moves it per frame. Never the decision owner:
+    /// [`conversion_for`] is, here and per frame.
+    hint_render: Option<Render>,
 }
 
 /// A shadow that was lost, kept to pace the next one ([`Inner::may_respawn`]).
@@ -500,6 +508,23 @@ fn conversion_for(params: &VideoParams) -> Result<Conversion, String> {
     } else {
         Conversion::Plain
     })
+}
+
+/// The renderer the player's own `video-params` call for: the same verdict
+/// [`conversion_for`] reaches per frame, moved earlier so the first shadow for a
+/// stream opens as the right renderer instead of starting Software and
+/// respawning when the first HDR/DV frame lands (the double open, measured
+/// 1.3-1.8 s). The player decoded this file already; its colour tags are the
+/// stream's, not the renderer's, so they match what the shadow will see.
+///
+/// `None` keeps today's behaviour exactly: the player reported no frame yet
+/// (just the container size), or its frames cannot be converted. Either way the
+/// Software default starts and [`checked_capture`] decides on the real frame -
+/// including the refusal, which is why the profile is not needed here (a hint
+/// never refuses; the frame does).
+fn initial_render(video_params: Option<&str>, profile: Option<&str>) -> Option<Render> {
+    let params = VideoParams::parse(video_params?, profile).ok()??;
+    conversion_for(&params).ok().map(|conversion| conversion.render())
 }
 
 /// What to do with a settled frame, given what it needs (`frame`, from
@@ -1455,7 +1480,7 @@ mod tests {
         let now = Instant::now();
         let mut inner = Inner::default();
         assert_eq!(
-            inner.request_thumb(url.clone(), 7, 448, now),
+            inner.request_thumb(url.clone(), 7, 448, None, now),
             ThumbRequest::Pending { start_worker: true }
         );
         // The worker refuses (e.g. libplacebo could not start), then exits.
@@ -1464,7 +1489,7 @@ mod tests {
         inner.worker_running = false;
         assert!(inner.refused.is_some() && inner.wanted.is_none() && inner.shadow.is_none());
         for bucket in [7, 8, 9] {
-            let answer = inner.request_thumb(url.clone(), bucket, 448, now);
+            let answer = inner.request_thumb(url.clone(), bucket, 448, None, now);
             assert_eq!(answer, ThumbRequest::Refused(reason.to_owned()));
             // ...and the web is told so, with the reason, to stop asking.
             assert_eq!(ThumbAnswer::from(answer), ThumbAnswer::Never { reason: reason.to_owned() });
@@ -1472,7 +1497,7 @@ mod tests {
         assert!(inner.wanted.is_none() && !inner.worker_running);
         // Another stream is judged on its own.
         assert_eq!(
-            inner.request_thumb("http://127.0.0.1:11470/sdr".to_owned(), 7, 448, now),
+            inner.request_thumb("http://127.0.0.1:11470/sdr".to_owned(), 7, 448, None, now),
             ThumbRequest::Pending { start_worker: true }
         );
         assert!(inner.refused.is_none());
@@ -1488,7 +1513,7 @@ mod tests {
         let url = "http://127.0.0.1:49312/cold-torrent".to_owned();
         let t0 = Instant::now();
         let mut inner = Inner::default();
-        assert_eq!(inner.request_thumb(url.clone(), 7, 448, t0), ThumbRequest::Pending { start_worker: true });
+        assert_eq!(inner.request_thumb(url.clone(), 7, 448, None, t0), ThumbRequest::Pending { start_worker: true });
         // The worker's job comes back lost after the shadow lived 3 s.
         inner.wanted = None;
         let lived = Duration::from_secs(3);
@@ -1500,13 +1525,13 @@ mod tests {
         // Asked again before the lost shadow's lifetime has passed: still
         // pending (the web keeps asking), no new shadow yet.
         let early = t0 + lived / 2;
-        let answer = inner.request_thumb(url.clone(), 7, 448, early);
+        let answer = inner.request_thumb(url.clone(), 7, 448, None, early);
         assert_eq!(answer, ThumbRequest::Pending { start_worker: false });
         assert_eq!(ThumbAnswer::from(answer), ThumbAnswer::Pending);
         assert_eq!(inner.wanted, Some(7), "the request stays queued");
         // Once it has passed, the next request starts a worker (a new shadow).
         assert_eq!(
-            inner.request_thumb(url.clone(), 7, 448, t0 + lived),
+            inner.request_thumb(url.clone(), 7, 448, None, t0 + lived),
             ThumbRequest::Pending { start_worker: true }
         );
         // A shadow that failed at once may be replaced at once.
@@ -1572,7 +1597,7 @@ mod tests {
         assert!(conversion_changed(Some(&hdr), &dv));
 
         let mut inner = Inner::default();
-        inner.switch_stream(Some("http://127.0.0.1:11470/spliced".to_owned()));
+        inner.switch_stream(Some("http://127.0.0.1:11470/spliced".to_owned()), None);
         let mut scan = Scan::new(600.0);
         scan.next = 7;
         scan.prev_luma = Some(vec![1; 144]);
@@ -1588,15 +1613,54 @@ mod tests {
         assert_eq!(scan.next, 7, "the sweep keeps its place");
         assert_eq!(inner.conversion, Some(hdr));
         // A new stream starts with no conversion at all.
-        inner.switch_stream(None);
+        inner.switch_stream(None, None);
         assert_eq!(inner.conversion, None);
+    }
+
+    /// The player's own video-params pick the first renderer, so an HDR or
+    /// Dolby Vision stream opens libplacebo at once instead of starting
+    /// software and respawning on the first frame (the double open). The same
+    /// verdict `conversion_for` reaches per frame, moved earlier.
+    #[test]
+    fn the_players_params_choose_the_first_renderer() {
+        for params in [DV_P5, DV_P81, HDR10_BARE, HDR10_LIGHT_LEVELS, HLG] {
+            assert_eq!(initial_render(Some(params), None), Some(Render::Libplacebo), "{params}");
+        }
+        for params in [SDR_BT709, SDR_BT601] {
+            assert_eq!(initial_render(Some(params), None), Some(Render::Software), "{params}");
+        }
+        // No frame yet (only the container size), or no player up: no hint, and
+        // the software default starts exactly as before.
+        assert_eq!(initial_render(Some(r#"{"w":3840,"h":1920}"#), None), None);
+        assert_eq!(initial_render(None, None), None);
+    }
+
+    /// The hint belongs to the stream: set when the stream is taken up, filled
+    /// in if it was not known then, never churned afterwards, and reset by a
+    /// new stream.
+    #[test]
+    fn the_render_hint_follows_the_stream() {
+        let now = Instant::now();
+        let mut inner = Inner::default();
+        // The first request came before the player reported a frame: no hint.
+        inner.request_thumb("http://x/1".into(), 0, 448, None, now);
+        assert_eq!(inner.hint_render, None);
+        // A later hover, the player's params now ready: fills the not-yet-open shadow's render.
+        inner.request_thumb("http://x/1".into(), 1, 448, Some(Render::Libplacebo), now);
+        assert_eq!(inner.hint_render, Some(Render::Libplacebo));
+        // A still-later, different hint does not overwrite it (a shadow may be open on it).
+        inner.request_thumb("http://x/1".into(), 2, 448, Some(Render::Software), now);
+        assert_eq!(inner.hint_render, Some(Render::Libplacebo));
+        // A new stream takes its own hint.
+        inner.request_thumb("http://y/2".into(), 0, 448, Some(Render::Software), now);
+        assert_eq!(inner.hint_render, Some(Render::Software));
     }
 
     /// A refusal met at capture time refuses the stream, as one found at open.
     #[test]
     fn a_refusal_at_capture_time_stops_the_stream() {
         let mut inner = Inner::default();
-        inner.switch_stream(Some("http://127.0.0.1:11470/spliced".to_owned()));
+        inner.switch_stream(Some("http://127.0.0.1:11470/spliced".to_owned()), None);
         inner.wanted = Some(3);
         let back = inner.take_back::<()>(Captured::Refused("thumbs: profile 5 without RPU".into()), Instant::now());
         assert!(matches!(back, TakenBack::Refused));
@@ -1620,7 +1684,7 @@ mod tests {
         const SDR_AT: f64 = 0.25;
         const HDR_AT: f64 = 0.75;
         let mut inner = Inner::default();
-        inner.switch_stream(Some(file.clone()));
+        inner.switch_stream(Some(file.clone()), None);
         let (shadow, first) = open_settled(&file, 448);
         assert_eq!(first, Conversion::Plain, "the file starts SDR");
         let duration = shadow.duration().expect("a duration");
@@ -1837,6 +1901,113 @@ mod tests {
                 Captured::Frame(..) | Captured::Skipped(_) | Captured::Replaced(..) | Captured::Yielded(_)
                 | Captured::Parked => panic!("{render:?}: an unreadable file was not noticed"),
             }
+        }
+    }
+
+    /// Lever (a): the player's video-params open the first shadow on the right
+    /// renderer, saving the software-open-then-respawn ("double open") for an
+    /// HDR/DV stream. Per file: read the colour the player would have (one probe
+    /// open), decide the hint, then time the OLD path (software spawn, respawn
+    /// on the first frame) against the NEW path (spawn on the hint, no respawn),
+    /// to a captured first frame, REPS each. An SDR file is the control: its
+    /// hint is Software, so both paths are the same and neither respawns. Needs
+    /// `libmpv-2.dll` (next to the test binary or via `RILLIO_LIBMPV`) and:
+    ///   RILLIO_THUMBS_DOUBLEOPEN_FILES  the videos, separated by `;`
+    ///   RILLIO_THUMBS_BENCH_WIDTH       the thumbnail width (default 640)
+    /// Run: `cargo test --lib thumbs::tests::bench_initial_render -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs libmpv-2.dll and RILLIO_THUMBS_DOUBLEOPEN_FILES"]
+    fn bench_initial_render_saves_the_double_open() {
+        const REPS: usize = 7;
+        // Software decode of a 4K HEVC 10-bit DV frame, twice over on the old
+        // path (the software shadow, then its libplacebo replacement), is slow
+        // on a debug build; give the capture room so the bench measures the
+        // cost instead of timing out on it.
+        const BENCH_CAPTURE_MS: u64 = 40_000;
+        let files = std::env::var("RILLIO_THUMBS_DOUBLEOPEN_FILES").expect("RILLIO_THUMBS_DOUBLEOPEN_FILES");
+        let width = thumb_width(
+            std::env::var("RILLIO_THUMBS_BENCH_WIDTH").ok().and_then(|w| w.trim().parse().ok()).unwrap_or(640),
+        )
+        .expect("a usable width");
+        // The hint the real code uses comes from the PLAYER, which renders with
+        // gpu-next (libplacebo): a DV stream reports colormatrix "dolbyvision"
+        // only once that VO has the RPU, which a software probe never sees. So
+        // read the bench's hint from a libplacebo shadow (the player's own
+        // renderer), settled on a frame, waiting for the colour to decide.
+        let player_hint = |file: &str| -> Option<Render> {
+            let probe = Shadow::spawn(file, width, Render::Libplacebo).expect("probe spawn");
+            let _ = probe.seek_settled(0.0, &|| false);
+            let deadline = Instant::now() + Duration::from_millis(BENCH_CAPTURE_MS);
+            loop {
+                let params = probe.mpv.get_property_string("video-params");
+                let profile = probe.mpv.get_property_string("current-tracks/video/dolby-vision-profile");
+                let hint = initial_render(params.as_deref(), profile.as_deref());
+                if hint.is_some() || Instant::now() >= deadline {
+                    break hint;
+                }
+                std::thread::sleep(SETTLE_POLL);
+            }
+        };
+        // Pay libplacebo's one-time GPU/Vulkan init now (the first probe above
+        // already created a libplacebo context), before any measured open.
+
+        for file in files.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+            // What the player's own renderer reports for this file, and the hint.
+            let hint = player_hint(file);
+
+            // Time one open-to-first-frame; `start` None is the OLD default
+            // (software), Some is the hinted renderer. Returns the millis and
+            // whether it had to respawn.
+            let timed = |start: Option<Render>| -> (f64, bool) {
+                let t = Instant::now();
+                let mut shadow = Shadow::spawn(file, width, start.unwrap_or(Render::Software)).expect("spawn");
+                let mut replaced = false;
+                let deadline = Instant::now() + Duration::from_millis(BENCH_CAPTURE_MS);
+                loop {
+                    let (w, r) = (shadow.width, shadow.render);
+                    match checked_capture(shadow, file, 0.0, &|| false, Shadow::capture_bytes) {
+                        Captured::Frame(done, _c, jpeg) => {
+                            jpeg.expect("capture");
+                            drop(done);
+                            break;
+                        }
+                        Captured::Replaced(again, _) => {
+                            replaced = true;
+                            shadow = again;
+                        }
+                        Captured::Skipped(again) | Captured::Yielded(again) => {
+                            assert!(Instant::now() < deadline, "{file} never captured");
+                            shadow = again;
+                        }
+                        Captured::Parked => {
+                            assert!(Instant::now() < deadline, "{file} never captured");
+                            shadow = Shadow::spawn(file, w, r).expect("respawn");
+                        }
+                        Captured::Refused(reason) | Captured::Lost { reason, .. } => panic!("{file}: {reason}"),
+                    }
+                }
+                (t.elapsed().as_secs_f64() * 1000.0, replaced)
+            };
+
+            let (mut before, mut after) = (Vec::new(), Vec::new());
+            let (mut before_respawns, mut after_respawns) = (0usize, 0usize);
+            for _ in 0..REPS {
+                let (ms, r) = timed(None);
+                before.push(ms);
+                before_respawns += r as usize;
+                let (ms, r) = timed(hint);
+                after.push(ms);
+                after_respawns += r as usize;
+            }
+            let mut before_sorted = before.clone();
+            let mut after_sorted = after.clone();
+            let (before_med, _) = median_p95(&mut before_sorted);
+            let (after_med, _) = median_p95(&mut after_sorted);
+            let ms = |v: &[f64]| v.iter().map(|x| format!("{x:.0}")).collect::<Vec<_>>().join(", ");
+            println!("== {file}");
+            println!("  hint: {hint:?}");
+            println!("  OLD software-start: median {before_med:.0} ms, respawned {before_respawns}/{REPS}, all [{}]", ms(&before));
+            println!("  NEW hint-start:     median {after_med:.0} ms, respawned {after_respawns}/{REPS}, all [{}]", ms(&after));
         }
     }
 
@@ -2084,9 +2255,10 @@ pub async fn player_thumb(
     let width = thumb_width(width_px)?;
     let bucket = (time_sec / BUCKET_SECONDS).round() as u32;
 
+    let hint = render_hint(&app);
     let inner_arc = state.0.clone();
     let mut inner = inner_arc.lock().map_err(|_| "thumbs: poisoned")?;
-    let answer = inner.request_thumb(url, bucket, width, Instant::now());
+    let answer = inner.request_thumb(url, bucket, width, hint, Instant::now());
     if let ThumbRequest::Pending { start_worker: true } = answer {
         let arc = inner_arc.clone();
         // A dedicated OS thread: every step (mpv FFI, settle polling, file
@@ -2142,9 +2314,15 @@ enum ThumbRequest {
 impl Inner {
     /// The bookkeeping half of [`player_thumb`]: switch streams or widths when
     /// they changed, answer from the cache, else queue `bucket`.
-    fn request_thumb(&mut self, url: String, bucket: u32, width: u32, now: Instant) -> ThumbRequest {
+    fn request_thumb(&mut self, url: String, bucket: u32, width: u32, hint: Option<Render>, now: Instant) -> ThumbRequest {
         if self.url.as_deref() != Some(url.as_str()) {
-            self.switch_stream(Some(url));
+            self.switch_stream(Some(url), hint);
+        } else {
+            // Same stream: fill the hint if it was not known at the first
+            // request (the player had not reported a frame yet), so a later
+            // hover still seeds a shadow not opened so far. Never overwrite a
+            // hint already set - the first shadow may be open on it.
+            self.hint_render = self.hint_render.or(hint);
         }
         if self.width != width {
             // The preview changed size (window moved to a denser screen, zoom):
@@ -2216,7 +2394,7 @@ impl Inner {
 
     /// A new stream (or none): drop the old shadow (its decoder pipeline is
     /// for the old url) and everything known about the old stream with it.
-    fn switch_stream(&mut self, url: Option<String>) {
+    fn switch_stream(&mut self, url: Option<String>, hint: Option<Render>) {
         self.url = url;
         self.generation += 1;
         self.shadow = None;
@@ -2227,6 +2405,7 @@ impl Inner {
         self.refused = None;
         self.lost = None;
         self.conversion = None;
+        self.hint_render = hint;
     }
 
     /// Record what the frame just checked by [`checked_capture`] needs. When
@@ -2314,8 +2493,16 @@ enum TakenBack<T> {
 #[tauri::command]
 pub async fn player_thumb_stop(state: State<'_, ThumbsState>) -> Result<(), String> {
     let mut inner = state.0.lock().map_err(|_| "thumbs: poisoned")?;
-    inner.switch_stream(None);
+    inner.switch_stream(None, None);
     Ok(())
+}
+
+/// The renderer the live player's frames call for, for the first shadow of this
+/// stream ([`initial_render`]). Read from what the player already decoded; the
+/// profile is not needed (a hint never refuses). `None` when no player is up or
+/// it has reported no frame yet.
+fn render_hint(app: &tauri::AppHandle) -> Option<Render> {
+    initial_render(crate::shell::player_video_params(app).as_deref(), None)
 }
 
 /// Scene-cut times (seconds) for `url`, from the shadow's background sweep:
@@ -2330,10 +2517,13 @@ pub async fn player_scene_cuts(
 ) -> Result<Option<Vec<f64>>, String> {
     let url = resolve_shadow_url(&app, &url)?;
     validate_url(&url)?;
+    let hint = render_hint(&app);
     let inner_arc = state.0.clone();
     let mut inner = inner_arc.lock().map_err(|_| "thumbs: poisoned")?;
     if inner.url.as_deref() != Some(url.as_str()) {
-        inner.switch_stream(Some(url));
+        inner.switch_stream(Some(url), hint);
+    } else {
+        inner.hint_render = inner.hint_render.or(hint);
     }
     if inner.refused.is_some() {
         return Ok(Some(Vec::new()));
@@ -2361,7 +2551,7 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
     loop {
         // Take the next job under the lock; NEVER hold the lock while driving
         // mpv (captures take up to seconds and player_thumb must stay instant).
-        let (job, url, generation, shadow_missing) = {
+        let (job, url, generation, shadow_missing, hint_render) = {
             let mut inner = match inner_arc.lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -2391,7 +2581,7 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 inner.worker_running = false;
                 return;
             }
-            (job, url, inner.generation, inner.shadow.is_none())
+            (job, url, inner.generation, inner.shadow.is_none(), inner.hint_render)
         };
 
         if shadow_missing {
@@ -2401,9 +2591,12 @@ fn worker(inner_arc: Arc<Mutex<Inner>>) {
                 Job::Thumb(_, width) => width,
                 Job::ScanStep => SCAN_WIDTH,
             };
-            // Every stream starts on the software path; `checked_capture` moves
-            // it to libplacebo when a frame mpv reports needs it.
-            match Shadow::spawn(&url, width, Render::Software) {
+            // Open on the renderer the player's frames call for, when it told
+            // us one; otherwise the software path, which `checked_capture`
+            // moves to libplacebo when a frame mpv reports needs it. The hint
+            // only saves the open-then-respawn; the per-frame check still rules.
+            let render = hint_render.unwrap_or(Render::Software);
+            match Shadow::spawn(&url, width, render) {
                 Ok(shadow) => {
                     let mut inner = match inner_arc.lock() {
                         Ok(guard) => guard,

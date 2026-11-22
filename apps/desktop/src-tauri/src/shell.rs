@@ -919,6 +919,24 @@ pub(crate) fn player_prop_f64(app: &AppHandle, name: &str) -> Option<f64> {
     player.stats().get(name)?.as_f64().filter(|v| v.is_finite())
 }
 
+/// The playing file's `video-params`, as mpv's JSON, from the observed-property
+/// cache (the same value the player decoded). For the trickplay shadow to open
+/// the right renderer at once instead of starting software and respawning on
+/// the first HDR/DV frame (thumbs::initial_render). `None` before any frame or
+/// when no player is up; never creates the player. The colour tags are the
+/// stream's, so they match what the shadow will decode of the same file.
+pub(crate) fn player_video_params(app: &AppHandle) -> Option<String> {
+    use tauri::Manager;
+    let state = app.state::<ShellState>();
+    let guard = state.0.lock().ok()?;
+    let player = guard.as_ref()?;
+    player
+        .stats()
+        .get("video-params")
+        .filter(|value| value.is_object())
+        .map(|value| value.to_string())
+}
+
 /// The player's current position in seconds.
 pub(crate) fn player_time_pos(app: &AppHandle) -> Option<f64> {
     player_prop_f64(app, "time-pos")
